@@ -153,3 +153,44 @@ Deferred until the GEMM delivery work lands. The payoff is bounded by the Q4_K
 byte share (19.1% of UD-Q4_K_S, 12.7% of the 3.84 bpw IQ4_XS shard), so expect
 single-digit percent prefill rather than 2x unless the weights are requantized
 to 4 bits throughout, which is a model quality decision, not a kernel one.
+
+
+## Deferred: Q2_K native prefill (chunked-path eligibility)
+
+Q2_K is the only type in the 3.84 bpw IQ4_XS shard outside
+`IsNativeWmmaQuant`, and `prefill_chunk.cpp`'s eligibility predicate tests every
+projection of every layer, so one Q2_K tensor (`blk.22.ssm_beta`, 48x5120)
+removes the whole model from the chunked prefill path. That matches the
+measured shape exactly: pp512 is equal for both shards (both fail the
+`batch < 1024` term) while pp1024/pp2048 diverge only for the shard that
+carries Q2_K.
+
+Q2_K cannot simply be added to `IsNativeWmmaQuant`: its min is per 16 elements,
+while `WKQuantA8BlockedWmmaGEMMKernel` carries one offset per 32-element kb
+(`HasOffset` -> `s_off[BK][kOffRowTiles][16]`, corrected once per kb with
+`sx = s_sx[kb][ts][sub_lane]`). Feeding it the per-32 activation sum would be
+numerically wrong.
+
+Scope:
+
+1. `StoreQ8ActLane<StoreActivationSum>` (prefill_quant_gemm.hpp, and the second
+   copy in prefill_quant_gemm.hip): widen the `__shfl_xor` reduction to stop at
+   16 lanes so both half sums are available, and write low and high sums.
+   `Q8ActSumBytes` doubles; every allocation and the capacity check at
+   prefill_quant_gemm.hip:1634 already route through it, so sizing stays
+   consistent.
+2. Kernel: add `constexpr bool PerHalfOffset = (WType == kQ2_K)`, store both
+   offsets per row, and correct with `off1 * sx_full + (off0 - off1) * sx_lo`
+   (equivalently two independent half sums). `PerHalfScale` must also cover
+   Q2_K, which it already does for the scale half.
+3. Dispatch: add Q2_K to the wave32 and wave64 WMMA dispatch and to
+   `IsNativeWmmaQuant`.
+4. Validation gate: add Q2_K to `kFormats` in the q4kxl oracle test, which
+   exercises `TestPrefillGemm` (production vs a CPU model of the same Q8
+   activation arithmetic) and `TestSmallBatchExactness` (bit-exact against the
+   decode GEMV). Both must be green before the type is promoted.
+
+Risk: the sidecar is shared by every q8-activating format, so a mistake here
+corrupts all quantised models rather than failing loudly. Land it with the
+oracle suite green at each step, and expect the payoff to be model-level (the
+whole shard regaining the chunked path) rather than Q2_K's own 0.0% byte share.
