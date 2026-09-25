@@ -633,4 +633,50 @@ kernel-efficiency investigation added nothing further, and is recorded here so
 that the next attempt starts from what has already been ruled out rather than
 from the tile geometry.
 
+### Isolating the 34%: the load path starves the matrix pipe
+
+Four more experiments, all on the real kernel or on the pure-MMA harness it is
+measured against:
+
+1. **Occupancy is not it.** The MMA rate is flat across the whole occupancy
+   curve: 23.7 TMAC/s with no LDS and high occupancy, 24.8 at 64 KiB per block
+   with 256 threads (one block per CU, eight waves per SIMD), 25.7 at 64 KiB
+   with 128 threads (four waves per SIMD). Even four resident waves sustain the
+   ceiling, so the kernel.s eight are not the constraint.
+2. **The LDS operand reads are not it.** Collapsing the K loop.s six swizzled
+   loads to one shared set -- a quarter of the LDS traffic, same MMA count --
+   buys 5% on Q4_K and nothing on IQ3_XXS.
+3. **The barriers are inconclusive.** Removing them, with or without the
+   staging, changes the operand data (the output goes non-finite), and operand
+   data measurably changes the rate -- see the caveat below. Those runs cannot
+   be read.
+4. **The load path is the differentiator.** Profiling the pure-MMA harness with
+   the same counters:
+
+| kernel | TA_TA_BUSY / GRBM | matrix pipe |
+| --- | ---: | ---: |
+| pure-MMA harness (256 thr, 64 KiB LDS) | 0.3% | ~100% of ceiling |
+| pure-MMA harness (no LDS, high occ) | 3.7% | ~100% of ceiling |
+| `HalfPrefillGemmKernel` Q4_K | 80% | 66% |
+
+That is the cleanest statement available: the only unit anywhere near
+saturation is the L1/texture load path at 80%, and the matrix pipe sits at 66%
+behind it. The kernel is starved by its own weight and activation loads, which
+also fits the staging ablation (10-22%) and the earlier finding that the two
+halves cost roughly independently (weights 1.6 ms, activations 2.7 ms on
+Q4_K). What is *not* established is why the TA is at 80% when the traffic is
+43 GB/s of DRAM and about 1.7 GB across L2 -- both far from any bandwidth
+limit. Answering that needs L1/TA sub-unit counters (miss handling, MSHR
+occupancy, per-wave stalls on memory) that this ASIC does not expose, and
+`SQ_WAIT_*` is absent from the counter list entirely.
+
+**Caveat discovered here.** Operand *values* change the measured MMA rate: an
+ablation that drops the staging without first staging valid data measures
+7.35 ms, while the same ablation with valid LDS data measures 10.45 ms. The
+harness with garbage operands runs about 40% faster than with real ones. Every
+ablation that changes correctness therefore has a data-dependent bias, which is
+what makes experiment 3 unreadable. Treat any correctness-breaking ablation here
+as usable only for direction, never for magnitude.
+
+
 
