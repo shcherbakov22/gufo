@@ -163,6 +163,127 @@ const TypeCase kTypes[] = {
 };
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// Tile-configuration sweep for the FP16 prefill kernel. The production
+// DirectGemm hard-codes one shape per case; this measures a candidate without
+// changing model code. BM+BN is capped at 512 because BK is fixed at 4 and the
+// two stages must fit the 64 KiB LDS budget.
+template<gufo::core::GgmlType Type, int BM, int BN, int WM, int WN,
+         bool Complete>
+void LaunchTile(const void* w, const short* x, float* y, std::size_t batch,
+                std::size_t m, std::size_t k, hipStream_t stream) {
+  const dim3 grid(static_cast<unsigned>((batch + BN - 1) / BN),
+                  static_cast<unsigned>((m + BM - 1) / BM));
+  gufo::hip::HalfPrefillGemmKernel<BM, BN, WM, WN, Type,
+                                   gufo::hip::HalfEpilogue::kStore, Complete>
+      <<<grid, WM * WN * 32, 0, stream>>>(w, x, y, batch, m, k, nullptr);
+}
+
+const char* TileName(int variant) {
+  switch (variant) {
+    case 0: return "256x256 w8n4";
+    case 1: return "256x256 w4n8";
+    case 2: return "256x256 w4n4";
+    case 3: return "256x256 w16n2";
+    case 4: return "256x192 w8n4";
+    case 5: return "128x256 w4n8";
+    case 6: return "256x128 w8n4";
+    case 7: return "128x128 w4n4";
+    case 8: return "256x256 w8n4 full";
+    default: return "?";
+  }
+}
+constexpr int kTileVariants = 9;
+
+template<gufo::core::GgmlType Type>
+void LaunchTileVariant(const void* w, const short* x, float* y,
+                       std::size_t batch, std::size_t m, std::size_t k,
+                       int variant, hipStream_t stream) {
+  switch (variant) {
+    case 0: LaunchTile<Type, 256, 256, 8, 4, false>(w, x, y, batch, m, k, stream); break;
+    case 1: LaunchTile<Type, 256, 256, 4, 8, false>(w, x, y, batch, m, k, stream); break;
+    case 2: LaunchTile<Type, 256, 256, 4, 4, false>(w, x, y, batch, m, k, stream); break;
+    case 3: LaunchTile<Type, 256, 256, 16, 2, false>(w, x, y, batch, m, k, stream); break;
+    case 4: LaunchTile<Type, 256, 192, 8, 4, false>(w, x, y, batch, m, k, stream); break;
+    case 5: LaunchTile<Type, 128, 256, 4, 8, false>(w, x, y, batch, m, k, stream); break;
+    case 6: LaunchTile<Type, 256, 128, 8, 4, false>(w, x, y, batch, m, k, stream); break;
+    case 7: LaunchTile<Type, 128, 128, 4, 4, false>(w, x, y, batch, m, k, stream); break;
+    case 8: LaunchTile<Type, 256, 256, 8, 4, true>(w, x, y, batch, m, k, stream); break;
+    default: break;
+  }
+}
+
+template<gufo::core::GgmlType Type>
+void RunTiles(std::size_t m, std::size_t k, std::size_t batch,
+              unsigned iterations, int pattern) {
+  using namespace gufo::hip;
+  const std::size_t block_bytes =
+      gufo::quant::QuantizedRowBytes(Type, gufo::quant::QuantizedBlockElements(Type));
+  const std::size_t weight_bytes = gufo::quant::QuantizedRowBytes(Type, k) * m;
+  const auto [d_offset, dmin_offset] = WeightScaleOffsets(Type);
+  DeviceBuffer<unsigned char> weights(weight_bytes);
+  DeviceBuffer<float> fp32_x(batch * k), y(batch * m), reference(batch * m);
+  DeviceBuffer<short> half_x(batch * k);
+  FillWeights<<<static_cast<unsigned>((weight_bytes / block_bytes + 255) / 256),
+                256>>>(weights.data(), weight_bytes, block_bytes, d_offset,
+                        dmin_offset, pattern);
+  FillValues<<<static_cast<unsigned>((fp32_x.size() + 255) / 256), 256>>>(
+      fp32_x.data(), fp32_x.size());
+  LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(), nullptr);
+  LaunchBatchedQuantGEMMFp16(Type, weights.data(), half_x.data(),
+                             reference.data(), batch, m, k, nullptr);
+  const auto expected = reference.CopyToHost();
+  for (int variant = 0; variant < kTileVariants; ++variant) {
+    const auto launch = [&] {
+      LaunchTileVariant<Type>(weights.data(), half_x.data(), y.data(), batch, m,
+                              k, variant, nullptr);
+    };
+    hipMemset(y.data(), 0, y.size() * sizeof(float));
+    launch();
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto actual = y.CopyToHost();
+    std::size_t mismatches = 0;
+    for (std::size_t i = 0; i < actual.size(); ++i)
+      mismatches += actual[i] != expected[i];
+    for (unsigned i = 0; i < 2; ++i) launch();
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < iterations; ++i) launch();
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto stop = std::chrono::steady_clock::now();
+    const double ms =
+        std::chrono::duration<double, std::milli>(stop - start).count() /
+        iterations;
+    std::printf(
+        "tiles type=%s M=%zu K=%zu variant=%d %-18s ms=%.6f tflops=%.2f "
+        "mismatch=%zu\n",
+        TypeName(Type), m, k, variant, TileName(variant), ms,
+        (2.0 * static_cast<double>(m) * k * batch) / (ms * 1e9), mismatches);
+    std::fflush(stdout);
+  }
+}
+
+void DispatchTiles(GgmlType type, std::size_t m, std::size_t k,
+                   std::size_t batch, unsigned iterations, int pattern) {
+  switch (type) {
+    case GgmlType::kQ4_K:
+      RunTiles<GgmlType::kQ4_K>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kQ6_K:
+      RunTiles<GgmlType::kQ6_K>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kIQ4_XS:
+      RunTiles<GgmlType::kIQ4_XS>(m, k, batch, iterations, pattern);
+      return;
+    case GgmlType::kIQ3_XXS:
+      RunTiles<GgmlType::kIQ3_XXS>(m, k, batch, iterations, pattern);
+      return;
+    default:
+      std::fprintf(stderr, "tiles sweep covers q4k, q6k, iq4xs, iq3xxs\n");
+      return;
+  }
+}
+
 int main(int argc, char** argv) {
   if (argc < 4) {
     std::fprintf(stderr,
@@ -170,7 +291,9 @@ int main(int argc, char** argv) {
                  "[iterations] [pattern]\n");
     return 1;
   }
-  const std::string name = argv[1];
+  std::string name = argv[1];
+  const bool sweep = name.rfind("tiles:", 0) == 0;
+  if (sweep) name = name.substr(6);
   const std::size_t m = std::stoull(argv[2]);
   const std::size_t k = std::stoull(argv[3]);
   const std::size_t batch = argc > 4 ? std::stoull(argv[4]) : 2048;
@@ -184,7 +307,10 @@ int main(int argc, char** argv) {
     }
     for (const auto& entry : kTypes) {
       if (name == entry.name) {
-        RunFp16(entry.type, m, k, batch, iterations, pattern);
+        if (sweep)
+          DispatchTiles(entry.type, m, k, batch, iterations, pattern);
+        else
+          RunFp16(entry.type, m, k, batch, iterations, pattern);
         return 0;
       }
     }
