@@ -5,6 +5,7 @@
 // Synthetic device weights; component timings do not replace release model
 // measurements with the actual mapped GGUF artifacts.
 #define ENGINE_ENABLE_HIP 1
+#include <chrono>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -71,15 +72,17 @@ void RunQuant(std::size_t m, std::size_t k, std::size_t batch,
               unsigned iterations) {
   using namespace gufo::hip;
   using gufo::core::GgmlType;
-  if (m < 1024 || k < 1024 || k % 256 || batch < 96 || iterations == 0)
+  if (m < 16 || k < 1024 || k % 256 || batch < 96 || iterations == 0)
     throw std::invalid_argument(
         "require M/K >= 1024, K % 256 = 0, batch >= 96");
   constexpr bool affine = Type == GgmlType::kQ4_K || Type == GgmlType::kQ5_K;
-  constexpr std::size_t block_bytes = Type == GgmlType::kQ4_K   ? 144
-                                      : Type == GgmlType::kQ5_K ? 176
-                                      : Type == GgmlType::kQ6_K ? 210
-                                      : Type == GgmlType::kQ8_0 ? 34
-                                                                : 136;
+  constexpr std::size_t block_bytes = Type == GgmlType::kQ4_K     ? 144
+                                      : Type == GgmlType::kQ5_K    ? 176
+                                      : Type == GgmlType::kQ6_K    ? 210
+                                      : Type == GgmlType::kQ8_0    ? 34
+                                      : Type == GgmlType::kIQ3_S   ? 110
+                                      : Type == GgmlType::kIQ3_XXS ? 98
+                                                                   : 136;
   const std::size_t weight_bytes =
       m * k / (Type == GgmlType::kQ8_0 ? 32 : 256) * block_bytes;
   DeviceBuffer<unsigned char> weights(weight_bytes),
@@ -113,18 +116,18 @@ void RunQuant(std::size_t m, std::size_t k, std::size_t batch,
       reference.data(), candidate.data(), reference.size(), mismatches.data());
   if (mismatches.CopyToHost()[0] != 0)
     throw std::runtime_error("production prefill differs from wave32 control");
-  Event begin, end;
   const auto time = [&](auto launch) {
     for (unsigned i = 0; i < 3; ++i)
       launch();
-    HIP_CHECK(hipEventRecord(begin.Get()));
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto start = std::chrono::steady_clock::now();
     for (unsigned i = 0; i < iterations; ++i)
       launch();
-    HIP_CHECK(hipEventRecord(end.Get()));
-    HIP_CHECK(hipEventSynchronize(end.Get()));
-    float ms = 0;
-    HIP_CHECK(hipEventElapsedTime(&ms, begin.Get(), end.Get()));
-    return ms / iterations;
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto stop = std::chrono::steady_clock::now();
+    return static_cast<float>(
+        std::chrono::duration<double, std::milli>(stop - start).count() /
+        iterations);
   };
   for (unsigned repeat = 0; repeat < 3; ++repeat) {
     float control_ms, production_ms;
@@ -239,9 +242,13 @@ int main(int argc, char** argv) {
         RunQuant<GgmlType::kQ8_0>(m, k, batch, iterations);
       else if (type == "iq4")
         RunQuant<GgmlType::kIQ4_XS>(m, k, batch, iterations);
+      else if (type == "iq3s")
+        RunQuant<GgmlType::kIQ3_S>(m, k, batch, iterations);
+      else if (type == "iq3xxs")
+        RunQuant<GgmlType::kIQ3_XXS>(m, k, batch, iterations);
       else
         throw std::invalid_argument(
-            "expected q4, q5, q6, q8, iq4 or q8-swiglu");
+            "expected q4, q5, q6, q8, iq4, iq3s, iq3xxs or q8-swiglu");
     } else {
       throw std::invalid_argument(
           "usage: prefill_gemm_bench q4|q5|q6|q8|iq4 M K [batch] [iterations], "

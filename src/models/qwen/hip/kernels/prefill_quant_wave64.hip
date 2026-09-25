@@ -38,6 +38,12 @@ bool TryLaunchQuantPrefillWave64(core::GgmlType type, const void* w,
       }
       launch.template operator()<core::GgmlType::kIQ4_XS>();
       return true;
+    case core::GgmlType::kIQ3_S:
+      launch.template operator()<core::GgmlType::kIQ3_S>();
+      return true;
+    case core::GgmlType::kIQ3_XXS:
+      launch.template operator()<core::GgmlType::kIQ3_XXS>();
+      return true;
     default:
       return false;
   }
