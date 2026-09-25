@@ -272,3 +272,30 @@ the model) removes the entire 27B model from the fast path. That is the ByteShap
 prefill deficit, and closing it is the highest-value fix available on that shard:
 make Q2_K native (per-half offset in the WMMA kernel) or re-encode that one tensor
 to a native format.
+
+### Q2_K native: implementation details derived so far
+
+Sidecar (`prefill_quant_gemm.hpp` and the second copy in
+`prefill_quant_gemm.hip`): reduce over 8,4,2,1 only, then fetch the other half
+with a single `__shfl_xor(qsum, 16)`. After that reduction lanes 0..15 hold the
+low 16-element sum and lanes 16..31 the high one, so lane 0 can write both; the
+per-(token, 32-block) slot becomes two floats and `kQ8ActSumTileBytes` doubles.
+Every allocation and the capacity check already route through `Q8ActSumBytes`.
+
+Kernel: the inner loop already keeps the two 16-element halves separate -
+`a0/b0` feed `c0` and `a1/b1` feed `c1` - so the correction is simply
+`acc -= off0*sx0 + off1*sx1`, or `off1*sx_full + (off0-off1)*sx_lo` if only the
+full and low sums are stored. `s_sx` and `s_off` each need a second half; the
+least invasive shape is a trailing dimension of `PerHalfOffset ? 32 : 16`, which
+leaves existing types bit-identical.
+
+Read the current `s_off` / `s_sx` indexing before choosing the layout: the
+offset path already partitions its 16 slots by `half_id * kAccumulatorElements`,
+and that decides whether the second half is a new leading dimension or the upper
+half of the trailing one. `PerHalfScale` must also gain `kQ2_K`; its list is
+currently Q6_K, Q3_K, IQ2_XS, IQ2_S only.
+
+Order: add Q2_K to `kFormats` in the q4kxl oracle test first and watch it fail
+red, then the sidecar, then the kernel, then the dispatch and
+`IsNativeWmmaQuant`. The sidecar is shared by every quantised format, so that
+test is the only thing that catches a mistake; it corrupts silently otherwise.
