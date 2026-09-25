@@ -433,4 +433,54 @@ already IQ4_XS/Q4_K/Q5_K. The remaining spread is inside the kernel again, but
 it is now small enough that the next lever worth pulling is the kernel's own
 58%-of-peak efficiency, not the per-format decoders.
 
+### Kernel efficiency: the ceiling is 48 TFLOPS, and the tile space is exhausted
+
+The fp16 ceiling had been assumed from the int8 figure. Measured properly with
+a wall-clock harness (`wmma_f32_16x16x16_f16_w32`, eight live accumulator chains
+so the compiler cannot delete six of them -- a first attempt read only two and
+reported 4x too high):
+
+| instruction | TMAC/s | TFLOPS |
+| --- | ---: | ---: |
+| WMMA fp16 | 24.17 | 48.35 |
+| WMMA bf16 | 23.73 | 47.47 |
+| WMMA iu8 | 25.15 | 50.31 |
+
+So 48.3 TFLOPS is the fp16 ceiling and the prefill kernel at ~31.7 TFLOPS sits
+at 66% of it, not the 58% of a 55 TFLOPS guess. The int4 rate really is 2x --
+52.6 TMAC/s at the same 16x16x16 shape -- but that path needs four-bit
+activations and is therefore a quality decision, not a kernel one.
+
+The tile space was then swept by launching `HalfPrefillGemmKernel` directly on
+candidate (BM, BN, WM, WN, Complete), each verified bit-wise against the
+production launcher (mismatch 0 everywhere), gate/up m=17408 k=5120 batch 2048,
+ms per GEMM:
+
+| variant | Q4_K | Q6_K | IQ4_XS | IQ3_XXS |
+| --- | ---: | ---: | ---: | ---: |
+| 256x256 w8n4 (production) | 12.68 | 11.92 | 11.28 | 12.12 |
+| 256x256 w4n8 | 12.89 | 11.93 | 11.78 | 11.96 |
+| 256x256 w4n4 | 12.00 | 11.80 | 11.85 | 12.90 |
+| 256x256 w16n2 | 14.33 | 13.73 | 12.28 | 12.77 |
+| 256x192 w8n4 | 14.54 | 13.65 | 13.61 | 13.37 |
+| 128x256 w4n8 | 14.82 | 14.46 | 14.37 | 13.85 |
+| 256x128 w8n4 | 15.85 | 15.89 | 15.80 | 15.14 |
+| 128x128 w4n4 | 16.05 | 17.91 | 15.11 | 14.74 |
+| 256x256 w8n4 Complete | 12.13 | 11.96 | 13.02 | 12.24 |
+
+Only the 256x256 family is competitive; every narrower tile is 15-40% slower.
+BK is fixed at 4 and the two stages already fill the 64 KiB LDS budget, so a
+smaller tile stages proportionally less work per byte and the occupancy it buys
+back does not repay it. `Complete` (drop the tail predicates) is worth 4% on
+Q4_K, neutral on Q6_K/IQ3_XXS, and costs 15% on IQ4_XS -- which is exactly why
+`DirectGemm` gates it on `LargeKvTile` and leaves IQ4_XS on the general kernel.
+Production is already at the optimum of this space.
+
+The remaining 34% is also not occupancy that can be bought: LDS is exactly full
+at 64 KiB per block, so there is one block per CU, and 1024 threads is the
+hardware workgroup limit. The block supplies 8 waves per SIMD and that is what
+the pipeline gets. Closing the rest needs a different inner loop -- wider LDS
+reads, or a wave64 variant -- which is a new kernel rather than a parameter.
+
+
 
