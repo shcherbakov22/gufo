@@ -531,8 +531,15 @@ __launch_bounds__(WM * WN * 32) __global__
                   ((Type == gufo::core::GgmlType::kIQ4_XS &&
                     (!Mixed || UpType != gufo::core::GgmlType::kQ5_K)) ||
                    (Type == gufo::core::GgmlType::kIQ4_NL &&
-                    UpType == gufo::core::GgmlType::kIQ4_XS))) {
-      // Interleave LDS reads with WMMA after IQ4 decoding. Mixed Q5
+                    UpType == gufo::core::GgmlType::kIQ4_XS) ||
+                   Type == gufo::core::GgmlType::kQ3_K ||
+                   Type == gufo::core::GgmlType::kQ2_K ||
+                   Type == gufo::core::GgmlType::kIQ3_S ||
+                   Type == gufo::core::GgmlType::kIQ3_XXS ||
+                   Type == gufo::core::GgmlType::kIQ2_XS ||
+                   Type == gufo::core::GgmlType::kIQ2_S ||
+                   Type == gufo::core::GgmlType::kIQ2_XXS)) {
+      // Interleave LDS reads with WMMA after the grid decoders. Mixed Q5
       // decoders retain the compiler's default instruction schedule.
       __builtin_amdgcn_iglp_opt(0);
     }
