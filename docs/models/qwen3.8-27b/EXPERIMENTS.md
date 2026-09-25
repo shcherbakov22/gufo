@@ -234,3 +234,41 @@ Risk: the sidecar is shared by every q8-activating format, so a mistake here
 corrupts all quantised models rather than failing loudly. Land it with the
 oracle suite green at each step, and expect the payoff to be model-level (the
 whole shard regaining the chunked path) rather than Q2_K's own 0.0% byte share.
+
+
+## int4 eligibility, and the one tensor that disqualifies the 3.84 bpw shard
+
+Eligible for int4 packing: the linear Q family at four bits or below.
+
+| format | code | work needed |
+| --- | --- | --- |
+| Q4_0 | already -8..7 | none |
+| Q3_K | already -4..3 | none, PerHalfScale already covers it |
+| Q4_K | 0..15 | q-8 remap folded into the existing offset |
+| Q4_1 | 0..15 plus per-block min | constant per-32 offset |
+| Q2_K | 0..3 plus per-16 min | needs the per-half activation sum |
+| Q2_0 | 0..3 | constant offset |
+| Q1_0 | 0/1 | constant offset |
+| TQ1_0 / TQ2_0 | -1/0/+1 | none |
+
+The weight repack is lossless by capacity: a linear format of four bits or fewer
+has at most sixteen distinct codes and signed int4 holds exactly sixteen values,
+so the map is a bijection and nothing is requantised. The integer codes are exact;
+the fp32 evaluation is merely rearranged, so the result moves at the ULP level and
+any bit-exact A/B spanning the change must move together.
+
+Excluded despite being four bits or fewer: the whole IQ family (grid codebooks -
+no integer WMMA can consume a grid code) and MXFP4/NVFP4 (4-bit float; the fp4
+WMMA builtins are gfx12). Excluded by width: Q5_*, Q6_K, Q8_*. Only Q4_K and Q3_K
+are present in the current shards - 25.7% of UD-Q4_K_S and 15.6% of the 3.84 bpw
+one - and the remainder is structurally excluded, so the payoff on these artifacts
+is a low-double-digit percent of prefill and only a change of quantisation mix
+enlarges it.
+
+Verified by enumeration: of the 455 tensors the chunked-prefill predicate inspects
+in the 3.84 bpw shard, exactly one is not Q8_0 or a native WMMA quant -
+`blk.22.ssm_beta.weight`, 5120x48, Q2_K. One 245k-parameter tensor (0.0009% of
+the model) removes the entire 27B model from the fast path. That is the ByteShape
+prefill deficit, and closing it is the highest-value fix available on that shard:
+make Q2_K native (per-half offset in the WMMA kernel) or re-encode that one tensor
+to a native format.
