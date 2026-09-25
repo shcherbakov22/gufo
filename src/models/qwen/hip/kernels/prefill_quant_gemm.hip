@@ -1416,6 +1416,18 @@ void LaunchKQuantSmallBatchByType(core::GgmlType type, const void* w,
       LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kIQ3_S>(
           w, fp32_x, y, batch, m, k, grid, block, stream);
       return;
+    case core::GgmlType::kIQ3_XXS:
+      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kIQ3_XXS>(
+          w, fp32_x, y, batch, m, k, grid, block, stream);
+      return;
+    case core::GgmlType::kIQ2_XS:
+      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kIQ2_XS>(
+          w, fp32_x, y, batch, m, k, grid, block, stream);
+      return;
+    case core::GgmlType::kIQ2_S:
+      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kIQ2_S>(
+          w, fp32_x, y, batch, m, k, grid, block, stream);
+      return;
     default:
       return;
   }
@@ -1492,6 +1504,18 @@ void LaunchKQuantWmmaGEMM(core::GgmlType type, const void* w,
     case core::GgmlType::kIQ3_S:
       LaunchKQuantWmmaGEMMTyped<core::GgmlType::kIQ3_S>(w, q8_1_x, y, batch, m,
                                                         k, stream);
+      return;
+    case core::GgmlType::kIQ3_XXS:
+      LaunchKQuantWmmaGEMMTyped<core::GgmlType::kIQ3_XXS>(
+          w, q8_1_x, y, batch, m, k, stream);
+      return;
+    case core::GgmlType::kIQ2_XS:
+      LaunchKQuantWmmaGEMMTyped<core::GgmlType::kIQ2_XS>(
+          w, q8_1_x, y, batch, m, k, stream);
+      return;
+    case core::GgmlType::kIQ2_S:
+      LaunchKQuantWmmaGEMMTyped<core::GgmlType::kIQ2_S>(
+          w, q8_1_x, y, batch, m, k, stream);
       return;
     default:
       return;

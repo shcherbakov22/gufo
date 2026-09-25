@@ -88,6 +88,33 @@ struct block_iq3_s {
   std::uint8_t signs[32];
   std::uint8_t scales[4];
 };
+
+// IQ3_XXS: super-block of 256 (98 bytes). The first 64 bytes are two-bit
+// indices into the 256-entry iq3xxs grid; the remaining 32 are
+// scales_and_signs -- four 7-bit sign indices plus one 4-bit scale per group of
+// 32 elements.
+struct block_iq3_xxs {
+  std::uint16_t d;
+  std::uint8_t qs[96];
+};
+
+// IQ2_XS: super-block of 256 (74 bytes). 32 uint16 codes, each a 9-bit index
+// into the 512-entry iq2xs grid plus a 7-bit sign index; scales holds two 4-bit
+// sub-block scales per byte.
+struct block_iq2_xs {
+  std::uint16_t d;
+  std::uint16_t qs[32];
+  std::uint8_t scales[8];
+};
+
+// IQ2_S: super-block of 256 (82 bytes). qs[0..31] are 8-bit grid indices whose
+// two high bits come from qh; qs[32..63] are the sign bytes; scales as IQ2_XS.
+struct block_iq2_s {
+  std::uint16_t d;
+  std::uint8_t qs[64];
+  std::uint8_t qh[8];
+  std::uint8_t scales[8];
+};
 #pragma pack(pop)
 
 static_assert(sizeof(block_q4_K) == 144, "block_q4_K must be 144 bytes");
@@ -99,6 +126,9 @@ static_assert(sizeof(block_q8_0) == 34, "block_q8_0 must be 34 bytes");
 static_assert(sizeof(block_iq4_nl) == 18, "block_iq4_nl must be 18 bytes");
 static_assert(sizeof(block_iq4_xs) == 136, "block_iq4_xs must be 136 bytes");
 static_assert(sizeof(block_iq3_s) == 110, "block_iq3_s must be 110 bytes");
+static_assert(sizeof(block_iq3_xxs) == 98, "block_iq3_xxs must be 98 bytes");
+static_assert(sizeof(block_iq2_xs) == 74, "block_iq2_xs must be 74 bytes");
+static_assert(sizeof(block_iq2_s) == 82, "block_iq2_s must be 82 bytes");
 
 /// Non-linear 4-bit codebook shared by IQ4_NL and IQ4_XS.
 inline constexpr std::int8_t kValuesIq4Nl[16] = {
@@ -119,6 +149,9 @@ inline constexpr std::int8_t kValuesIq4Nl[16] = {
       return 32;
     case core::GgmlType::kQ2_K:
     case core::GgmlType::kIQ2_XXS:
+    case core::GgmlType::kIQ2_XS:
+    case core::GgmlType::kIQ3_XXS:
+    case core::GgmlType::kIQ2_S:
     case core::GgmlType::kIQ4_XS:
     case core::GgmlType::kIQ3_S:
     case core::GgmlType::kQ3_K:
@@ -185,6 +218,15 @@ void DequantizeIQ4_XS(const void* src, float* dst, std::size_t k);
 // Dequantize row of IQ3_S to float
 void DequantizeIQ3_S(const void* src, float* dst, std::size_t k);
 
+// Dequantize row of IQ3_XXS to float
+void DequantizeIQ3_XXS(const void* src, float* dst, std::size_t k);
+
+// Dequantize row of IQ2_XS to float
+void DequantizeIQ2_XS(const void* src, float* dst, std::size_t k);
+
+// Dequantize row of IQ2_S to float
+void DequantizeIQ2_S(const void* src, float* dst, std::size_t k);
+
 // Compute dot product of IQ4_NL quantized row with FP32 vector
 float DotProductIQ4_NL(const void* row_data, std::span<const float> vec,
                        std::size_t k);
@@ -193,6 +235,15 @@ float DotProductIQ4_XS(const void* row_data, std::span<const float> vec,
                        std::size_t k);
 // Compute dot product of IQ3_S quantized row with FP32 vector
 float DotProductIQ3_S(const void* row_data, std::span<const float> vec,
+                      std::size_t k);
+// Compute dot product of IQ3_XXS quantized row with FP32 vector
+float DotProductIQ3_XXS(const void* row_data, std::span<const float> vec,
+                        std::size_t k);
+// Compute dot product of IQ2_XS quantized row with FP32 vector
+float DotProductIQ2_XS(const void* row_data, std::span<const float> vec,
+                       std::size_t k);
+// Compute dot product of IQ2_S quantized row with FP32 vector
+float DotProductIQ2_S(const void* row_data, std::span<const float> vec,
                       std::size_t k);
 
 /// Returns the 512-entry IQ3_S grid table (each entry packs four uint8

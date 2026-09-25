@@ -5,6 +5,8 @@
 #include <cstring>
 #include <limits>
 
+#include "src/core/quant/iq_grids.hpp"
+
 namespace gufo::quant {
 
 // Standard half-precision float to single-precision float conversion
@@ -188,6 +190,15 @@ std::size_t QuantizedRowBytes(core::GgmlType type,
       break;
     case core::GgmlType::kIQ2_XXS:
       block_bytes = 66;
+      break;
+    case core::GgmlType::kIQ3_XXS:
+      block_bytes = sizeof(block_iq3_xxs);
+      break;
+    case core::GgmlType::kIQ2_XS:
+      block_bytes = sizeof(block_iq2_xs);
+      break;
+    case core::GgmlType::kIQ2_S:
+      block_bytes = sizeof(block_iq2_s);
       break;
     case core::GgmlType::kQ3_K:
       block_bytes = sizeof(block_q3_K);
@@ -668,6 +679,157 @@ float DotProductIQ3_S(const void* row_data, std::span<const float> vec,
     const float* v = vec.data() + (b * 256);
     for (std::size_t i = 0; i < 256; ++i) {
       sum += Iq3sValue(blocks[b], i) * v[i];
+    }
+  }
+  return sum;
+}
+
+// ---------------------------------------------------------------------------
+// IQ3_XXS / IQ2_XS / IQ2_S: the Unsloth UD-Q4_K_S shard uses these three for a
+// handful of small tensors. Mirrors ggml-quants.c
+// dequantize_row_iq3_xxs / _iq2_xs / _iq2_s element for element.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Element index (0..255) of one IQ3_XXS super-block. Each group of eight
+// elements is two four-value grid entries that share one sign byte.
+float Iq3XxsValue(const block_iq3_xxs& block, std::size_t index) noexcept {
+  const std::size_t ib32 = index / 32;
+  const std::size_t l = (index % 32) / 8;  // group of eight
+  const std::size_t m = index % 8;         // element in the group
+  const std::size_t half = m / 4;          // 0 -> grid1, 1 -> grid2
+  const std::size_t jj = m % 4;
+
+  const std::uint8_t* scales_and_signs = block.qs + 64;
+  const std::uint32_t aux32 =
+      static_cast<std::uint32_t>(scales_and_signs[4 * ib32]) |
+      (static_cast<std::uint32_t>(scales_and_signs[(4 * ib32) + 1]) << 8) |
+      (static_cast<std::uint32_t>(scales_and_signs[(4 * ib32) + 2]) << 16) |
+      (static_cast<std::uint32_t>(scales_and_signs[(4 * ib32) + 3]) << 24);
+  const float db =
+      Fp16ToFloat(block.d) * (0.5F + static_cast<float>(aux32 >> 28)) * 0.5F;
+
+  const std::size_t grid_index = block.qs[(8 * ib32) + (2 * l) + half];
+  const auto* grid =
+      reinterpret_cast<const std::uint8_t*>(&kIq3XxsGrid[grid_index]);
+  const std::uint8_t signs = kKsignsIq2xs[(aux32 >> (7 * l)) & 127U];
+
+  const float magnitude = static_cast<float>(grid[jj]);
+  return (signs & kKmaskIq2xs[m]) ? -db * magnitude : db * magnitude;
+}
+
+// Element index (0..255) of one IQ2_XS super-block.
+float Iq2XsValue(const block_iq2_xs& block, std::size_t index) noexcept {
+  const std::size_t ib32 = index / 32;
+  const std::size_t l = (index % 32) / 8;
+  const std::size_t j = index % 8;
+
+  const std::uint16_t code = block.qs[(4 * ib32) + l];
+  const auto* grid =
+      reinterpret_cast<const std::uint8_t*>(&kIq2XsGrid[code & 511U]);
+  const std::uint8_t signs = kKsignsIq2xs[code >> 9];
+
+  const int scale_nibble =
+      (l < 2) ? (block.scales[ib32] & 0x0FU) : (block.scales[ib32] >> 4U);
+  const float db =
+      Fp16ToFloat(block.d) * (0.5F + static_cast<float>(scale_nibble)) * 0.25F;
+
+  const float magnitude = static_cast<float>(grid[j]);
+  return (signs & kKmaskIq2xs[j]) ? -db * magnitude : db * magnitude;
+}
+
+// Element index (0..255) of one IQ2_S super-block.
+float Iq2SValue(const block_iq2_s& block, std::size_t index) noexcept {
+  const std::size_t ib32 = index / 32;
+  const std::size_t l = (index % 32) / 8;
+  const std::size_t j = index % 8;
+
+  const std::size_t grid_index =
+      static_cast<std::size_t>(block.qs[(4 * ib32) + l]) |
+      ((static_cast<std::size_t>(block.qh[ib32]) << (8 - (2 * l))) & 0x300U);
+  const auto* grid =
+      reinterpret_cast<const std::uint8_t*>(&kIq2SGrid[grid_index]);
+  const std::uint8_t signs = block.qs[32 + (4 * ib32) + l];
+
+  const int scale_nibble =
+      (l < 2) ? (block.scales[ib32] & 0x0FU) : (block.scales[ib32] >> 4U);
+  const float db =
+      Fp16ToFloat(block.d) * (0.5F + static_cast<float>(scale_nibble)) * 0.25F;
+
+  const float magnitude = static_cast<float>(grid[j]);
+  return (signs & kKmaskIq2xs[j]) ? -db * magnitude : db * magnitude;
+}
+
+}  // namespace
+
+void DequantizeIQ3_XXS(const void* src, float* dst, std::size_t k) {
+  const auto* blocks = static_cast<const block_iq3_xxs*>(src);
+  const std::size_t nb = k / 256;
+  for (std::size_t b = 0; b < nb; ++b) {
+    for (std::size_t i = 0; i < 256; ++i) {
+      dst[(b * 256) + i] = Iq3XxsValue(blocks[b], i);
+    }
+  }
+}
+
+void DequantizeIQ2_XS(const void* src, float* dst, std::size_t k) {
+  const auto* blocks = static_cast<const block_iq2_xs*>(src);
+  const std::size_t nb = k / 256;
+  for (std::size_t b = 0; b < nb; ++b) {
+    for (std::size_t i = 0; i < 256; ++i) {
+      dst[(b * 256) + i] = Iq2XsValue(blocks[b], i);
+    }
+  }
+}
+
+void DequantizeIQ2_S(const void* src, float* dst, std::size_t k) {
+  const auto* blocks = static_cast<const block_iq2_s*>(src);
+  const std::size_t nb = k / 256;
+  for (std::size_t b = 0; b < nb; ++b) {
+    for (std::size_t i = 0; i < 256; ++i) {
+      dst[(b * 256) + i] = Iq2SValue(blocks[b], i);
+    }
+  }
+}
+
+float DotProductIQ3_XXS(const void* row_data, std::span<const float> vec,
+                        std::size_t k) {
+  const auto* blocks = static_cast<const block_iq3_xxs*>(row_data);
+  const std::size_t nb = k / 256;
+  float sum = 0.0F;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float* v = vec.data() + (b * 256);
+    for (std::size_t i = 0; i < 256; ++i) {
+      sum += Iq3XxsValue(blocks[b], i) * v[i];
+    }
+  }
+  return sum;
+}
+
+float DotProductIQ2_XS(const void* row_data, std::span<const float> vec,
+                       std::size_t k) {
+  const auto* blocks = static_cast<const block_iq2_xs*>(row_data);
+  const std::size_t nb = k / 256;
+  float sum = 0.0F;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float* v = vec.data() + (b * 256);
+    for (std::size_t i = 0; i < 256; ++i) {
+      sum += Iq2XsValue(blocks[b], i) * v[i];
+    }
+  }
+  return sum;
+}
+
+float DotProductIQ2_S(const void* row_data, std::span<const float> vec,
+                      std::size_t k) {
+  const auto* blocks = static_cast<const block_iq2_s*>(row_data);
+  const std::size_t nb = k / 256;
+  float sum = 0.0F;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float* v = vec.data() + (b * 256);
+    for (std::size_t i = 0; i < 256; ++i) {
+      sum += Iq2SValue(blocks[b], i) * v[i];
     }
   }
   return sum;

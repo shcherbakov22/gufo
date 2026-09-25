@@ -142,8 +142,11 @@ __launch_bounds__(WM * WN * WaveSize, 1) __global__
                                         float* __restrict__ y,
                                         std::size_t batch, std::size_t m,
                                         std::size_t k) {
+  // Q6_K/Q3_K and the IQ2 family carry one scale per sixteen elements, so the
+  // second half of each thirty-two-element stage needs its own scale.
   constexpr bool PerHalfScale =
-      WType == core::GgmlType::kQ6_K || WType == core::GgmlType::kQ3_K;
+      WType == core::GgmlType::kQ6_K || WType == core::GgmlType::kQ3_K ||
+      WType == core::GgmlType::kIQ2_XS || WType == core::GgmlType::kIQ2_S;
   constexpr bool HasOffset =
       WType == core::GgmlType::kQ4_K || WType == core::GgmlType::kQ5_K;
 
