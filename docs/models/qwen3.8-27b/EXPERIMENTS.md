@@ -554,4 +554,45 @@ away entirely (`LDS Size: 2 bytes`) and measured an empty loop. Both looked
 plausible. Ceiling and ablation numbers here are trusted only when the resource
 report and the operand values both check out.
 
+### Hardware counters: the load path is the loaded unit
+
+`rocprofv3` counter collection works on this platform even though its kernel
+timestamps do not. That is worth knowing: the earlier "no profiling possible"
+note applies to timing/tracing, not to PMCs. For the Q4_K 256x256 kernel at
+gate/up m=17408 k=5120 batch 2048, per dispatch (19 launches aggregated):
+
+| counter | value | reading |
+| --- | ---: | --- |
+| `SQC_LDS_BANK_CONFLICT` | 26 total (max 495) | zero -- LDS conflicts are ruled out for good |
+| `SQ_INSTS_LDS` | 7.24e7 | 12 LDS per K step per wave, exactly the design |
+| `SQ_INSTS_VALU` | 1.77e8 | 44.6e6 are MMA; 132e6 are address/loop arithmetic |
+| `SQ_INSTS_FLAT` | 1.09e7 | the global load instructions |
+| `TA_TA_BUSY` | 1.87e7 of 2.35e7 cycles | L1/texture path busy 80% of the runtime |
+| `GL2C_HIT` / `GL2C_MISS` | 2.08e7 / 5.42e6 | 79% L2 hit rate |
+| L2 miss traffic | 347 MB per dispatch | against a 60 MB irreducible minimum |
+
+The traffic is the finding. The weight matrix is 50.1 MB, so reading it once per
+token block is 401 MB of requests. Each token block's activation tile is 1.31 MB
+and is re-read once per row block, 68 times, so activations request
+8 x 68 x 1.31 = 713 MB. Against that, unique data is only
+50.1 + 8 x 1.31 = 60.6 MB. The measured 347 MB of misses sits just under the
+weight stream, so it is the weights that mostly miss while the activations mostly
+hit -- which is backwards from the intent: the grid is x-fastest, so the eight
+token blocks of one row tile run consecutively and that row tile's 720 KB of
+weights should stay resident in the 32 MB MALL. It evidently does not; the eight
+blocks stream the same lines in lockstep and the tile is re-fetched each time.
+
+What the counters do not give: a stall reason. This ASIC exposes no
+`SQ_WAIT_*` counters, so the division of the remaining gap between memory
+latency and the matrix pipe cannot be read off directly. What can be said is
+that L1/TA is the busiest unit (80%), the matrix pipe is not saturated (the
+kernel is at 64-68% of a ceiling that a pure-MMA harness reaches), and the LDS
+and VALU instruction counts match the design exactly.
+
+The next candidate is therefore cross-block reuse rather than the inner loop:
+either an order that keeps a row tile's weights resident across its token
+blocks, or a two-level blocking that keeps both streams resident. Cutting
+347 MB toward 60 MB is worth roughly 5.8x less DRAM traffic; whether it
+converts to time depends on how much of the gap is latency, which the missing
+stall counters leave open. Worth a prototype before believing it.
 
