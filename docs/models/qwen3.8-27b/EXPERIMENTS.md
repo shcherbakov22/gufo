@@ -299,3 +299,61 @@ Order: add Q2_K to `kFormats` in the q4kxl oracle test first and watch it fail
 red, then the sidecar, then the kernel, then the dispatch and
 `IsNativeWmmaQuant`. The sidecar is shared by every quantised format, so that
 test is the only thing that catches a mistake; it corrupts silently otherwise.
+
+### Result: Q2_K native, and the 3.84 bpw shard rejoins the chunked path
+
+Implemented and green in `qwen_q4kxl_quant_ops_test`:
+
+* `prefill_quant_gemm.hpp`: `PerHalfScale` gains Q2_K; new `PerHalfOffset` and
+  `UsesOffset`; the activation-sum sidecar doubles to two floats per
+  (token, 32-block) -- slot 0 the whole-block sum, slot 1 the low 16-element half.
+  `StoreQ8ActLane` reduces over 8,4,2,1 and then fetches the other half with one
+  `__shfl_xor(qsum, 16)`; `Q8ActSumTileBytes` doubles, and every allocation and
+  the capacity check already scale through `Q8ActSumBytes`.
+* Inner loop: `acc -= off_high * full + (off_low - off_high) * low` (the member
+  `lo.offset` feeds the low half and `hi.offset` the high one).
+* `IsNativeWmmaQuant`, the WMMA and small-batch dispatches, and the FP16
+  prefill `DirectGemm` switch all gain Q2_K.
+  `IsFusedSwiGluGemmEpilogueSupported` stays Q8_0-only.
+
+Both sidecar writers were converted -- the shared-pass `StoreQ8ActLane` and the
+fused SwiGLU epilogue in `BlockedSwiGluQuantEpilogue`, which the Q8_0 fused
+kernel instantiates with `StoreActivationSum=true` -- and `ZeroQ8ActTailKernel`
+now zeroes both halves. Every other format still reads the identical whole-block
+sum from slot 0, so their results cannot move: integer addition is exact and
+associative, so stopping the butterfly at sixteen lanes and adding the two
+halves changes nothing.
+
+Oracle coverage for Q2_K, all four routes: decode GEMV relative error 9.6e-08,
+native prefill GEMM 6.9e-08 (small-batch 2.8e-08), FP16 prefill RMSE ratio 0.108,
+and batch 1..8 bit-exact against the decode GEMV.
+
+Measured with `gufo bench -p 2048 -n 128 -r 3`, 30 s between runs, two runs each:
+
+| artifact | pp1024 | pp2048 | tg128 |
+| --- | ---: | ---: | ---: |
+| 3.84 bpw before | -- | 409.55 +/- 1.81 | 12.99 |
+| 3.84 bpw after | 539.02 +/- 0.70 | 522.32 +/- 7.73 / 513.54 +/- 25.51 | 12.94 |
+| `UD-Q4_K_S` reference, same session | -- | 562.38 +/- 9.85 / 547.91 +/- 45.63 | 13.17 |
+
+The 3.84 bpw shard was the slow one only because that single Q2_K tensor removed
+it from the chunked FP16 prefill path. Re-enumerating the predicate over the real
+files now finds 503 inspected tensors and zero outside
+`{Q8_0} union IsNativeWmmaQuant` on both shards, so both take it. That is +27%
+pp2048 on the 3.84 bpw shard, and the route table in `gemm_route.hpp` already
+declared Q2_K `hip_prefill_direct`; only the kernel dispatch was missing.
+
+End-to-end: `gufo bench --validate-prefill 2048` on the 3.84 bpw shard returns
+`top1_match=yes finite=yes`, cosine 0.99999923, max abs diff 0.0111 against the
+token-at-a-time reference. The FP16 route is also the more accurate one by
+construction -- the FP16-prefill oracle requires the FP16 error to
+come in under a quarter of the A8 error, and Q2_K measures a ratio of 0.108.
+
+Residual: the 3.84 bpw shard still trails the reference by about 7% at pp2048.
+The shapes are identical and the shard is smaller (12.18 vs 14.30 GiB), so the
+likely remainder is per-weight decode cost in the FP16 prefill kernel: the
+3.84 bpw FFN matrices are predominantly IQ3_S/IQ3_XXS grid codebooks where the
+reference is IQ4_XS / Q4_K / Q5_K affine nibbles. Unverified -- there is no
+standalone bench of `HalfPrefillGemmKernel` yet. If it holds, the lever is the
+IQ3 grid decode (`CacheIqHeader` currently covers IQ4_XS only).
+
