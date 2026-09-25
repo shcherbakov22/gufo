@@ -603,6 +603,18 @@ __device__ inline constexpr std::uint8_t kDeviceKmaskIq2xs[8] = {
     0x1U, 0x2U, 0x4U, 0x8U, 0x10U, 0x20U, 0x40U, 0x80U,
 };
 
+// Byte-wise sign masks for one four-element grid word: bit i of the index sets
+// byte i to 0xFF. Combined with a carry-free byte negate
+// ((m ^ mask) + (mask & 0x01010101)) it applies four independent sign bits to
+// four magnitudes in one word. Exact because every grid magnitude is at least
+// one, so the per-byte add never carries.
+__device__ inline constexpr std::uint32_t kDeviceIq3sSignMask[16] = {
+    0x00000000U, 0x000000ffU, 0x0000ff00U, 0x0000ffffU,
+    0x00ff0000U, 0x00ff00ffU, 0x00ffff00U, 0x00ffffffU,
+    0xff000000U, 0xff0000ffU, 0xff00ff00U, 0xff00ffffU,
+    0xffff0000U, 0xffff00ffU, 0xffffff00U, 0xffffffffU,
+};
+
 // iq2xxs_grid (ggml-common.h)
 __device__ inline constexpr std::uint64_t kDeviceIq2XxsGrid[256] = {
     0x0808080808080808ULL, 0x080808080808082bULL, 0x0808080808081919ULL,

@@ -720,25 +720,30 @@ __device__ inline void DecodeQuantSub16(core::GgmlType type,
       const std::size_t sb32 = (sub16 / 2) % 8;
       const std::size_t within0 = (sub16 % 2) * 16;
       const std::uint8_t qh_byte = blk.qh[sb32];
-      // Irregular by construction: every group of four elements is a separate
-      // 512-entry grid lookup, so this one stays element-wise. IQ3_S is a
-      // single tensor in the shard.
+      // Each group of eight elements is two four-value grid lookups that share
+      // one sign byte. Loading whole grid words and applying four sign bits per
+      // word with the byte negate keeps the group in one iteration instead of
+      // eight element-at-a-time index computations.
 #pragma unroll
-      for (int j = 0; j < 16; ++j) {
-        const std::size_t within = within0 + static_cast<std::size_t>(j);
-        const std::size_t l = within / 8;
-        const std::size_t jj = within % 8;
-        const std::size_t grid_half = jj / 4;
-        const int shift = static_cast<int>(8 - (2 * l) - grid_half);
-        const std::uint32_t grid_index =
-            static_cast<std::uint32_t>(
-                blk.qs[(sb32 * 8) + (2 * l) + grid_half]) |
-            ((static_cast<std::uint32_t>(qh_byte) << shift) & 256U);
-        const auto* grid =
-            reinterpret_cast<const std::uint8_t*>(&kDeviceIq3sGrid[grid_index]);
-        const int magnitude = static_cast<int>(grid[jj % 4]);
-        const bool negate = (blk.signs[(sb32 * 4) + l] & (1U << jj)) != 0U;
-        out.q[j] = static_cast<std::int8_t>(negate ? -magnitude : magnitude);
+      for (std::size_t q = 0; q < 2; ++q) {
+        const std::size_t l = ((sub16 % 2) * 2) + q;
+        const std::uint32_t signs = blk.signs[(sb32 * 4) + l];
+        const std::uint32_t g1 =
+            kDeviceIq3sGrid[static_cast<std::uint32_t>(
+                                blk.qs[(sb32 * 8) + (2 * l)]) |
+                            ((static_cast<std::uint32_t>(qh_byte)
+                              << static_cast<int>(8 - (2 * l))) &
+                             256U)];
+        const std::uint32_t g2 =
+            kDeviceIq3sGrid[static_cast<std::uint32_t>(
+                                blk.qs[(sb32 * 8) + (2 * l) + 1]) |
+                            ((static_cast<std::uint32_t>(qh_byte)
+                              << static_cast<int>(7 - (2 * l))) &
+                             256U)];
+        const std::uint32_t n1 = kDeviceIq3sSignMask[signs & 0x0FU];
+        const std::uint32_t n2 = kDeviceIq3sSignMask[signs >> 4U];
+        out.w[(2 * q) + 0] = (g1 ^ n1) + (n1 & 0x01010101U);
+        out.w[(2 * q) + 1] = (g2 ^ n2) + (n2 & 0x01010101U);
       }
       const std::uint8_t scale_byte = blk.scales[sb32 / 2];
       const int nibble =
@@ -799,21 +804,18 @@ __device__ inline void DecodeQuantSub16(core::GgmlType type,
       out.scale =
           __half2float(blk.d) * (0.5F + static_cast<float>(aux32 >> 28)) * 0.5F;
 #pragma unroll
-      for (int li = 0; li < 2; ++li) {
-        const std::size_t l = 2 * half + static_cast<std::size_t>(li);
-        const std::uint8_t signs =
+      for (std::size_t q = 0; q < 2; ++q) {
+        const std::size_t l = (2 * half) + q;
+        const std::uint32_t signs =
             kDeviceKsignsIq2xs[(aux32 >> (7 * l)) & 127U];
-        const std::uint8_t* g1 = reinterpret_cast<const std::uint8_t*>(
-            &kDeviceIq3XxsGrid[blk.qs[(8 * ib32) + (2 * l)]]);
-        const std::uint8_t* g2 = reinterpret_cast<const std::uint8_t*>(
-            &kDeviceIq3XxsGrid[blk.qs[(8 * ib32) + (2 * l) + 1]]);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          const bool n0 = (signs & kDeviceKmaskIq2xs[j]) != 0U;
-          const bool n1 = (signs & kDeviceKmaskIq2xs[j + 4]) != 0U;
-          out.q[li * 8 + j] = static_cast<std::int8_t>(n0 ? -g1[j] : g1[j]);
-          out.q[li * 8 + j + 4] = static_cast<std::int8_t>(n1 ? -g2[j] : g2[j]);
-        }
+        const std::uint32_t g1 =
+            kDeviceIq3XxsGrid[blk.qs[(8 * ib32) + (2 * l)]];
+        const std::uint32_t g2 =
+            kDeviceIq3XxsGrid[blk.qs[(8 * ib32) + (2 * l) + 1]];
+        const std::uint32_t n1 = kDeviceIq3sSignMask[signs & 0x0FU];
+        const std::uint32_t n2 = kDeviceIq3sSignMask[signs >> 4U];
+        out.w[(2 * q) + 0] = (g1 ^ n1) + (n1 & 0x01010101U);
+        out.w[(2 * q) + 1] = (g2 ^ n2) + (n2 & 0x01010101U);
       }
       return;
     }
