@@ -482,5 +482,34 @@ hardware workgroup limit. The block supplies 8 waves per SIMD and that is what
 the pipeline gets. Closing the rest needs a different inner loop -- wider LDS
 reads, or a wave64 variant -- which is a new kernel rather than a parameter.
 
+### wave64 is not a lever for fp16
 
+The obvious next structure was a wave64 fp16 kernel, mirroring
+`prefill_quant_wave64.hip` on the int8 side. Measured the ceiling first, since
+that decides it. `wmma_f32_16x16x16_f16_w64` takes the same operands as the w32
+form (16 + 16 halves) with a v4f accumulator instead of v8f:
+
+| form | TMAC/s | TFLOPS |
+| --- | ---: | ---: |
+| wmma f16 w32 | 24.17 / 24.41 | 48.35 / 48.82 |
+| wmma f16 w64 | 24.25 / 24.32 | 48.50 / 48.64 |
+
+Identical. The w64 instruction computes the same 4096 MACs and the SIMD issues
+it over two cycles, so it buys half the accumulator registers and no throughput.
+Together with the tile sweep (occupancy is not what is binding) and the int8
+evidence -- the int8 path, wave64 where it qualifies, still measures 14.8-17.5
+ms per FFN GEMM against 11.5-13.0 for the fp16 w32 path -- a wave64 fp16 prefill
+kernel is not worth building: it can only reach the ceiling the current kernel is
+already closest to. That closes the fp16 efficiency question at 66% of a 48.3
+TFLOPS ceiling.
+
+What is left is the int4 rate: 52.6 TMAC/s at the same 16x16x16 shape, 2.1x
+int8 and 2.2x fp16, and the only measured lever above 1.5x anywhere in this
+kernel. It is a quality decision -- both operands must be four-bit -- and it is
+eligibility-bound on the current shards (Q4_K and Q3_K only: 25.7% of
+UD-Q4_K_S, 15.6% of the 3.84 bpw one), so a low-double-digit percent of prefill
+on these artifacts. One caveat before building on it: all-ones operands give
+c[0] = 16 for both iu4 and iu8, which is consistent with both consuming K = 16
+per output element, but the remaining fragments of the iu4 accumulator did not
+read back as clean sixteens, so its fragment mapping deserves its own check.
 
