@@ -596,3 +596,41 @@ blocks, or a two-level blocking that keeps both streams resident. Cutting
 converts to time depends on how much of the gap is latency, which the missing
 stall counters leave open. Worth a prototype before believing it.
 
+### The L2 residency lever does not exist either
+
+The kernel already swizzles the block grid so that a group of row tiles walks
+all of its token blocks back to back, and `DirectGemm` already tunes that group
+width per format (IQ4_XS uses 32 rows, Q5_K 32 for small K, everything else 8).
+Since the counters reported 347 MB of L2 misses against a 60 MB unique working
+set, widening that group was the obvious lever. Made it a runtime parameter and
+swept 2..64 rows on the gate/up shape, ms per GEMM:
+
+| group_shift | rows | Q4_K | IQ3_XXS | IQ4_XS |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 2 | 10.19 | 11.45 | 10.08 |
+| 2 | 4 | 10.30 | 11.03 | 10.30 |
+| 3 | 8 (current) | 10.27 | 10.87 | 10.04 |
+| 4 | 16 | 10.26 | 10.93 | 10.02 |
+| 5 | 32 | 10.28 | 11.11 | 10.00 |
+| 6 | 64 | 10.27 | 10.99 | 9.93 |
+
+Flat: 1% on Q4_K and 5% on IQ3_XXS with no monotone trend. The reuse schedule
+is not what limits the kernel, which also fits the bandwidth arithmetic --
+347 MB over 23.5M GPU cycles is 43 GB/s, roughly 17% of the box DRAM peak. The
+deficit is latency, not traffic.
+
+That was the last structural hypothesis. The fp16 prefill kernel stands at 66%
+of a 48.3 TFLOPS ceiling with every lever tried and measured: tile geometry,
+LDS bank conflicts, decode work, operand-register reuse, wave64, the store
+epilogue, L2 residency, DRAM traffic, and the row-group schedule. The only unit
+reading high is the L1/TA path at 80% busy, and the staging ablation puts
+10-22% of the runtime there, but nothing that keeps the current structure
+recovers it.
+
+Tally for this stretch of work: the Q2_K fix took the 3.84 bpw shard from 409.6
+to ~522 t/s (+27%), and the fetch scheduling hint took it to ~536 (+2.6%). The
+kernel-efficiency investigation added nothing further, and is recorded here so
+that the next attempt starts from what has already been ruled out rather than
+from the tile geometry.
+
+
