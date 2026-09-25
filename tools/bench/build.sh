@@ -68,7 +68,13 @@ for t in "${targets[@]}"; do
   if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ]]; then
     native_sources+=(src/models/qwen/hip/kernels/prefill_quant_wave64.hip)
   fi
-  if ((${#native_sources[@]})); then
+  # Host-side quant helpers (QuantizedRowBytes and friends) live in one TU.
+  host_sources=()
+  if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ||
+        "$src" -ef tools/qwen27b/prefill_fp16_bench.hip ]]; then
+    host_sources+=(src/core/quant/ggml_dequant.cpp)
+  fi
+  if ((${#native_sources[@]})) || ((${#host_sources[@]})); then
     # HIP helpers and their callers must share the native wave size.
     objects="$(mktemp -d "/tmp/${t}.XXXXXX")"
     trap 'rm -rf "$objects"' EXIT
@@ -86,11 +92,11 @@ for t in "${targets[@]}"; do
           -c "$unit" -o "$object" || exit 1
         native_objects+=("$object")
       done
-      if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ]]; then
-        "${compile[@]}" -c src/core/quant/ggml_dequant.cpp \
-          -o "$objects/quant.o" || exit 1
-        native_objects+=("$objects/quant.o")
-      fi
+      for unit in "${host_sources[@]}"; do
+        object="$objects/$(basename "$unit").o"
+        "${compile[@]}" -c "$unit" -o "$object" || exit 1
+        native_objects+=("$object")
+      done
       hipcc --offload-arch=gfx1151 "${lib[@]}" \
         "$objects/main.o" "${native_objects[@]}" "${extra[@]}" -o "$out"
     ) 2>"/tmp/${t}.build.log" ||
