@@ -98,6 +98,17 @@ struct block_iq3_xxs {
   std::uint8_t qs[96];
 };
 
+// Q2_K: super-block of 256 (84 bytes). Sixteen 16-element sub-blocks, each
+// with a 4-bit scale in the low nibble and a 4-bit min in the high nibble of
+// one scales byte; d and dmin are the super-block scale and min.
+struct block_q2_K {
+  std::uint8_t scales[16];
+  std::uint8_t qs[64];
+  std::uint16_t d;
+  std::uint16_t dmin;
+};
+static_assert(sizeof(block_q2_K) == 84, "block_q2_K must be 84 bytes");
+
 // IQ2_XXS: super-block of 256 (66 bytes). Each group of 32 elements is four
 // 8-bit iq2xxs grid indices followed by one word holding the 4-bit scale and
 // four 7-bit sign indices.
@@ -230,6 +241,9 @@ void DequantizeIQ3_S(const void* src, float* dst, std::size_t k);
 // Dequantize row of IQ3_XXS to float
 void DequantizeIQ3_XXS(const void* src, float* dst, std::size_t k);
 
+// Dequantize row of Q2_K to float
+void DequantizeQ2_K(const void* src, float* dst, std::size_t k);
+
 // Dequantize row of IQ2_XXS to float
 void DequantizeIQ2_XXS(const void* src, float* dst, std::size_t k);
 
@@ -254,6 +268,9 @@ float DotProductIQ3_XXS(const void* row_data, std::span<const float> vec,
 // Compute dot product of IQ2_XXS quantized row with FP32 vector
 float DotProductIQ2_XXS(const void* row_data, std::span<const float> vec,
                         std::size_t k);
+// Compute dot product of Q2_K quantized row with FP32 vector
+float DotProductQ2_K(const void* row_data, std::span<const float> vec,
+                     std::size_t k);
 // Compute dot product of IQ2_XS quantized row with FP32 vector
 float DotProductIQ2_XS(const void* row_data, std::span<const float> vec,
                        std::size_t k);

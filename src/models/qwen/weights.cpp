@@ -70,7 +70,7 @@ enum class TensorRole : std::uint8_t {
              type == core::GgmlType::kQ3_K || type == core::GgmlType::kQ5_K ||
              type == core::GgmlType::kQ6_K || type == core::GgmlType::kIQ4_NL ||
              type == core::GgmlType::kIQ4_XS ||
-             type == core::GgmlType::kIQ3_S ||
+             type == core::GgmlType::kIQ3_S || type == core::GgmlType::kQ2_K ||
              type == core::GgmlType::kIQ3_XXS ||
              type == core::GgmlType::kIQ2_XXS ||
              type == core::GgmlType::kIQ2_XS || type == core::GgmlType::kIQ2_S;
@@ -89,7 +89,7 @@ enum class TensorRole : std::uint8_t {
              type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ3_K ||
              type == core::GgmlType::kIQ4_NL ||
              type == core::GgmlType::kIQ4_XS ||
-             type == core::GgmlType::kIQ3_S ||
+             type == core::GgmlType::kIQ3_S || type == core::GgmlType::kQ2_K ||
              type == core::GgmlType::kIQ3_XXS ||
              type == core::GgmlType::kIQ2_XXS ||
              type == core::GgmlType::kIQ2_XS || type == core::GgmlType::kIQ2_S;

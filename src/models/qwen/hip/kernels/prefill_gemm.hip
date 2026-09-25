@@ -445,6 +445,20 @@ __global__ void DequantizeQ6KToBf16Kernel(const void* __restrict__ w,
   }
 }
 
+// Generic fallback for the packed formats without a hand-written conversion:
+// one thread per element through the shared sub-16 decoder. Only tensors no
+// native kernel claims (a lone Q2_K projection, for example) reach this.
+__global__ void DequantizeQuantElementToBf16Kernel(
+    core::GgmlType type, const void* __restrict__ w,
+    hip_bfloat16* __restrict__ out, std::size_t n_elems) {
+  const std::size_t idx =
+      (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+  if (idx >= n_elems) {
+    return;
+  }
+  out[idx] = hip_bfloat16(QuantBlockElement(type, w, idx));
+}
+
 // opt-c162-q8k-prefill-dequant (extended): type-dispatched entry point that
 // converts a quantized weight region (Q8_0/Q5_K/Q6_K/Q8_K) into a BF16 scratch
 // for the prefill hipblas GEMM path.
@@ -487,7 +501,15 @@ void LaunchDequantizeToBf16(core::GgmlType type, const void* w,
     }
     return;
   }
-  // Unsupported quant type: no-op.
+  // Generic fallback for every other DecodeQuantSub16-backed format.
+  const std::size_t qk = QuantBlockQK(type);
+  if (qk == 0 || n_elems % qk != 0) {
+    return;
+  }
+  const std::size_t grid = (n_elems + block_threads - 1U) / block_threads;
+  DequantizeQuantElementToBf16Kernel<<<static_cast<unsigned int>(grid),
+                                       block_threads, 0, stream>>>(
+      type, w, out, n_elems);
 }
 
 }  // namespace gufo::hip

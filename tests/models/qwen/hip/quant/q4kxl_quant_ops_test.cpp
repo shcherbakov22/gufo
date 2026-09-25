@@ -103,6 +103,10 @@ std::vector<std::uint8_t> MakeWeights(gufo::core::GgmlType type,
       case gufo::core::GgmlType::kQ3_K:
         tame_half(block + 108);  // d is last
         break;
+      case gufo::core::GgmlType::kQ2_K:
+        tame_half(block + 80);  // d is last
+        tame_half(block + 82);  // dmin is last
+        break;
       case gufo::core::GgmlType::kIQ4_NL:
       case gufo::core::GgmlType::kIQ4_XS:
       case gufo::core::GgmlType::kIQ3_S:
@@ -143,6 +147,8 @@ float CpuDot(gufo::core::GgmlType type, const void* row,
       return gufo::quant::DotProductIQ2_XS(row, x, k);
     case gufo::core::GgmlType::kIQ2_XXS:
       return gufo::quant::DotProductIQ2_XXS(row, x, k);
+    case gufo::core::GgmlType::kQ2_K:
+      return gufo::quant::DotProductQ2_K(row, x, k);
     case gufo::core::GgmlType::kIQ2_S:
       return gufo::quant::DotProductIQ2_S(row, x, k);
     default:
@@ -182,6 +188,9 @@ void Dequantize(gufo::core::GgmlType type, const void* row, float* out,
       return;
     case gufo::core::GgmlType::kIQ2_XXS:
       gufo::quant::DequantizeIQ2_XXS(row, out, k);
+      return;
+    case gufo::core::GgmlType::kQ2_K:
+      gufo::quant::DequantizeQ2_K(row, out, k);
       return;
     case gufo::core::GgmlType::kIQ2_S:
       gufo::quant::DequantizeIQ2_S(row, out, k);
@@ -814,6 +823,9 @@ void TestFp16Norm() {
 
 int main() {
   TestFp16Norm();
+  // Q2_K has a per-16 min, so only the decode GEMV route is exact for it; the
+  // prefill WMMA route stages it through the generic BF16 fallback instead.
+  TestDecodeGemv({gufo::core::GgmlType::kQ2_K, "Q2_K"});
   for (const auto& format : kFormats) {
     TestFp16Prefill(format, 4097, 257);
     if (format.type == gufo::core::GgmlType::kQ4_K ||
