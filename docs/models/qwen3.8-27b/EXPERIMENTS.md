@@ -169,6 +169,23 @@ Both operands are int4, so this also means 4-bit *activations* rather than the
 current q8_1. That is a prefill precision change needing quality validation, not
 just a kernel change, and it is the main reason the 2x is not free.
 
+Every format is decoded to int8 (`QuantSub16::q[16]`) and multiplied on the int8
+WMMA today, so the comparison that matters is int4 against **int8**, not against
+some hypothetical narrower path. Any format that can be re-encoded as signed
+4-bit values therefore takes the full 2x immediately, whatever its storage width:
+Q4_K, Q3_K, Q2_K, Q1_0, Q2_0 and the ternary formats. There is no int2 or int1
+WMMA, so the int4 rate is the ceiling, but sub-4-bit formats are currently paying
+int8 rates, so moving them to int4 is a 2x in its own right rather than merely a
+bandwidth win.
+
+The dividing line is linear versus codebook. No integer WMMA can consume a grid
+code, so IQ2, IQ3 and IQ4 stay on int8 permanently. Linear formats are therefore
+architecturally favoured on this part, which inverts the usual "IQ is better per
+bit" preference: an IQ-heavy shard gets the 2x only on its linear fraction. The
+3.84 bpw shard is about 46% IQ3 by bytes, so its int4 gain is capped at the
+Q4_K+Q3_K share (15.6%) unless the quantisation mix moves toward linear formats -
+a model decision whose value is now quantified.
+
 Deferred until the GEMM delivery work lands. On the current shards the eligible share is Q4_K plus Q3_K (25.7% of UD-Q4_K_S,
 15.6% of the 3.84 bpw shard), so expect a low-double-digit percent of prefill
 from those two alone, and they need no new offset support. The full 2x needs weights that are linear and at
