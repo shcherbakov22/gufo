@@ -142,17 +142,29 @@ Availability on gfx1151 is limited to that one path. `wmma_i32_16x16x32_iu4`
 and `f32_32x16x128_f4` are gfx12 only, and the VALU int4 dots (`sdot8`,
 `sudot8`, `udot8`) need the gfx12 `dot1-insts` target feature.
 
-Feeding int4 WMMA needs signed 4-bit values. Q4_K qualifies: its 0..15 quants
-become signed nibbles (q-8) with the +8 folded into the existing affine offset
-(`offset = dmin*m - 8d`), which the kernel's `HasOffset` path already carries.
-IQ4_XS/IQ4_NL are 4-bit codebook indices whose decoded span is -127..113, and
-IQ3 magnitudes reach 62, so neither fits; IQ2/Q2_K fit but are under 0.7% of
-bytes.
+The 2x is an issue-rate effect: at the same 16x16x16 shape, iu4 retires about
+twice the instructions per second of iu8 and its operand fragments are half the
+size (2-int vs 4-int per lane), so register and LDS pressure drop as well.
 
-Deferred until the GEMM delivery work lands. The payoff is bounded by the Q4_K
-byte share (19.1% of UD-Q4_K_S, 12.7% of the 3.84 bpw IQ4_XS shard), so expect
-single-digit percent prefill rather than 2x unless the weights are requantized
-to 4 bits throughout, which is a model quality decision, not a kernel one.
+What can feed it is decided by `*linearity*`, not bit width. Integer WMMA
+multiplies the stored code by the activation, so the code must be proportional
+to the value. Linear formats fit at any width up to 4 bits: Q4_K (0..15), Q2_K
+and Q2_0 (0..3), ternary (TQ1_0/TQ2_0), Q1-style. The constant term folds into
+the existing affine offset, so a q-8 remap of Q4_K costs nothing extra. Codebook
+formats do not fit at any width: IQ4_XS/IQ4_NL are 4-bit grid indices whose
+decoded span is -127..113, and IQ2/IQ3 grid magnitudes reach 43 and 62.
+
+Both operands are int4, so this also means 4-bit *activations* rather than the
+current q8_1. That is a prefill precision change needing quality validation, not
+just a kernel change, and it is the main reason the 2x is not free.
+
+Deferred until the GEMM delivery work lands. On the current shards the eligible
+share is Q4_K alone (19.1% of UD-Q4_K_S, 12.7% of the 3.84 bpw shard), so expect
+single-digit percent prefill. The full 2x needs weights that are linear and at
+most 4 bits throughout, which is a model/quantization decision. It is also
+orthogonal to the Q2_K chunked-path work: sub-4-bit linear formats become
+*eligible* for the int4 path, but their per-16 affine minimum still needs the
+per-half activation sum, so that fix is not avoided by moving to int4.
 
 
 ## Deferred: Q2_K native prefill (chunked-path eligibility)
