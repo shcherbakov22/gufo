@@ -120,3 +120,36 @@ is limited.
 
 Published workload numbers live only in [benchmarks](BENCHMARKS.md); source and
 model qualification live in [quality](QUALITY.md).
+
+
+## Deferred: INT4 WMMA doubles matrix throughput
+
+Measured 2026-09-25 with a register-fed issue loop (operands in registers, eight
+independent accumulator chains, non-zero operands so the loop cannot be folded):
+
+| kernel | TMAC/s | TFLOPS |
+| --- | --- | --- |
+| `wmma_i32_16x16x16_iu8_w32` | 25.6 | 51.1 |
+| `wmma_i32_16x16x16_iu4_w32` | 49.6 | 99.2 |
+
+The int4 form has the same 16x16x16 shape but runs at **2x** the int8 rate, so the
+matrix ceiling is ~99 TFLOPS rather than the ~51-59 TFLOPS the int8 path reaches.
+A pp2048 dense prefill would floor at 1.13 s (1815 t/s) instead of 2.10 s
+(976 t/s). Reproduced at two chain depths (1.89x and 1.94x).
+
+Availability on gfx1151 is limited to that one path. `wmma_i32_16x16x32_iu4`
+(the larger int4 shape), `wmma_i32_16x16x64_iu8`, the fp8 and `f8f6f4` shapes
+and `f32_32x16x128_f4` are gfx12 only, and the VALU int4 dots (`sdot8`,
+`sudot8`, `udot8`) need the gfx12 `dot1-insts` target feature.
+
+Feeding int4 WMMA needs signed 4-bit values. Q4_K qualifies: its 0..15 quants
+become signed nibbles (q-8) with the +8 folded into the existing affine offset
+(`offset = dmin*m - 8d`), which the kernel's `HasOffset` path already carries.
+IQ4_XS/IQ4_NL are 4-bit codebook indices whose decoded span is -127..113, and
+IQ3 magnitudes reach 62, so neither fits; IQ2/Q2_K fit but are under 0.7% of
+bytes.
+
+Deferred until the GEMM delivery work lands. The payoff is bounded by the Q4_K
+byte share (19.1% of UD-Q4_K_S, 12.7% of the 3.84 bpw IQ4_XS shard), so expect
+single-digit percent prefill rather than 2x unless the weights are requantized
+to 4 bits throughout, which is a model quality decision, not a kernel one.
