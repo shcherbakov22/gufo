@@ -56,6 +56,7 @@ const FormatCase kFormats[] = {
     {gufo::core::GgmlType::kIQ3_XXS, "IQ3_XXS"},
     {gufo::core::GgmlType::kIQ2_XS, "IQ2_XS"},
     {gufo::core::GgmlType::kIQ2_S, "IQ2_S"},
+    {gufo::core::GgmlType::kIQ2_XXS, "IQ2_XXS"},
     {gufo::core::GgmlType::kQ8_0, "Q8_0"},
 };
 
@@ -108,6 +109,7 @@ std::vector<std::uint8_t> MakeWeights(gufo::core::GgmlType type,
       case gufo::core::GgmlType::kIQ3_XXS:
       case gufo::core::GgmlType::kIQ2_XS:
       case gufo::core::GgmlType::kIQ2_S:
+      case gufo::core::GgmlType::kIQ2_XXS:
       case gufo::core::GgmlType::kQ8_0:
         tame_half(block);  // d is first
         break;
@@ -139,6 +141,8 @@ float CpuDot(gufo::core::GgmlType type, const void* row,
       return gufo::quant::DotProductIQ3_XXS(row, x, k);
     case gufo::core::GgmlType::kIQ2_XS:
       return gufo::quant::DotProductIQ2_XS(row, x, k);
+    case gufo::core::GgmlType::kIQ2_XXS:
+      return gufo::quant::DotProductIQ2_XXS(row, x, k);
     case gufo::core::GgmlType::kIQ2_S:
       return gufo::quant::DotProductIQ2_S(row, x, k);
     default:
@@ -175,6 +179,9 @@ void Dequantize(gufo::core::GgmlType type, const void* row, float* out,
       return;
     case gufo::core::GgmlType::kIQ2_XS:
       gufo::quant::DequantizeIQ2_XS(row, out, k);
+      return;
+    case gufo::core::GgmlType::kIQ2_XXS:
+      gufo::quant::DequantizeIQ2_XXS(row, out, k);
       return;
     case gufo::core::GgmlType::kIQ2_S:
       gufo::quant::DequantizeIQ2_S(row, out, k);

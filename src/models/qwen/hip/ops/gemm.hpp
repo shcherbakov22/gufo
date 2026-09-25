@@ -164,6 +164,7 @@ namespace detail {
     case core::GgmlType::kIQ3_XXS:
     case core::GgmlType::kIQ2_XS:
     case core::GgmlType::kIQ2_S:
+    case core::GgmlType::kIQ2_XXS:
       return true;
     default:
       return false;

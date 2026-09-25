@@ -72,6 +72,7 @@ enum class TensorRole : std::uint8_t {
              type == core::GgmlType::kIQ4_XS ||
              type == core::GgmlType::kIQ3_S ||
              type == core::GgmlType::kIQ3_XXS ||
+             type == core::GgmlType::kIQ2_XXS ||
              type == core::GgmlType::kIQ2_XS || type == core::GgmlType::kIQ2_S;
     case TensorRole::kNorm:
     case TensorRole::kSsmParameter:
@@ -90,6 +91,7 @@ enum class TensorRole : std::uint8_t {
              type == core::GgmlType::kIQ4_XS ||
              type == core::GgmlType::kIQ3_S ||
              type == core::GgmlType::kIQ3_XXS ||
+             type == core::GgmlType::kIQ2_XXS ||
              type == core::GgmlType::kIQ2_XS || type == core::GgmlType::kIQ2_S;
   }
   return false;

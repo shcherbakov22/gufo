@@ -719,6 +719,29 @@ float Iq3XxsValue(const block_iq3_xxs& block, std::size_t index) noexcept {
   return (signs & kKmaskIq2xs[m]) ? -db * magnitude : db * magnitude;
 }
 
+// Element index (0..255) of one IQ2_XXS super-block.
+float Iq2XxsValue(const block_iq2_xxs& block, std::size_t index) noexcept {
+  const std::size_t ib32 = index / 32;
+  const std::size_t l = (index % 32) / 8;
+  const std::size_t j = index % 8;
+
+  const auto* bytes =
+      reinterpret_cast<const std::uint8_t*>(block.qs) + (8 * ib32);
+  const std::uint32_t high = static_cast<std::uint32_t>(bytes[4]) |
+                             (static_cast<std::uint32_t>(bytes[5]) << 8) |
+                             (static_cast<std::uint32_t>(bytes[6]) << 16) |
+                             (static_cast<std::uint32_t>(bytes[7]) << 24);
+  const float db =
+      Fp16ToFloat(block.d) * (0.5F + static_cast<float>(high >> 28)) * 0.25F;
+
+  const auto* grid =
+      reinterpret_cast<const std::uint8_t*>(&kIq2XxsGrid[bytes[l]]);
+  const std::uint8_t signs = kKsignsIq2xs[(high >> (7 * l)) & 127U];
+
+  const float magnitude = static_cast<float>(grid[j]);
+  return (signs & kKmaskIq2xs[j]) ? -db * magnitude : db * magnitude;
+}
+
 // Element index (0..255) of one IQ2_XS super-block.
 float Iq2XsValue(const block_iq2_xs& block, std::size_t index) noexcept {
   const std::size_t ib32 = index / 32;
@@ -773,6 +796,16 @@ void DequantizeIQ3_XXS(const void* src, float* dst, std::size_t k) {
   }
 }
 
+void DequantizeIQ2_XXS(const void* src, float* dst, std::size_t k) {
+  const auto* blocks = static_cast<const block_iq2_xxs*>(src);
+  const std::size_t nb = k / 256;
+  for (std::size_t b = 0; b < nb; ++b) {
+    for (std::size_t i = 0; i < 256; ++i) {
+      dst[(b * 256) + i] = Iq2XxsValue(blocks[b], i);
+    }
+  }
+}
+
 void DequantizeIQ2_XS(const void* src, float* dst, std::size_t k) {
   const auto* blocks = static_cast<const block_iq2_xs*>(src);
   const std::size_t nb = k / 256;
@@ -802,6 +835,20 @@ float DotProductIQ3_XXS(const void* row_data, std::span<const float> vec,
     const float* v = vec.data() + (b * 256);
     for (std::size_t i = 0; i < 256; ++i) {
       sum += Iq3XxsValue(blocks[b], i) * v[i];
+    }
+  }
+  return sum;
+}
+
+float DotProductIQ2_XXS(const void* row_data, std::span<const float> vec,
+                        std::size_t k) {
+  const auto* blocks = static_cast<const block_iq2_xxs*>(row_data);
+  const std::size_t nb = k / 256;
+  float sum = 0.0F;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float* v = vec.data() + (b * 256);
+    for (std::size_t i = 0; i < 256; ++i) {
+      sum += Iq2XxsValue(blocks[b], i) * v[i];
     }
   }
   return sum;

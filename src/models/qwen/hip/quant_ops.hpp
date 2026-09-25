@@ -154,6 +154,17 @@ struct IQ3XXSBlock {
 };
 static_assert(sizeof(IQ3XXSBlock) == 98, "block_iq3_xxs must be 98 bytes");
 
+// block_iq2_xxs layout ({half d; uint16 qs[32];}, 66 bytes). Each group of 32
+// elements is four 8-bit iq2xxs grid indices followed by one word carrying the
+// 4-bit scale and four 7-bit sign indices.
+constexpr std::size_t kIQ2XXSBlockSize = 256;
+
+struct IQ2XXSBlock {
+  __half d;
+  std::uint16_t qs[32];
+};
+static_assert(sizeof(IQ2XXSBlock) == 66, "block_iq2_xxs must be 66 bytes");
+
 // block_iq2_xs layout ({half d; uint16 qs[32]; uint8 scales[8];}, 74 bytes).
 // Each uint16 carries a 9-bit index into the 512-entry iq2xs grid and a 7-bit
 // sign index; scales packs two 4-bit sub-block scales per byte.
@@ -208,6 +219,8 @@ __device__ inline std::size_t QuantBlockBytes(core::GgmlType t) {
       return sizeof(IQ3SBlock);
     case core::GgmlType::kIQ3_XXS:
       return sizeof(IQ3XXSBlock);
+    case core::GgmlType::kIQ2_XXS:
+      return sizeof(IQ2XXSBlock);
     case core::GgmlType::kIQ2_XS:
       return sizeof(IQ2XSBlock);
     case core::GgmlType::kIQ2_S:
@@ -239,6 +252,8 @@ __device__ inline std::size_t QuantBlockQK(core::GgmlType t) {
       return kIQ3SBlockSize;
     case core::GgmlType::kIQ3_XXS:
       return kIQ3XXSBlockSize;
+    case core::GgmlType::kIQ2_XXS:
+      return kIQ2XXSBlockSize;
     case core::GgmlType::kIQ2_XS:
       return kIQ2XSBlockSize;
     case core::GgmlType::kIQ2_S:
@@ -714,6 +729,32 @@ __device__ inline void DecodeQuantSub16(core::GgmlType type,
       out.scale = __half2float(blk.d) * static_cast<float>(1 + (2 * nibble));
       return;
     }
+    case core::GgmlType::kIQ2_XXS: {
+      const auto& blk = static_cast<const IQ2XXSBlock*>(row)[sub16 / 16];
+      const std::size_t ib32 = (sub16 / 2) % 8;
+      const std::size_t half = sub16 % 2;
+      const auto* bytes =
+          reinterpret_cast<const std::uint8_t*>(blk.qs) + (8 * ib32);
+      const std::uint32_t high = static_cast<std::uint32_t>(bytes[4]) |
+                                 (static_cast<std::uint32_t>(bytes[5]) << 8) |
+                                 (static_cast<std::uint32_t>(bytes[6]) << 16) |
+                                 (static_cast<std::uint32_t>(bytes[7]) << 24);
+      out.scale =
+          __half2float(blk.d) * (0.5F + static_cast<float>(high >> 28)) * 0.25F;
+#pragma unroll
+      for (int li = 0; li < 2; ++li) {
+        const std::size_t l = 2 * half + static_cast<std::size_t>(li);
+        const std::uint8_t* grid =
+            reinterpret_cast<const std::uint8_t*>(&kDeviceIq2XxsGrid[bytes[l]]);
+        const std::uint8_t signs = kDeviceKsignsIq2xs[(high >> (7 * l)) & 127U];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          out.q[li * 8 + j] = static_cast<std::int8_t>(
+              (signs & kDeviceKmaskIq2xs[j]) != 0U ? -grid[j] : grid[j]);
+        }
+      }
+      return;
+    }
     case core::GgmlType::kIQ3_XXS: {
       const auto& blk = static_cast<const IQ3XXSBlock*>(row)[sub16 / 16];
       const std::size_t ib32 = (sub16 / 2) % 8;
@@ -830,7 +871,8 @@ __device__ inline bool IsSub16DecodedQuant(core::GgmlType t) noexcept {
          t == core::GgmlType::kQ6_K || t == core::GgmlType::kQ3_K ||
          t == core::GgmlType::kIQ4_NL || t == core::GgmlType::kIQ4_XS ||
          t == core::GgmlType::kIQ3_S || t == core::GgmlType::kIQ3_XXS ||
-         t == core::GgmlType::kIQ2_XS || t == core::GgmlType::kIQ2_S;
+         t == core::GgmlType::kIQ2_XS || t == core::GgmlType::kIQ2_S ||
+         t == core::GgmlType::kIQ2_XXS;
 }
 
 // opt-r7-decode-parallel: warp-parallel quant row-dot, templated on the input

@@ -793,6 +793,9 @@ void DirectGemm(gufo::core::GgmlType type, const void* w, const void* x,
     case GgmlType::kIQ2_S:
       launch.template operator()<GgmlType::kIQ2_S>();
       break;
+    case GgmlType::kIQ2_XXS:
+      launch.template operator()<GgmlType::kIQ2_XXS>();
+      break;
     default:
       throw std::runtime_error("unexpected half prefill weight format");
   }
