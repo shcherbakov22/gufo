@@ -513,3 +513,45 @@ c[0] = 16 for both iu4 and iu8, which is consistent with both consuming K = 16
 per output element, but the remaining fragments of the iu4 accumulator did not
 read back as clean sixteens, so its fragment mapping deserves its own check.
 
+### Kernel efficiency: ablating the real kernel
+
+Ablations on `HalfPrefillGemmKernel<256,256,8,4>` at gate/up m=17408 k=5120
+batch 2048, back-to-back in one session, ms per GEMM, base repeated so the
+drift is visible:
+
+| ablation | Q4_K | IQ3_XXS |
+| --- | ---: | ---: |
+| base | 11.06 / 12.12 | 12.90 |
+| staging removed, valid LDS | 10.45 / 10.45 | 10.04 |
+| store epilogue removed | 11.74 / 11.97 | 11.42 / 12.70 |
+
+So the weight + activation staging costs about 10% on Q4_K and 22% on IQ3_XXS,
+and the epilogue costs nothing measurable. Ruled out by measurement along the
+way: grid-table divergence, decode FP32 op count, operand-register sharing
+(48.2 TFLOPS with fully distinct operands against 48.4 with shared ones), and
+the whole tile space. The MMA ceiling is 48.3 TFLOPS on wave32 and 48.5 on
+wave64, so the flat kernel is at 64-68% of it.
+
+That leaves the K loop itself. With staging removed the kernel runs at 34.9
+TFLOPS, 72% of the ceiling, and what is left is the six swizzled LDS reads plus
+eight WMMA per K step, the loop overhead across forty stages, and the barriers.
+A reduced microbenchmark of exactly that sequence was built and measured 18.6
+TFLOPS -- *slower* than the real kernel -- so it was not a faithful model and
+its number cannot be used as a reference. The remaining 28% is localised to the
+K loop but not yet explained.
+
+**Retraction.** An earlier pass at the staging ablation removed the fetch
+without first putting valid data in LDS. It reported 7.35 ms, 49.7 TFLOPS,
+above the measured ceiling, and was briefly read as "the staging is the entire
+deficit". Invalid operands are not free: that number is an artefact, the
+valid-data rerun above supersedes it, and the strong claim is withdrawn.
+
+Two harnesses in this investigation also produced confident wrong numbers and
+are worth recording. A peak harness that read only two of eight accumulator
+chains let the compiler delete six MMAs and reported 4x the real rate; a
+reduced inner-loop probe whose LDS was never written had the arrays optimised
+away entirely (`LDS Size: 2 bytes`) and measured an empty loop. Both looked
+plausible. Ceiling and ablation numbers here are trusted only when the resource
+report and the operand values both check out.
+
+
