@@ -475,8 +475,11 @@ __launch_bounds__(WavesPerBlock * 32, (MinWaves * 32 / HardwareWaveSize > 0
         (WType == core::GgmlType::kIQ4_XS && RowsPerWave == 4 && NarrowIndex)));
   constexpr Index kStride = kSubElems + (kCompact ? 0 : 4);
   constexpr Index kTileStride = kSubsPerTile * kStride;
-  constexpr bool kHasOffset =
-      WType == core::GgmlType::kQ4_K || WType == core::GgmlType::kQ5_K;
+  // Q4_K/Q5_K carry one minimum per thirty-two elements; Q2_K carries one per
+  // sixteen, which still resolves to a single offset per staged sub-block here.
+  constexpr bool kHasOffset = WType == core::GgmlType::kQ4_K ||
+                              WType == core::GgmlType::kQ5_K ||
+                              WType == core::GgmlType::kQ2_K;
   __shared__ float staged_x[Batch * kTileStride];
   // Affine formats use the same activation sum for every output row.
   // Compute it once during staging, in the decode GEMV's left-to-right order.

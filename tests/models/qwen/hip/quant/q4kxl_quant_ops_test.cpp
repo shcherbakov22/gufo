@@ -57,6 +57,7 @@ const FormatCase kFormats[] = {
     {gufo::core::GgmlType::kIQ2_XS, "IQ2_XS"},
     {gufo::core::GgmlType::kIQ2_S, "IQ2_S"},
     {gufo::core::GgmlType::kIQ2_XXS, "IQ2_XXS"},
+    {gufo::core::GgmlType::kQ2_K, "Q2_K"},
     {gufo::core::GgmlType::kQ8_0, "Q8_0"},
 };
 
@@ -823,9 +824,6 @@ void TestFp16Norm() {
 
 int main() {
   TestFp16Norm();
-  // Q2_K has a per-16 min, so only the decode GEMV route is exact for it; the
-  // prefill WMMA route stages it through the generic BF16 fallback instead.
-  TestDecodeGemv({gufo::core::GgmlType::kQ2_K, "Q2_K"});
   for (const auto& format : kFormats) {
     TestFp16Prefill(format, 4097, 257);
     if (format.type == gufo::core::GgmlType::kQ4_K ||

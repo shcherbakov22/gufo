@@ -38,7 +38,11 @@ using int32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
 constexpr std::size_t kQ8ActTileTokens = 16;
 constexpr std::size_t kQ8ActTileBytes = 576;
 constexpr std::size_t kQ8ActScaleOffset = 512;
-constexpr std::size_t kQ8ActSumTileBytes = kQ8ActTileTokens * sizeof(float);
+// Two sums per (token, 32-block): the whole block and its low half. The low
+// half lets a format with a per-16 minimum apply its affine offset.
+constexpr std::size_t kQ8ActSumHalves = 2;
+constexpr std::size_t kQ8ActSumTileBytes =
+    kQ8ActTileTokens * kQ8ActSumHalves * sizeof(float);
 
 /// Byte size of the tiled Q8_1 activation buffer for a [batch, k] tensor.
 __host__ __device__ inline std::size_t Q8ActTiledBytes(std::size_t batch,
@@ -104,14 +108,21 @@ __device__ __forceinline__ void StoreQ8ActLane(void* y, std::size_t batch,
         d;
   }
   if constexpr (StoreActivationSum) {
+    // Stop the reduction at sixteen lanes: lanes 0..15 then hold the low half
+    // sum and lanes 16..31 the high one, which is what Q2_K's per-16 minimum
+    // needs alongside the whole-block sum.
     int qsum = static_cast<int>(q);
-    for (int off = 16; off > 0; off >>= 1) {
+    for (int off = 8; off > 0; off >>= 1) {
       qsum += __shfl_xor(qsum, off);
     }
+    const int qsum_high = __shfl_xor(qsum, 16);
     if (lane_id == 0) {
       float* sums = Q8ActSumSidecar(y, batch, num_blocks * 32);
-      sums[(((tt * num_blocks) + blk) * kQ8ActTileTokens) + tl] =
-          d * static_cast<float>(qsum);
+      float* slot =
+          sums + (((((tt * num_blocks) + blk) * kQ8ActTileTokens) + tl) *
+                  kQ8ActSumHalves);
+      slot[0] = d * static_cast<float>(qsum_high + qsum);
+      slot[1] = d * static_cast<float>(qsum);
     }
   }
 }
@@ -146,9 +157,14 @@ __launch_bounds__(WM * WN * WaveSize, 1) __global__
   // second half of each thirty-two-element stage needs its own scale.
   constexpr bool PerHalfScale =
       WType == core::GgmlType::kQ6_K || WType == core::GgmlType::kQ3_K ||
-      WType == core::GgmlType::kIQ2_XS || WType == core::GgmlType::kIQ2_S;
+      WType == core::GgmlType::kQ2_K || WType == core::GgmlType::kIQ2_XS ||
+      WType == core::GgmlType::kIQ2_S;
   constexpr bool HasOffset =
       WType == core::GgmlType::kQ4_K || WType == core::GgmlType::kQ5_K;
+  // Q2_K carries a per-16 minimum as well as a per-16 scale, so its affine
+  // correction needs one offset and one activation sum per half.
+  constexpr bool PerHalfOffset = WType == core::GgmlType::kQ2_K;
+  constexpr bool UsesOffset = HasOffset || PerHalfOffset;
 
   static_assert(WaveSize == 32 || WaveSize == 64);
   static_assert((WaveSize == 32 && WM * WN == 8) ||
@@ -166,7 +182,7 @@ __launch_bounds__(WM * WN * WaveSize, 1) __global__
   constexpr int kWaveRowTiles = kRowTiles / WM;
   constexpr int kWaveTokTiles = kTokTiles / WN;
   constexpr int kScaleHalves = PerHalfScale ? 2 : 1;
-  constexpr int kOffRowTiles = HasOffset ? kRowTiles : 1;
+  constexpr int kOffRowTiles = UsesOffset ? kRowTiles : 1;
 
   constexpr int kStageTiles = (kTokTiles + kStageWaves - 1) / kStageWaves;
 
@@ -190,9 +206,13 @@ __launch_bounds__(WM * WN * WaveSize, 1) __global__
   };
   __shared__ float s_dw[BK][kScaleHalves][kRowTiles][16];
   __shared__ float s_off[BK][kOffRowTiles][16];
+  __shared__ float s_off1[PerHalfOffset ? BK : 1]
+                         [PerHalfOffset ? kOffRowTiles : 1][16];
   __shared__ int32x4_t s_b[BK][kTokTiles][32];
   __shared__ float s_dx[BK][kTokTiles][16];
-  __shared__ float s_sx[HasOffset ? BK : 1][kTokTiles][16];
+  __shared__ float s_sx[UsesOffset ? BK : 1][kTokTiles][16];
+  __shared__ float s_sx1[PerHalfOffset ? BK : 1][PerHalfOffset ? kTokTiles : 1]
+                        [16];
 
   const std::size_t num_blocks = k / 32;
   const std::size_t row_bytes = QuantRowBytes(WType, k);
@@ -248,9 +268,11 @@ __launch_bounds__(WM * WN * WaveSize, 1) __global__
   float r_dw0[kPrefetch];
   float r_dw1[kPrefetch];
   float r_off[kPrefetch];
+  float r_off1[PerHalfOffset ? kPrefetch : 1];
   int32x4_t r_b[kStageTiles][BK];
   float r_dx[kStageTiles][BK];
-  float r_sx[kStageTiles][HasOffset ? BK : 1];
+  float r_sx[kStageTiles][UsesOffset ? BK : 1];
+  float r_sx1[kStageTiles][PerHalfOffset ? BK : 1];
 
   const int num_kb = static_cast<int>(num_blocks);
   const int m_i = static_cast<int>(m);
@@ -306,8 +328,11 @@ __launch_bounds__(WM * WN * WaveSize, 1) __global__
       __builtin_memcpy(&r_q1[p], hi.q, 16);
       r_dw0[p] = lo.scale * live;
       r_dw1[p] = hi.scale * live;
-      if constexpr (HasOffset) {
+      if constexpr (UsesOffset) {
         r_off[p] = lo.offset * live;
+      }
+      if constexpr (PerHalfOffset) {
+        r_off1[p] = hi.offset * live;
       }
     }
 #pragma unroll
@@ -325,12 +350,18 @@ __launch_bounds__(WM * WN * WaveSize, 1) __global__
         r_dx[t][i] = ((kb < num_kb) ? tile_scale[t] : 0.0F) *
                      reinterpret_cast<const float*>(
                          tile + kQ8ActScaleOffset)[lane_id & 15];
-        if constexpr (HasOffset) {
-          r_sx[t][i] = ((kb < num_kb) ? tile_scale[t] : 0.0F) *
-                       activation_sums[(((act_tile[t] * num_blocks) +
-                                         static_cast<std::size_t>(kb_clamped)) *
-                                        kQ8ActTileTokens) +
-                                       static_cast<std::size_t>(lane_id & 15)];
+        if constexpr (UsesOffset) {
+          const float scale = (kb < num_kb) ? tile_scale[t] : 0.0F;
+          const float* sums =
+              activation_sums + (((((act_tile[t] * num_blocks) +
+                                    static_cast<std::size_t>(kb_clamped)) *
+                                   kQ8ActTileTokens) +
+                                  static_cast<std::size_t>(lane_id & 15)) *
+                                 kQ8ActSumHalves);
+          r_sx[t][i] = scale * sums[0];
+          if constexpr (PerHalfOffset) {
+            r_sx1[t][i] = scale * sums[1];
+          }
         }
       }
     }
@@ -358,8 +389,11 @@ __launch_bounds__(WM * WN * WaveSize, 1) __global__
       if constexpr (PerHalfScale) {
         s_dw[kk][1][rs][slot] = r_dw1[p];
       }
-      if constexpr (HasOffset) {
+      if constexpr (UsesOffset) {
         s_off[kk][rs][slot] = r_off[p];
+      }
+      if constexpr (PerHalfOffset) {
+        s_off1[kk][rs][slot] = r_off1[p];
       }
     }
 #pragma unroll
@@ -372,8 +406,11 @@ __launch_bounds__(WM * WN * WaveSize, 1) __global__
         s_b[i][b_tile[t]][stage_lane] = r_b[t][i];
         if (stage_lane < 16) {
           s_dx[i][b_tile[t]][stage_lane] = r_dx[t][i];
-          if constexpr (HasOffset) {
+          if constexpr (UsesOffset) {
             s_sx[i][b_tile[t]][stage_lane] = r_sx[t][i];
+          }
+          if constexpr (PerHalfOffset) {
+            s_sx1[i][b_tile[t]][stage_lane] = r_sx1[t][i];
           }
         }
       }
@@ -395,7 +432,8 @@ __launch_bounds__(WM * WN * WaveSize, 1) __global__
       float dw0[kWaveRowTiles][kAccumulatorElements];
 
       float dw1[PerHalfScale ? kWaveRowTiles : 1][kAccumulatorElements];
-      float off[HasOffset ? kWaveRowTiles : 1][kAccumulatorElements];
+      float off[UsesOffset ? kWaveRowTiles : 1][kAccumulatorElements];
+      float off1[PerHalfOffset ? kWaveRowTiles : 1][kAccumulatorElements];
 #pragma unroll
       for (int i = 0; i < kWaveRowTiles; ++i) {
         const int rs = (wave_row * kWaveRowTiles) + i;
@@ -431,7 +469,7 @@ __launch_bounds__(WM * WN * WaveSize, 1) __global__
             dw1[i][7] = hup.w;
           }
         }
-        if constexpr (HasOffset) {
+        if constexpr (UsesOffset) {
           const float4 olo = *reinterpret_cast<const float4*>(
               &s_off[kb][rs][half_id * kAccumulatorElements]);
           off[i][0] = olo.x;
@@ -447,6 +485,22 @@ __launch_bounds__(WM * WN * WaveSize, 1) __global__
             off[i][7] = oup.w;
           }
         }
+        if constexpr (PerHalfOffset) {
+          const float4 hlo = *reinterpret_cast<const float4*>(
+              &s_off1[kb][rs][half_id * kAccumulatorElements]);
+          off1[i][0] = hlo.x;
+          off1[i][1] = hlo.y;
+          off1[i][2] = hlo.z;
+          off1[i][3] = hlo.w;
+          if constexpr (WaveSize == 32) {
+            const float4 hup = *reinterpret_cast<const float4*>(
+                &s_off1[kb][rs][(half_id * kAccumulatorElements) + 4]);
+            off1[i][4] = hup.x;
+            off1[i][5] = hup.y;
+            off1[i][6] = hup.z;
+            off1[i][7] = hup.w;
+          }
+        }
       }
 #pragma unroll
       for (int j = 0; j < kWaveTokTiles; ++j) {
@@ -456,8 +510,15 @@ __launch_bounds__(WM * WN * WaveSize, 1) __global__
         const float dx = s_dx[kb][ts][sub_lane];
 
         float sx = 0.0F;
-        if constexpr (HasOffset) {
+        float sx1 = 0.0F;
+        if constexpr (UsesOffset) {
           sx = s_sx[kb][ts][sub_lane];
+        }
+        if constexpr (PerHalfOffset) {
+          // off/off1 carry the low/high half minimums and s_sx/s_sx1 the
+          // whole-block and low-half activation sums, so the correction is
+          // off_high * full + (off_low - off_high) * low.
+          sx1 = s_sx1[kb][ts][sub_lane];
         }
 #pragma unroll
         for (int i = 0; i < kWaveRowTiles; ++i) {
@@ -480,7 +541,13 @@ __launch_bounds__(WM * WN * WaveSize, 1) __global__
               acc[i][j][l] += (dw0[i][l] * dx) * static_cast<float>(c[l]);
             }
           }
-          if constexpr (HasOffset) {
+          if constexpr (PerHalfOffset) {
+#pragma unroll
+            for (int l = 0; l < kAccumulatorElements; ++l) {
+              acc[i][j][l] -=
+                  (off1[i][l] * sx) + ((off[i][l] - off1[i][l]) * sx1);
+            }
+          } else if constexpr (HasOffset) {
 #pragma unroll
             for (int l = 0; l < kAccumulatorElements; ++l) {
               acc[i][j][l] -= off[i][l] * sx;

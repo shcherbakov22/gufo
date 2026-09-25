@@ -229,7 +229,10 @@ __global__ void ZeroQ8ActTailKernel(void* __restrict__ y, std::size_t batch,
       0.0F;
   if constexpr (StoreActivationSum) {
     float* sums = Q8ActSumSidecar(y, batch, num_blocks * 32);
-    sums[(((tt * num_blocks) + kb) * kQ8ActTileTokens) + tl] = 0.0F;
+    float* slot = sums + (((((tt * num_blocks) + kb) * kQ8ActTileTokens) + tl) *
+                          kQ8ActSumHalves);
+    slot[0] = 0.0F;
+    slot[1] = 0.0F;
   }
 }
 
@@ -367,16 +370,27 @@ __device__ __forceinline__ void BlockedSwiGluQuantEpilogue(
         }
       }
       if constexpr (StoreActivationSum) {
-        int qsum = static_cast<int>(q_lo) + static_cast<int>(q_hi);
+        // Reduce the low and high sub-block sums separately: Q2_K carries one
+        // minimum per 16-element sub-block, so the whole-block sum alone cannot
+        // express its correction. Integer addition is exact and associative, so
+        // every other type still reads the identical whole-block sum from
+        // slot 0 and this shape change cannot move one of their results.
+        int qsum_lo = static_cast<int>(q_lo);
+        int qsum_hi = static_cast<int>(q_hi);
 #pragma unroll
         for (int off = 8; off > 0; off >>= 1) {
-          qsum += __shfl_xor(qsum, off, 16);
+          qsum_lo += __shfl_xor(qsum_lo, off, 16);
+          qsum_hi += __shfl_xor(qsum_hi, off, 16);
         }
         if (live && row == 0) {
           float* sums = Q8ActSumSidecar(q8_out, batch, m);
-          sums[(((t0 / kQ8ActTileTokens * num_blocks) + blk) *
-                kQ8ActTileTokens) +
-               static_cast<std::size_t>(tl)] = d * static_cast<float>(qsum);
+          float* slot =
+              sums + (((((t0 / kQ8ActTileTokens * num_blocks) + blk) *
+                        kQ8ActTileTokens) +
+                       static_cast<std::size_t>(tl)) *
+                      kQ8ActSumHalves);
+          slot[0] = d * static_cast<float>(qsum_lo + qsum_hi);
+          slot[1] = d * static_cast<float>(qsum_lo);
         }
       }
     }
@@ -1432,6 +1446,10 @@ void LaunchKQuantSmallBatchByType(core::GgmlType type, const void* w,
       LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kIQ2_S>(
           w, fp32_x, y, batch, m, k, grid, block, stream);
       return;
+    case core::GgmlType::kQ2_K:
+      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kQ2_K>(
+          w, fp32_x, y, batch, m, k, grid, block, stream);
+      return;
     default:
       return;
   }
@@ -1524,6 +1542,10 @@ void LaunchKQuantWmmaGEMM(core::GgmlType type, const void* w,
     case core::GgmlType::kIQ2_S:
       LaunchKQuantWmmaGEMMTyped<core::GgmlType::kIQ2_S>(
           w, q8_1_x, y, batch, m, k, stream);
+      return;
+    case core::GgmlType::kQ2_K:
+      LaunchKQuantWmmaGEMMTyped<core::GgmlType::kQ2_K>(w, q8_1_x, y, batch, m, k,
+                                                       stream);
       return;
     default:
       return;
