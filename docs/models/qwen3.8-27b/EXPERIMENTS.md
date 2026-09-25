@@ -146,21 +146,32 @@ The 2x is an issue-rate effect: at the same 16x16x16 shape, iu4 retires about
 twice the instructions per second of iu8 and its operand fragments are half the
 size (2-int vs 4-int per lane), so register and LDS pressure drop as well.
 
-What can feed it is decided by `*linearity*`, not bit width. Integer WMMA
+What can feed it is decided by `*linearity*`, not bit width, and the K-quants
+and the IQ-quants fall on opposite sides despite similar names. Integer WMMA
 multiplies the stored code by the activation, so the code must be proportional
-to the value. Linear formats fit at any width up to 4 bits: Q4_K (0..15), Q2_K
-and Q2_0 (0..3), ternary (TQ1_0/TQ2_0), Q1-style. The constant term folds into
-the existing affine offset, so a q-8 remap of Q4_K costs nothing extra. Codebook
-formats do not fit at any width: IQ4_XS/IQ4_NL are 4-bit grid indices whose
-decoded span is -127..113, and IQ2/IQ3 grid magnitudes reach 43 and 62.
+to the value.
+
+Linear, therefore eligible: Q4_K (0..15), **Q3_K** (already decoded to -4..3 with
+a per-16 scale and no offset), Q2_K and Q2_0 (0..3), ternary (TQ1_0/TQ2_0),
+Q1-style. Q4_K's constant folds into the affine offset it already carries, so a
+q-8 remap costs nothing new; Q3_K needs nothing at all, since
+`PerHalfScale` already covers its per-16 scale and its values are already
+signed. Q4_K plus Q3_K are 25.7% of UD-Q4_K_S and 15.6% of the 3.84 bpw shard,
+and neither needs new correction machinery.
+
+Codebook, therefore ineligible at any width: IQ4_XS/IQ4_NL (4-bit grid indices
+whose decoded span is -127..113), IQ2_XXS/IQ2_XS/IQ2_S (grid magnitudes reach
+43), IQ3_S/IQ3_XXS (reach 62). Q5_K and Q6_K exceed four bits and Q6_K also
+carries a per-16 constant.
+
 
 Both operands are int4, so this also means 4-bit *activations* rather than the
 current q8_1. That is a prefill precision change needing quality validation, not
 just a kernel change, and it is the main reason the 2x is not free.
 
-Deferred until the GEMM delivery work lands. On the current shards the eligible
-share is Q4_K alone (19.1% of UD-Q4_K_S, 12.7% of the 3.84 bpw shard), so expect
-single-digit percent prefill. The full 2x needs weights that are linear and at
+Deferred until the GEMM delivery work lands. On the current shards the eligible share is Q4_K plus Q3_K (25.7% of UD-Q4_K_S,
+15.6% of the 3.84 bpw shard), so expect a low-double-digit percent of prefill
+from those two alone, and they need no new offset support. The full 2x needs weights that are linear and at
 most 4 bits throughout, which is a model/quantization decision. It is also
 orthogonal to the Q2_K chunked-path work: sub-4-bit linear formats become
 *eligible* for the int4 path, but their per-16 affine minimum still needs the
