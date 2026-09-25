@@ -349,11 +349,88 @@ token-at-a-time reference. The FP16 route is also the more accurate one by
 construction -- the FP16-prefill oracle requires the FP16 error to
 come in under a quarter of the A8 error, and Q2_K measures a ratio of 0.108.
 
-Residual: the 3.84 bpw shard still trails the reference by about 7% at pp2048.
-The shapes are identical and the shard is smaller (12.18 vs 14.30 GiB), so the
-likely remainder is per-weight decode cost in the FP16 prefill kernel: the
-3.84 bpw FFN matrices are predominantly IQ3_S/IQ3_XXS grid codebooks where the
-reference is IQ4_XS / Q4_K / Q5_K affine nibbles. Unverified -- there is no
-standalone bench of `HalfPrefillGemmKernel` yet. If it holds, the lever is the
-IQ3 grid decode (`CacheIqHeader` currently covers IQ4_XS only).
+Residual: the 3.84 bpw shard trailed the reference by about 7% at pp2048. The
+shapes are identical and the shard is smaller (12.18 vs 14.30 GiB), so the
+remainder has to be per-format cost in the FP16 prefill kernel -- its FFN
+matrices are predominantly IQ3_S/IQ3_XXS grid codebooks where the reference is
+IQ4_XS / Q4_K / Q5_K affine nibbles. Measured, attributed, and partly closed
+below.
+
+### Closing the residual: the fetch schedule, not the decode
+
+Built `tools/qwen27b/prefill_fp16_bench.hip`, a per-format bench of the FP16
+prefill kernel `HalfPrefillGemmKernel` (the one `LaunchBatchedQuantGEMMFp16`
+dispatches, so the one the chunked path actually runs).
+`tools/bench/build.sh` now links the host quant TU for it. At the production
+FFN shapes, batch 2048, ms per GEMM:
+
+| format | gate/up m=17408 k=5120 | down m=5120 k=17408 |
+| --- | ---: | ---: |
+| Q4_K | 11.53 | 11.37 |
+| Q5_K | 11.60 | 11.18 |
+| IQ4_NL | 11.74 | 11.57 |
+| IQ4_XS | 11.85 | 10.77 |
+| Q8_0 | 12.03 | 11.58 |
+| Q6_K | 12.49 | 11.81 |
+| Q3_K | 12.54 | 12.14 |
+| Q2_K | 12.74 | 12.14 |
+| IQ3_S | 13.14 | 12.39 |
+| IQ3_XXS | 13.31 | 12.78 |
+| IQ2_XXS | 13.38 | 12.97 |
+| IQ2_XS | 13.49 | 12.99 |
+| IQ2_S | 13.62 | 13.02 |
+
+Weighting those by each shard's real per-layer mix gives 38.34 ms for the
+3.84 bpw layer against 35.60 ms for the reference, +7.7% -- the measured
+model-level gap, so the residual is entirely inside this kernel.
+
+Two candidates were tested and refuted:
+
+* Divergent grid-table loads. Filling the weight payload with one constant byte
+  so every `kDeviceIq3sGrid` / `kDeviceIq3XxsGrid` / sign index collapses to a
+  single entry changes nothing (IQ3_S 13.09 -> 13.10 ms, IQ3_XXS 13.31 -> 13.47)
+  while Q4_K moves 2%. The 1-2 KB tables are not the cost.
+* FP32 op count in the generic fetch. `DecodeQuantSub16` leaves `offset` at zero
+  for every sub16 format except Q4_K/Q5_K/Q2_K, so the subtract can be compiled
+  out exactly. Building two bench binaries and interleaving them showed no
+  change at all -- every delta inside the 2% noise band, including Q4_K, which
+  the elision cannot affect. Reverted; the change was not kept.
+
+What did move it is the instruction-scheduling hint the IQ4 decoders already
+carry. `__builtin_amdgcn_iglp_opt(0)` after the K loop interleaves the LDS
+reads with the WMMA, which the immediate-decoding formats need and the deferred
+`LoadRaw` formats (Q4_K/Q5_K/Q6_K/Q8_0) do not. The condition was extended from
+IQ4 only to the whole immediate-decode set (Q3_K, Q2_K, IQ3_S, IQ3_XXS, IQ2_XS,
+IQ2_S, IQ2_XXS) at the 256x256 tile. Paired against the previous binary,
+back-to-back so only the deltas read:
+
+| format | before ms | after ms | delta |
+| --- | ---: | ---: | ---: |
+| Q2_K | 13.15 | 12.35 | -6.1% |
+| IQ3_S | 14.47 | 13.72 | -5.2% |
+| IQ2_S | 14.38 | 13.74 | -4.4% |
+| IQ2_XS | 13.71 | 13.14 | -4.1% |
+| IQ2_XXS | 14.37 | 13.86 | -3.6% |
+| Q3_K | 12.77 | 12.60 | -1.3% |
+| Q4_K (hint not applied either side) | 11.97 | 11.97 | -0.0% |
+
+`__builtin_amdgcn_iglp_opt` only reorders instructions, so results are exact;
+the oracle suite is green at 269 checks with it in place. Projected per layer:
+3.84 bpw 38.34 -> 36.81 ms (-4.0%), reference 35.60 -> 35.35 ms (-0.7%).
+
+Measured on the box, interleaved with 30 s between runs, two runs each:
+
+| artifact | pp1024 | pp2048 |
+| --- | ---: | ---: |
+| 3.84 bpw, before Q2_K native | -- | 409.55 +/- 1.81 |
+| 3.84 bpw, Q2_K native | 539.02 +/- 0.70 | 522.32 +/- 7.73 |
+| 3.84 bpw, + fetch-schedule hint | 548.29 / 556.65 | 540.33 / 531.07 |
+| reference `UD-Q4_K_S`, same session | 587.65 / 586.04 | 542.45 / 561.84 |
+
+That is +31% pp2048 on the 3.84 bpw shard (409.6 -> ~536) and a gap of about 3%
+to the reference, from 26%. The reference barely moves because its FFN is
+already IQ4_XS/Q4_K/Q5_K. The remaining spread is inside the kernel again, but
+it is now small enough that the next lever worth pulling is the kernel's own
+58%-of-peak efficiency, not the per-format decoders.
+
 
