@@ -3532,3 +3532,50 @@ epilogue at +0.13%. That arm is almost certainly dead code: with the store ablat
 can drop the IQ3_XXS decode entirely, which is the same DCE trap hit earlier in this work. No
 conclusion is drawn from it, and per-format ablation arms need their own ISA verification.
 
+## The non-FFN shapes are not slow -- and a 26% harness discrepancy is open
+
+The shape sweep at production batch (prefill_fp16_bench, q4k, batch 2048) is uniform:
+
+| shape | m | k | TFLOPS |
+|---|---|---|---|
+| FFN gate/up | 17408 | 5120 | 30.01 |
+| attn_qkv | 10240 | 5120 | 30.05 |
+| attn_q | 12288 | 5120 | 29.69 |
+| attn_gate | 6144 | 5120 | 29.42 |
+| ssm_out | 5120 | 6144 | 29.49 |
+| attn_output | 5120 | 6144 | 29.47 |
+| attn_k/v | 1024 | 5120 | 30.88 |
+
+Uniform to within 5%, and ~30 TF agrees with the wall-clock model-level 29.7 TF. So the
+inference that the non-FFN GEMMs run at ~24 TF was **wrong**: there is no slow subsystem. The
+arithmetic behind it was bad -- the FFN is 67% of GEMM FLOPs (the embedding is a gather, not a
+GEMM), not the 47% the parameter count suggested, and at 67% the model-level rate is fully
+explained by a uniform ~30 TF.
+
+**But two harnesses disagree by ~26% on the same kernel and shape**, reproducibly and
+back-to-back:
+
+| harness | ms | TFLOPS |
+|---|---|---|
+| prefill_fp16_bench, production launcher | 12.13 - 12.40 | 29.4 - 30.1 |
+| prefill_fp16_bench, tile variant 8 (same instantiation) | 12.26 | 29.77 |
+| fp16_prod_ab, direct launch | 9.23 - 9.46 | 38.6 - 39.7 |
+| fp16_prod_ab, production launcher | 9.19 - 9.47 | 38.6 - 39.7 |
+
+Ruled out as causes: the production launcher (9.468 vs 9.460 ms against a direct launch of the
+same instantiation *in one binary*); the `Complete` flag (12.26 vs 12.90 ms *within* the slow
+harness, correctly ordered); data content (NaN-filled weights cost 4.5%); sustained load (1
+iteration per rep still reads 12.0 ms, and 12 rounds in the fast harness still reads 9.2 ms).
+What remains is the allocation set -- the slow harness additionally allocates a 42 MB `fp32_x`
+staging buffer and fills weights via `FillWeights` instead of a memset.
+
+**Recorded as unresolved: no absolute TFLOPS from either harness should be trusted until this
+is settled.** The relative results in this document survive, because both harnesses order
+conditions consistently, but the iGPU side of the split is not sized. Note the direction if the
+slow harness is right: at ~30 TF the iGPU would be *slower* than the NPU's 32.4 TF, making the
+NPU the faster engine and the split worth more rather than less.
+
+**Bisect plan (cheap, ~5 runs):** start from the 9.2 ms harness and add the slow one's elements
+one at a time -- the extra 42 MB staging allocation, the `FillWeights` pattern, the
+`FillValues` + `LaunchFloatToFp16` warmup -- until the time jumps.
+
