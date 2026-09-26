@@ -3575,9 +3575,38 @@ conditions consistently, but the iGPU side of the split is not sized. Note the d
 slow harness is right: at ~30 TF the iGPU would be *slower* than the NPU's 32.4 TF, making the
 NPU the faster engine and the split worth more rather than less.
 
-**Bisect plan (cheap, ~5 runs):** start from the 9.2 ms harness and add the slow one's elements
-one at a time -- the extra 42 MB staging allocation, the `FillWeights` pattern, the
-`FillValues` + `LaunchFloatToFp16` warmup -- until the time jumps.
+**Update: the discrepancy is real and eleven candidate causes are excluded.** rocprofv3
+kernel-trace on both binaries:
+
+| binary | kernel GPU time | wall |
+|---|---|---|
+| prefill_fp16_bench | **11.663 ms** (n=19) | 12.1 ms |
+| fp16_bench_ab | **9.659 ms** (n=40) | 9.45 ms |
+
+The same instantiation genuinely executes 21% slower in one process -- the wall clock is not
+lying. Excluded, each by direct measurement:
+
+- the production launcher (9.468 vs 9.460 ms against a direct launch, one binary)
+- the `Complete` flag (correctly ordered *within* each harness: 12.26 vs 12.90 ms)
+- the include set (replicated exactly, same order -> still 9.45 ms)
+- `DeviceBuffer` (same class, same `hipMalloc`)
+- data content (zero, valid Q4_K scales, NaN scales, non-zero activations -> 4.7% spread)
+- an extra 42 MB allocation
+- the slow harness's exact allocation set *and order* (`w, fp32_x(42MB), y, half_x` -> 9.2 ms)
+- the 142 MB device-to-host readback before timing
+- sustained load (1 iteration per rep still reads 12.0 ms)
+- register allocation (VGPR counts do not track the fast/slow split)
+- the bench code path (main -> RunFp16 is trivial)
+
+The remaining candidate is that the same template instantiation is compiled to **different
+machine code** in the two translation units. Confirming that means dumping and diffing SASS,
+which was not done.
+
+**Practical impact.** The iGPU's real FFN GEMM rate is ~30 or ~39 TF depending on which
+harness matches the model, and the model-level wall-clock rate of 29.7 TF is independent
+evidence for ~30. Note the direction if the slow harness is the truthful one: the NPU at
+32.4 TF would be the *faster* engine, and the split worth more than the 1.53x computed from
+40.6 TF. Either way the NPU conclusion is unaffected.
 
 ## The bfp16 quality gate passes on real weights
 
