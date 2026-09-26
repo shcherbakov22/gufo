@@ -2884,3 +2884,51 @@ bounds the cost of four-bit activations on the **short-batch path where int4 is 
 implemented**, not on the pp2048 fp16 path that holds 78% of the GEMM time. Nothing here
 says what four-bit activations would do to the path where the 2x would actually be taken.
 A fixture of at least 1024 tokens is the prerequisite for that, and it does not exist yet.
+
+## The int4 2x is real, and it is coupled to the shard's quantisation mix
+
+The 9% figure above is a property of the shipped shard, not of the int4 path. Weight elements
+are proportional to GEMM FLOPs, so the eligible share *is* the FLOP share, and it is set
+entirely by how much of the model is stored on a linear grid:
+
+| shard | int4-eligible elements | FFN mix |
+| --- | ---: | --- |
+| IQ4_XS-3.84bpw | 15.5% | IQ3_S 36.9%, IQ3_XXS 33.3%, IQ4_XS 21.0% -- **all codebooks** |
+| UD-Q4_K_S | 25.7% | IQ4_XS 50.3% |
+| **UD-Q4_K_S-requant294-Q4K** | **91.2%** | **Q4_K 97.9%**, Q6_K 2.1% |
+
+On the third shard -- which is already on disk -- the ceiling is `1/(0.09 + 0.91/2.2)` =
+**1.99x**, not 1.09x. That is the \"quantisation mix\" the section above called the
+larger lever, and it exists.
+
+The catch is that the 4-bit *activation* cost scales with the same eligible share, so the
+2x and the quality are inversely coupled. Measured on the held-out instrument, two repeats
+each, all figures bit-exact:
+
+| shard | eligible | configuration | mean KL | top-1 | mean NLL delta |
+| --- | ---: | --- | ---: | ---: | ---: |
+| IQ4_XS-3.84bpw | 15.5% | production | 0.0147376 | 25/27 | 0.00616 |
+| IQ4_XS-3.84bpw | 15.5% | + mixed int4 | 0.0179338 | 24/27 | 0.01964 |
+| requant294-Q4K | 91.2% | production | 0.0066611 | **27/27** | 0.02358 |
+| requant294-Q4K | 91.2% | + mixed int4 | 0.0124258 | 26/27 | **0.06523** |
+
+Reading it:
+
+* **The requantised shard beats the shipped one on this instrument** -- 0.0067 mean KL and
+  27/27 top-1 against 0.0147 and 25/27, both measured against `UD-Q4_K_S`. Its weight
+  requantisation is closer to its source than the 3.84 bpw shard is.
+* **Four-bit activations cost far more there, as they must.** +0.0032 KL at 15.5% eligible
+  becomes +0.0058 at 91.2%, and the NLL delta nearly triples, 0.0236 -> 0.0652.
+* **The metrics disagree, and that is the finding.** On KL, TV and top-1, requant294 with
+  4-bit activations (0.0124, 26/27) is still *closer to the reference* than the shipped
+  3.84 bpw shard without them (0.0147, 25/27). On teacher-forced NLL -- which is what
+  perplexity is -- it is ten times worse, 0.0652 against 0.0062. Twenty-seven rows over
+  three fixtures cannot adjudicate that, and the sample is the binding limitation, not the
+  instrument.
+
+So the honest state of the int4 direction: **the 2x is reachable, the shard that unlocks it
+exists and is better than the shipped one on distribution metrics, and the price is a 4-bit
+activation grid whose true-token cost is large enough that the current evaluation cannot
+clear it.** The next step is a larger held-out evaluation -- the same instrument over many
+more tokens -- before any kernel work, because the two metrics currently point opposite
+ways and 27 rows is not enough to break the tie.
