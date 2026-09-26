@@ -74,4 +74,62 @@ gates are quantized.
 `/home/q/models/gufo-sweep/` (79 GiB): `base_q4kpure.gguf`, `ssm_f32q8.gguf`,
 `q6_big.gguf`, `ffn_q5k.gguf`, `ffn_q6k.gguf` + `.quant.log` files.
 Reproduce with `llama-quantize --pure --allow-requantize [--tensor-type ...] IN OUT Q4_K`
+
+## Correction: the mechanism is a global gate, not the 96 tiny projections
+
+The attribution above -- "96 tiny GDN projections on a slow path, ~13 ms each" --
+is wrong, and measurement says so.
+
+`UseQwen27bFp16Prefill` is **global and all-or-nothing**. It requires every GEMM
+tensor role in every layer to be Q8_0 or `IsNativeWmmaQuant`, and that includes
+`ssm_alpha`/`ssm_beta`. A single F32 `ssm_alpha` does not make 48 projections
+slow; it takes the *whole model* off the fp16 WMMA path in
+[prefill_chunk.cpp](../../../src/models/qwen/hip/prefill_chunk.cpp). The FFN dual
+fused kernel is launched only `if (half_prefill)`, and once `half_prefill` is
+false every native quant GEMM drops to the int8-activation route -- measured at
+1.4-1.5x slower per FFN GEMM (14.8-17.5 ms against 11.5-13.0 ms).
+
+The ablations' own telemetry already pointed here: per-layer route fingerprints
+were identical between the requant and the pure file, so "the difference is
+inside the per-GEMM dispatch". `half_prefill` is exactly such a per-GEMM
+dispatch switch, and it does not appear in the layer route plan.
+
+**Measured.** Relaxing the gate so `ssm_alpha`/`ssm_beta` do not trip it, and
+routing `gemm_weight` per tensor instead of per model, on `ssm_f32q8.gguf`,
+`-p 2048 -n 1`:
+
+| | pp2048 t/s |
+| --- | --- |
+| `base_q4kpure` (all native, gate on) | 555 / 589 / 567 |
+| `ssm_f32q8` before (gate off) | **424.46 +/- 0.68** |
+| `ssm_f32q8` after (per-tensor gate) | **579.61 +/- 7.98** |
+
+That is +36.6%, back to parity with the all-native file.
+
+**But that configuration is numerically invalid, and must not be shipped as it
+stands.** `--validate-prefill 2048`:
+
+| file | cosine | max_abs_diff |
+| --- | --- | --- |
+| `base_q4kpure` (unaffected control) | 0.99999970 | 0.0076 |
+| `ssm_f32q8` with the per-tensor gate | **0.98234493** | **1.67** |
+
+The cause: under `half_prefill` the RMSNorm writes only the BF16 staging buffer.
+The FP32 buffer `d_normed` is never populated on that path, but the F32 route
+(`kHipPrefillF32Blas`) reads `fp32_input = d_normed`. So the relaxed gate fed
+`ssm_alpha` a stale buffer and still measured fast. A *more* precise alpha (F32
+rather than Q4_K) cannot explain a 0.982 cosine against a 0.9999997 control; only
+wrong input can.
+
+**So the fix is two parts, not one:**
+
+1. dispatch `gemm_weight` per tensor rather than per model, so one foreign type
+   costs its own projection instead of the whole model's fast path; and
+2. make the fp16 norm path emit the FP32 normed row whenever any consumer of that
+   row is routed off the fp16 path, so the F32 route has valid input.
+
+Part 1 alone is worth roughly +36% on such artifacts and is what the numbers
+above measure; part 2 is what makes it correct. Both are small, and together they
+replace the two fixes originally proposed here (requantizing the artifact, or
+writing new int8-WMMA small-n kernels / fusing the GDN gate projections).
 followed by `gufo bench -m OUT -p 2048 -n 1 -r 1`.
