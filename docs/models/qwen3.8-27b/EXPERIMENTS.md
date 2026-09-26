@@ -520,6 +520,51 @@ kernel's structure is what 64 KiB of LDS *and* the accumulator-and-operand VGPR
 budget jointly permit, and both attempts to beat it died on the register half of
 that pair rather than the LDS half.
 
+### Is the int8 kernel unoptimizable? No -- it has more headroom than fp16
+
+It is worth separating two claims that were conflated in the prose above. What
+was measured is that the int8 *path* is slower and that its smaller staging does
+not convert into speed because the fp32 scale/offset/sum metadata fills the LDS
+back up. What was **not** measured is whether the int8 kernel is near its own
+limit. It is not.
+
+`tools/qwen27b/prefill_gemm_bench.hip` already benches it. Interleaved with the
+fp16 bench in one session, Q4_K, m=17408 k=5120 batch=2048, so both arms see the
+same thermal state:
+
+| kernel | ms | TFLOPS | share of its measured ceiling |
+| --- | ---: | ---: | ---: |
+| fp16 `HalfPrefillGemmKernel`, 256x256 bk4 | ~12.0 | 30.4 | **63%** of 48.35 |
+| int8 `WKQuantA8BlockedWmmaGEMMKernel` | ~15.1 (14.3-16.4) | 24.2 | **48%** of 50.31 |
+
+The int8 kernel is **15 percentage points further from its ceiling**. So the
+honest answer to "is int8 at its limit" is no: it wastes about half of what the
+hardware offers on this shape, and the levers are different from the fp16 ones --
+its cost is per-element metadata arithmetic (four fp32 arrays staged as scales,
+offsets, activation scales and activation sums, plus the affine offset
+correction) and its epilogue, not the barrier structure.
+
+But the headroom is worth little, for two reasons:
+
+1. **The int8 rate ceiling is only 4% above fp16's** (50.31 against 48.35). Even
+   brought to fp16's 63% efficiency, int8 lands at ~31.7 TFLOPS, about +4% on the
+   GEMM and nothing more. There is no rate to win here; the 2x lives in int4.
+2. **The int8 path carries roughly 12% of non-GEMM overhead.** Model-level, the
+   forced q8 path runs 390 t/s against 540 for fp16, about 28% slower, while the
+   GEMM alone is only 26% slower -- the rest is the activation quantization passes
+   and the fusion the fp16 path gets instead (`LaunchBatchedDualQuantGEMMSwiGLU`
+   against the fp16 dual). Fixing the GEMM to parity would still leave the path
+   behind.
+
+And the one thing int8's spare LDS could buy -- a larger tile with a better
+fragment ratio -- does not help, because the fp16 measurements already showed the
+K loop sits at 100% of the MMA peak and 0.75 loads per MMA. A better ratio has
+nothing to recover; the bottleneck is the format-independent staging, barriers and
+epilogue, which is exactly what int8 cannot change.
+
+**So: optimizable in principle, not worth it in practice** -- a 4% rate ceiling
+against ~12% of path overhead, with the real lever elsewhere.
+
 
 ## Deferred: Q2_K native prefill (chunked-path eligibility)
 
