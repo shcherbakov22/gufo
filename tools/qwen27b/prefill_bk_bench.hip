@@ -169,16 +169,16 @@ const TypeCase kTypes[] = {
 // changing model code. BM+BN is capped at 512 because BK is fixed at 4 and the
 // two stages must fit the 64 KiB LDS budget.
 template<gufo::core::GgmlType Type, int BM, int BN, int WM, int WN,
-         bool Complete, int BK = 4>
+         bool Complete, int BK = 4,
+         gufo::hip::HalfEpilogue Epi = gufo::hip::HalfEpilogue::kStore>
 void LaunchTile(const void* w, const short* x, float* y, std::size_t batch,
                 std::size_t m, std::size_t k, hipStream_t stream,
-                unsigned dyn_smem = 0) {
+                unsigned dyn_smem = 0, const float* gate = nullptr) {
   const dim3 grid(static_cast<unsigned>((batch + BN - 1) / BN),
                   static_cast<unsigned>((m + BM - 1) / BM));
-  gufo::hip::HalfPrefillGemmKernel<BM, BN, WM, WN, Type,
-                                   gufo::hip::HalfEpilogue::kStore, Complete,
-                                   Type, BK>
-      <<<grid, WM * WN * 32, dyn_smem, stream>>>(w, x, y, batch, m, k, nullptr);
+  gufo::hip::HalfPrefillGemmKernel<BM, BN, WM, WN, Type, Epi, Complete, Type,
+                                   BK>
+      <<<grid, WM * WN * 32, dyn_smem, stream>>>(w, x, y, batch, m, k, gate);
 }
 
 template<gufo::core::GgmlType Type, int BM, int BN, int WM, int WN, int BK>
@@ -196,12 +196,12 @@ void ReportBlocks(const char* tag, unsigned dyn) {
 
 const char* TileName(int variant) {
   switch (variant) {
-    case 0: return "256x256 w8n4 bk4 BASE";
-    case 1: return "128x128 w4n2 bk4 2blk";
-    case 2: return "128x128 w4n2 bk4 FORCE1";
-    case 3: return "128x128 w4n4 bk4 2blk r1";
-    case 4: return "128x128 w4n4 bk4 FORCE1";
-    case 5: return "128x128 w2n4 bk4 2blk";
+    case 0: return "256x256 w8n4 store";
+    case 1: return "256x256 w8n4 swiglu";
+    case 2: return "128x128 w4n2 store";
+    case 3: return "128x128 w4n2 swiglu";
+    case 4: return "128x128 w4n2 store 1blk";
+    case 5: return "256x256 w8n4 store bk2";
     default: return "?";
   }
 }
@@ -210,14 +210,15 @@ constexpr int kTileVariants = 6;
 template<gufo::core::GgmlType Type>
 void LaunchTileVariant(const void* w, const short* x, float* y,
                        std::size_t batch, std::size_t m, std::size_t k,
-                       int variant, hipStream_t stream) {
+                       int variant, hipStream_t stream, const float* gate) {
+  using Epi = gufo::hip::HalfEpilogue;
   switch (variant) {
-    case 0: LaunchTile<Type, 256, 256, 8, 4, false, 4>(w, x, y, batch, m, k, stream); break;
-    case 1: LaunchTile<Type, 128, 128, 4, 2, false, 4>(w, x, y, batch, m, k, stream, 0); break;
-    case 2: LaunchTile<Type, 128, 128, 4, 2, false, 4>(w, x, y, batch, m, k, stream, 32768); break;
-    case 3: LaunchTile<Type, 128, 128, 4, 4, false, 4>(w, x, y, batch, m, k, stream, 0); break;
-    case 4: LaunchTile<Type, 128, 128, 4, 4, false, 4>(w, x, y, batch, m, k, stream, 32768); break;
-    case 5: LaunchTile<Type, 128, 128, 2, 4, false, 4>(w, x, y, batch, m, k, stream, 0); break;
+    case 0: LaunchTile<Type, 256, 256, 8, 4, false, 4, Epi::kStore>(w, x, y, batch, m, k, stream, 0, gate); break;
+    case 1: LaunchTile<Type, 256, 256, 8, 4, false, 4, Epi::kSwiGLU>(w, x, y, batch, m, k, stream, 0, gate); break;
+    case 2: LaunchTile<Type, 128, 128, 4, 2, false, 4, Epi::kStore>(w, x, y, batch, m, k, stream, 0, gate); break;
+    case 3: LaunchTile<Type, 128, 128, 4, 2, false, 4, Epi::kSwiGLU>(w, x, y, batch, m, k, stream, 0, gate); break;
+    case 4: LaunchTile<Type, 128, 128, 4, 2, false, 4, Epi::kStore>(w, x, y, batch, m, k, stream, 32768, gate); break;
+    case 5: LaunchTile<Type, 256, 256, 8, 4, false, 2, Epi::kStore>(w, x, y, batch, m, k, stream, 0, gate); break;
     default: break;
   }
 }
@@ -241,12 +242,15 @@ void RunTiles(std::size_t m, std::size_t k, std::size_t batch,
   const auto [d_offset, dmin_offset] = WeightScaleOffsets(Type);
   DeviceBuffer<unsigned char> weights(weight_bytes);
   DeviceBuffer<float> fp32_x(batch * k), y(batch * m), reference(batch * m);
+  DeviceBuffer<float> gate(batch * m);
   DeviceBuffer<short> half_x(batch * k);
   FillWeights<<<static_cast<unsigned>((weight_bytes / block_bytes + 255) / 256),
                 256>>>(weights.data(), weight_bytes, block_bytes, d_offset,
                         dmin_offset, pattern);
   FillValues<<<static_cast<unsigned>((fp32_x.size() + 255) / 256), 256>>>(
       fp32_x.data(), fp32_x.size());
+  FillValues<<<static_cast<unsigned>((gate.size() + 255) / 256), 256>>>(
+      gate.data(), gate.size());
   LaunchFloatToFp16(fp32_x.data(), half_x.data(), fp32_x.size(), nullptr);
   LaunchBatchedQuantGEMMFp16(Type, weights.data(), half_x.data(),
                              reference.data(), batch, m, k, nullptr);
@@ -254,7 +258,7 @@ void RunTiles(std::size_t m, std::size_t k, std::size_t batch,
   for (int variant = 0; variant < kTileVariants; ++variant) {
     const auto launch = [&] {
       LaunchTileVariant<Type>(weights.data(), half_x.data(), y.data(), batch, m,
-                              k, variant, nullptr);
+                              k, variant, nullptr, gate.data());
     };
     hipMemset(y.data(), 0, y.size() * sizeof(float));
     launch();
@@ -277,6 +281,29 @@ void RunTiles(std::size_t m, std::size_t k, std::size_t batch,
         "mismatch=%zu\n",
         TypeName(Type), m, k, variant, TileName(variant), ms,
         (2.0 * static_cast<double>(m) * k * batch) / (ms * 1e9), mismatches);
+    std::fflush(stdout);
+  }
+  {
+    DeviceBuffer<short> y_half(batch * m);
+    const auto launch = [&] {
+      (void)TryLaunchBatchedDualQuantGEMMSwiGLUFp16(
+          Type, Type, weights.data(), weights.data(), half_x.data(),
+          y_half.data(), batch, m, k, nullptr);
+    };
+    launch();
+    HIP_CHECK(hipDeviceSynchronize());
+    for (unsigned i = 0; i < 2; ++i) launch();
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < iterations; ++i) launch();
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto stop = std::chrono::steady_clock::now();
+    const double ms =
+        std::chrono::duration<double, std::milli>(stop - start).count() /
+        iterations;
+    std::printf("dual  type=%s M=%zu K=%zu %-18s ms=%.6f tflops=%.2f\n",
+                TypeName(Type), m, k, "PROD gateup fused", ms,
+                (4.0 * static_cast<double>(m) * k * batch) / (ms * 1e9));
     std::fflush(stdout);
   }
 }

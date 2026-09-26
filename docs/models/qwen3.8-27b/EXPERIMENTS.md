@@ -1191,10 +1191,14 @@ to a description of pipe occupancy.
 
 The instruction mix says the same thing from the other side. The Q4_K 256x256
 kStore kernel's K-loop body is 193 instructions carrying 32 WMMAs, and the
-weight decode is already *inside* it -- 50 of those instructions are the
-`v_bfe`/`v_cvt`/`v_fma_mix` nibble unpacking, interleaved with the MMAs by the
-scheduler. The whole function contains 48 `ds_load_b128` and 4 `ds_store_b128`
-in total. Per stage a SIMD issues 8 waves x 193 = 1544 instructions against
+weight decode appears in the same loop *body* -- 50 of those instructions are the
+`v_bfe`/`v_cvt`/`v_fma_mix` nibble unpacking. The whole function contains 48
+`ds_load_b128` and 4 `ds_store_b128` in total. But being in the same body is not
+the same as being overlapped: that body also contains two `s_barrier`
+instructions, and the decode sits entirely on the `commit()` side of the first
+one. See the buffering note below -- an earlier draft of this section claimed the
+scheduler had interleaved the decode with the MMAs, which the barriers make
+impossible. Per stage a SIMD issues 8 waves x 193 = 1544 instructions against
 about 8000 cycles of matrix-pipe time, so roughly 80% of issue slots are spare:
 the non-MMA instructions in the loop are free, and they are already overlapped.
 
@@ -1207,6 +1211,65 @@ instruction ceiling" figure is pessimistic for production and should be
 re-measured on the fused epilogue rather than estimated from kStore. The second
 is the int4 decision: nothing else in the block is removable without changing
 the numerics.
+
+### The fused epilogue, and why there are two barriers per stage
+
+The 12.9% epilogue figure above was measured on the `kStore` epilogue, which
+writes fp32. Production's FFN runs the *dual* `kGateUp` kernel and writes fp16,
+so the figure was suspect. Measured directly, same tile and shape, median of
+three passes:
+
+| variant | ms | vs kStore |
+| --- | --- | --- |
+| 256x256 w8n4 `kStore` (fp32 out) | 12.38 | -- |
+| 256x256 w8n4 `kSwiGLU` (fp16 out, fp32 gate read) | 13.13 | **+6%** |
+| 128x128 w4n2 `kStore` | 13.05 | +5% |
+| 128x128 w4n2 `kSwiGLU` | 13.85 | +12% |
+| **production dual `kGateUp` fused** (2 GEMMs per launch) | **22.84** | **--** |
+
+The standalone fused epilogue is *slower*, not faster: `kSwiGLU` reads a fp32
+gate (4 B) and writes fp16 (2 B), so 6 B/element against `kStore`'s 4 B of write.
+The dual kernel is the one that wins, because it never reads a gate at all --
+both operands are already in registers -- and writes 2 B. Per GEMM it does
+22.84/2 = 11.42 ms against the single kStore GEMM's 12.38 ms, so about **8%
+better per GEMM**, which is the activation staging being shared plus the halved
+output.
+
+That gives the number that matters. The dual kernel moves 2 x 1.825e11 MACs in
+22.84 ms, so **31.96 TFLOPS, or 66.1% of the measured 48.35 fp16 ceiling**. The
+"66% of ceiling" figure was therefore *not* pessimistic: it holds for the kernel
+production actually runs, and the fused epilogue does not remove the overhead.
+That hypothesis is refuted.
+
+What the epilogue costing 6% does confirm is where the two barriers come from.
+`commit()` writes `s_a[ks]` and `s_b[ks]` with **no parity dimension** -- the LDS
+is single-buffered -- and `sizeof(s_a) + sizeof(s_b)` is exactly the 64 KiB
+budget, so there is no room for a second buffer. The loop is therefore
+
+```
+commit()    decode + StoreSwizzled into s_a/s_b     7.3%   <- serial
+barrier A   publish the single buffer                      \
+fetch()     global loads to registers               2.9%   | 6.5% barriers
+K loop      48 ds_load_b128 + 32 WMMA              70.4%   |
+barrier B   nobody may overwrite until readers done        /
+```
+
+Barrier B exists *only* because the buffer is single, and barrier A is the
+publish that a double buffer would let you overlap with compute. Both are paid
+because 64 KiB cannot hold two stages. This is the same capacity wall as the BK
+result, seen from the other side: at 256x256 the stage is exactly the LDS budget,
+so single-buffering is forced, so both barriers are forced.
+
+**The one structural lever that survives all of this** is that the decode half of
+`commit()` is pure VALU reading registers, and issue is ~80% spare, so it does
+not have to be inside the fenced serial window -- it could be pre-decoded into
+registers during the K loop of the previous stage, leaving only `StoreSwizzled`
+after barrier B. The register cost is bounded and small: one stage's worth is
+`BM*BK/kThreads` = one 16-half sub-block for s_a and one for s_b, 16 VGPRs,
+against the 64 VGPRs of headroom between the 192 in use and the 256 the
+occupancy allows. The compiler cannot do this itself because `s_barrier` is a
+scheduling fence. The ceiling on the gain is the decode's share of the 7.3%
+commit -- a few percent of the block, not a third of it.
 
 
 
