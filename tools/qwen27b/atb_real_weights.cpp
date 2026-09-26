@@ -17,19 +17,20 @@
 // weight is written transposed.  A is a fixed-seed standard normal [M, K]; the
 // bfp16 error is a per-element relative effect, so the output error is
 // insensitive to A's scale.
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   if (argc != 7) {
-    std::fprintf(stderr,
-                 "usage: %s <w_raw> <W_rows> <W_cols> <M> <out_A.f32> <out_B.f32>\n",
-                 argv[0]);
+    std::fprintf(
+        stderr,
+        "usage: %s <w_raw> <W_rows> <W_cols> <M> <out_A.f32> <out_B.f32>\n",
+        argv[0]);
     return 2;
   }
-  const char *raw_path = argv[1];
-  const std::size_t n_rows = std::strtoull(argv[2], nullptr, 10); // W_rows = N
-  const std::size_t k = std::strtoull(argv[3], nullptr, 10);      // W_cols = K
+  const char* raw_path = argv[1];
+  const std::size_t n_rows = std::strtoull(argv[2], nullptr, 10);  // W_rows = N
+  const std::size_t k = std::strtoull(argv[3], nullptr, 10);       // W_cols = K
   const std::size_t m = std::strtoull(argv[4], nullptr, 10);
-  const char *a_path = argv[5];
-  const char *b_path = argv[6];
+  const char* a_path = argv[5];
+  const char* b_path = argv[6];
 
   if (k % 256 != 0) {
     std::fprintf(stderr, "K must be a multiple of 256\n");
@@ -37,7 +38,7 @@ int main(int argc, char **argv) {
   }
   const std::size_t row_bytes = (k / 256) * 98;
   std::vector<std::uint8_t> raw(row_bytes * n_rows);
-  FILE *fp = std::fopen(raw_path, "rb");
+  FILE* fp = std::fopen(raw_path, "rb");
   if (!fp) {
     std::perror("open w_raw");
     return 1;
@@ -50,8 +51,8 @@ int main(int argc, char **argv) {
 
   std::vector<float> w(n_rows * k);
   for (std::size_t r = 0; r < n_rows; ++r)
-    gufo::quant::DequantizeIQ3_XXS(raw.data() + r * row_bytes,
-                                   w.data() + r * k, k);
+    gufo::quant::DequantizeIQ3_XXS(raw.data() + r * row_bytes, w.data() + r * k,
+                                   k);
 
   double sum2 = 0, mx = 0;
   for (float v : w) {
@@ -63,7 +64,7 @@ int main(int argc, char **argv) {
 
   // B is row-major [K, N] = W^T.
   {
-    FILE *bf = std::fopen(b_path, "wb");
+    FILE* bf = std::fopen(b_path, "wb");
     if (!bf) {
       std::perror("open out_B");
       return 1;
@@ -84,7 +85,7 @@ int main(int argc, char **argv) {
   {
     std::mt19937_64 rng(0x5eed1234ULL);
     std::normal_distribution<float> nd(0.0f, 1.0f);
-    FILE *af = std::fopen(a_path, "wb");
+    FILE* af = std::fopen(a_path, "wb");
     if (!af) {
       std::perror("open out_A");
       return 1;

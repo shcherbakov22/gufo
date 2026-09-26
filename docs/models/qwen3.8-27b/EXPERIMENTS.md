@@ -3967,27 +3967,44 @@ the FFN inflates it 2.94x:
 | as bfp16 (9 bits) | | **13.45 GiB** |
 | model plus fully packed FFN | | **25.63 GiB** |
 
-The machine has 30 GiB total with about 18 GiB available, so **a full FFN repack does not fit.**
-Packing only the NPU's share -- 44% of the FFN at the measured split -- is about 5.9 GiB, which
-fits, but there is no room to also keep the IQ3_XXS copy of what was packed.
+Packing *all* FFN weights therefore needs 13.45 GiB and, alongside the 12.18 GiB model,
+does not fit in the ~18 GiB available. But the operating point is not "all": at the measured
+split the NPU takes 44% of the FFN, so the packed set is ~5.9 GiB gross, and because a channel
+is served by either the NPU or the GPU the IQ3_XXS bytes it replaces are freed -- about
+2.0 GiB -- for a net of roughly **+3.9 GiB**, which fits. The ceiling is real but the plan is
+under it.
 
-**What it costs in time.** Timed on the real gate/up shape at a 2048-token batch, host-side,
-single-threaded:
+**What it costs in time -- and why the first answer was wrong.** Timed on the real gate/up shape
+at a 2048-token batch, host-side, single-threaded:
 
 | operand | shuffle | encode | total | vs GEMM |
 |---|---|---|---|---|
-| A (activation, 2048 x 5120) | 9.3 ms | 42.3 ms | **51.6 ms** | **4.5x** |
-| B (weights, 5120 x 17408) | 77.0 ms | 326.1 ms | **403.1 ms** | 35x |
+| A (activation, 2048 x 5120) | 9.3 ms | 42.3 ms | 51.6 ms | 4.5x |
+| B (weights, 5120 x 17408) | 77.0 ms | 326.1 ms | 403.1 ms | 35x |
 | NPU GEMM | | | 11.45 ms | |
 
-B is static, so its 403 ms is a one-off repack cost -- about 400 ms per tensor, roughly a minute
-for all 48 layers' gate/up/down. **A is not.** 51.6 ms per call against 11.45 ms of compute
-means the naive host-side path loses by 4.5x regardless of what the NPU does. The activation
-encode has to be fused into the preceding GPU kernel -- the FFN RMSNorm for gate/up, the SwiGLU
-for down -- which reads and writes the same activation anyway. That is an engineering task, and
-it is now the critical path.
+That reads as a dead end for feeding the NPU from the host, and it was written up that way for
+one round. It is wrong. The packing is embarrassingly parallel -- every 8-element exponent block
+and every L1 tile is independent of every other -- and the measurement was single-threaded on a
+32-thread part. `tools/qwen27b/atb_act_bench.cpp` measures the same work at 1 to 32 threads:
 
-So the NPU path's real cost is the operand preparation, not the 32 TFLOPS GEMM. A plan that
-treats the bfp16 conversion as free -- in memory or in time -- is wrong by the two numbers
-above.
+| threads | shuffle | encode | total |
+|---|---|---|---|
+| 1 | 6.38 ms | 56.74 ms | 63.12 ms |
+| 4 | 1.88 ms | 14.42 ms | 16.30 ms |
+| 8 | 1.41 ms | 7.32 ms | **8.73 ms** |
+| 16 | 1.05 ms | 4.49 ms | **5.53 ms** |
+| 32 | 0.90 ms | 3.57 ms | 4.46 ms |
+
+At 8 threads the activation pack is 8.73 ms against 11.45 ms of GEMM; at 16 threads it is
+5.53 ms, **below the compute it feeds**. The host can prepare A, so fusing the encoder into the
+GPU norm and SwiGLU kernels is an optimisation rather than a prerequisite. During GPU-bound
+prefill the CPU is otherwise idle, so those threads are close to free.
+
+B stays a one-off: 403 ms single-threaded per tensor, well under a second with threads, paid
+once at load.
+
+**The lesson is the same one this document keeps relearning.** The infeasibility came from not
+using the other 31 cores, not from the design; the correction is one measurement. The operand
+preparation is affordable on both axes, and the NPU path's cost remains the 32 TFLOPS GEMM.
 
