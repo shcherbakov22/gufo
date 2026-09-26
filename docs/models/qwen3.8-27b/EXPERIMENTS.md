@@ -3003,3 +3003,84 @@ of order 0.1 over 513 tokens puts the standard error of the mean near 0.004 -- t
 order as the int4 delta itself. So \"no NLL cost\" here means \"below the resolution of
 513 tokens\", not \"measured at zero\". A real perplexity run over tens of thousands of
 tokens is the acceptance test for the kernel, and it is the next measurement, not this one.
+
+## Conclusion: shipping IQ4_XS-3.84bpw; the int4 2x is not reachable at quality
+
+**Decision: the 3.84 bpw codebook shard stands, and no int4 kernel will be built.** The
+reason is structural, not an implementation gap, and it took a sweep of what actually exists
+to establish.
+
+### Eligibility is a property of the stored type, and can be read without downloading
+
+The int4 WMMA needs both operands on a *linear* grid, so what matters is each tensor's
+stored type. The GGUF header carries that list at the front of the file, so an HTTP Range
+request for the first 24 MB classifies a shard without downloading it;
+`tools/qwen27b/quant_eligibility.py` does this. Fourteen published quants:
+
+| quant | GB | int4-eligible | dominant types |
+| --- | ---: | ---: | --- |
+| ISTA GSQ-RCO IQ3_S | 11.77 | **13.0%** | IQ3_S 31.0%, IQ4_XS 20.8%, IQ3_XXS 19.8% |
+| UD-IQ3_S | 12.04 | 10.9% | IQ3_S 31.7%, IQ4_XS 17.9% |
+| UD-Q3_K_XL | 13.15 | 12.3% | IQ4_XS 34.3%, IQ3_S 30.1% |
+| UD-Q2_K_XL / UD-IQ3_XXS | 9.83 / 10.93 | 14.0% | IQ3_XXS, IQ2_S |
+| UD-IQ4_XS | 14.25 | 15.3% | IQ4_XS 49.7% |
+| UD-Q4_K_XL | 17.56 | 20.9% | Q5_K 42.2%, IQ4_XS 21.5% |
+| UD-Q4_K_S | 15.36 | 27.6% | IQ4_XS 43.4%, Q4_K 19.1% |
+| UD-Q4_K_M | 16.46 | 29.6% | IQ4_XS 32.8%, Q4_K 27.4% |
+| **Q4_0** | **16.06** | **89.5%** | Q4_0 86.9% |
+| **Q4_1** | **17.54** | **89.5%** | Q4_1 89.5% |
+| shipped IQ4_XS-3.84bpw | 13.08 | 15.5% | IQ3_S 30.3%, IQ4_XS 24.8%, IQ3_XXS 23.5% |
+
+**No Unsloth UD quant exceeds 29.6% and the GSQ-RCO release is 13.0%.** The two families
+that lead on quality per byte are both non-uniform codebooks -- that is *how* they get their
+quality -- and the names mislead in the same direction: UD-Q3_K_XL is 12.3% linear, not
+Q3_K. Only the legacy uniform schemes reach ~90%, and they cost +23% to +34% in bytes
+(4.705 / 5.140 bpw against 3.834). RCO was checked because a *rotation*-based method would
+be the one escape; it is not one -- Riemannian Constrained Optimization is a bit-allocation
+optimizer that chooses the per-layer precision mix under an exact budget and never touches
+the grids, so the ISTA release is GSQ's codebook quantiser plus that mix.
+
+### Why no codebook format can be mapped onto int4
+
+Two independent blockers, and they are the same fact seen twice.
+
+1. **The instruction has no indirection.** `wmma_i32_16x16x16_iu4` computes a dot product of
+   4-bit operands. A codebook stores an *index*, so one MMA on indices computes a dot
+   product of indices, not of values. Correctness needs index -> value to be linear.
+2. **The values need more than four bits.** From our own table, `kDeviceValuesIq4Nl` is
+   `-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113` -- sixteen
+   levels spanning 240. A 4-bit operand holds sixteen *uniformly spaced* values, about
+   -8..7 with a per-block scale.
+
+These are one fact because the codebook spends its four bits on an index precisely so the
+levels can be non-uniform *and* span eight bits of magnitude. **The indirection is the
+quality.** So the property that makes these formats good is the property that makes them
+ineligible -- a structural conflict, not a gap in the kernel.
+
+Two escapes were considered and both are dead:
+
+* **Sum of uniform grids.** Any non-uniform grid is a sum of K uniform grids, so K MMAs
+  could synthesise it -- but each stored value must first be split into its K uniform codes,
+  which is the decode that was being avoided, and the MMA cost scales by K. K=2 already
+  lands at 105/2 = 52 TF against fp16's 48-50. K=1 is the linear case.
+* **Use int8.** The codebook values *do* fit int8, so index -> int8 lookup plus `iu8` WMMA is
+  legitimate -- but `iu8` measures 50.31 TF against fp16's 48.35, about 4%. The 2x exists
+  only at four bits, which is exactly what the codebooks do not have.
+
+### What was actually gained, and what is left
+
+Everything in this section is fp16-side and closes with the shipped kernel unchanged. The
+durable results are the negative ones: the fp16 K-loop ceiling is measured (MMA-only 47.65-
+51.05 TF against ~41 TF shipped), every inner-loop lever is refuted with an ISA reason, the
+isolated probe was shown not to predict production and was retired as a screen, the quality
+instrument was made deterministic and scaled to 513 rows with a long prompt, and the int4
+direction is now closed by construction rather than by budget.
+
+**The one route left open, and it is the opposite of what both leading quant families do:**
+a *rotation*-based uniform-int4 quantisation (QuaRot / SpinQuant style). Rotating weights and
+activations reshapes the distribution so a uniform 4-bit grid approaches codebook quality
+while staying int4-eligible. It is untested here and no such Qwen3.8 shard is published,
+which is why the decision stands.
+
+**Falsifier: a published quality-first quant whose header is more than ~30% linear, or a
+rotation-based uniform-int4 shard.** Either would reopen the direction.
