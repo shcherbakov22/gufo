@@ -4125,3 +4125,60 @@ So the operand side of the NPU path is settled: exact, a minute to build once, a
 fast enough to overlap. The open items are the two that cannot be settled with tools -- the
 engine wiring, and an end-to-end quality measurement of the 1.0% RMS conversion.
 
+## The quality gate, run: the bfp16 operand encoding is an order of magnitude below noise
+
+The gate is whether the bfp16 encoding degrades the model. The per-GEMM number (1.04% RMS)
+cannot answer that: the FFN output feeds SwiGLU and the residual stream and repeats 65 times,
+so the question is whether 1.04% stays 1.04% or accumulates.
+
+**Instrument.** `qwen27b_target_test`, which already grows its context with a corpus fixture so
+the prompt crosses the fp16/int8 prefill switch and can `--dump` / `--compare` two runs of the
+same model under different environment. 1024-token prompt, 512 teacher-forced rows = **513 logit
+rows over the full 248,320-token vocabulary**, exactly deterministic (two runs give KL 0). Corpus
+is `README.md + QUALITY.md + TESTING.md`, 29,405 bytes.
+
+**Perturbation.** A new env-gated diagnostic, `GUFO_BFP16_FFN_BITS=N`, rounds the FFN input
+activation in place onto a shared-exponent grid with N magnitude bits -- the same 8-element
+grouping (consecutive k within one row) and the same grid the NPU operand encoder uses. It is
+applied at the FFN norm output **inside the per-layer loop**, so every layer's FFN sees it and the
+effect accumulates the way it would in production. Unset or N outside [1,9] is a no-op.
+
+| configuration | top-1 | mean KL | mean TV | NLL delta |
+| --- | ---: | ---: | ---: | ---: |
+| no-op (`GUFO_BFP16_FFN_BITS=10`) vs baseline | **513/513** | **0** | 0 | 0 |
+| **bfp16 A operand (7 bits)** | 512/513 | **1.91e-05** | 0.000867 | +9.8e-05 |
+| 6 bits | 513/513 | 5.91e-05 | 0.001187 | -0.000247 |
+| 5 bits | 510/513 | 9.38e-05 | 0.001983 | +0.000732 |
+
+The no-op row is the safety check: the diagnostic is bit-inert when the knob is not on, so the
+default path is provably unchanged rather than assumed to be.
+
+**Anchors, measured on the same corpus in the same session** (the doc's published int8/int4
+figures use a different corpus, so absolute values are not comparable across them):
+
+| configuration | top-1 | mean KL | mean TV | NLL delta |
+| --- | ---: | ---: | ---: | ---: |
+| baseline vs int8 activations (forced q8) | 510/513 | 2.007e-04 | 0.002197 | +0.000543 |
+| int8 vs **int4** activations | 496/513 | **1.017e-03** | 0.006680 | -0.000900 |
+| baseline vs int4 activations | 495/513 | 1.144e-03 | 0.007145 | -0.000356 |
+
+**Reading.** The bfp16 activation encoding costs **1.91e-05 mean KL: 10.5x below the int8
+activation step and 53x below the int4 grid**, on a corpus where the int4 grid itself is already
+the smaller of the two numbers in the published table. On the likelihood metric the deltas are
++/-1e-4 nats with mixed sign, i.e. nothing. The KL grows sublinearly with the grid: the step
+doubles per bit and KL rises 3.1x and then 1.6x, so the response is not near a cliff at 7 bits.
+
+**The one inference, stated as one.** This measures the **activation** half -- 0.76% of the
+combined 1.04% per-GEMM error. The weight half (0.71%) is not directly measured; it is a slightly
+*smaller* and independent perturbation, and taking the sweep's own slope, a second perturbation
+of that size roughly adds, giving a combined estimate of ~4e-05 -- still 5x below the int8 anchor
+and ~25x below the int4 grid. Measuring the weight half directly means the same round trip at the
+five weight-decode sites in the fp16 prefill kernel instead of the one activation site; on this
+evidence that is not worth the hot-path risk, which is why it is an inference and not a
+measurement.
+
+**Gate: passed, with margin.** The bfp16 FFN path is below the threshold this project has already
+accepted elsewhere, so the engine wiring is not gated on quality. The diagnostic is left in place
+behind its env var as the instrument for any future datatype change (an int8 path would want the
+same measurement, and on the int8 anchor it would land 10x higher).
+

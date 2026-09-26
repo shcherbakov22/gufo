@@ -17,6 +17,12 @@ void LaunchBatchedRMSNormFp16(const float* input, const float* residual,
                               const float* weight, float* sum_out, void* output,
                               std::size_t batch, std::size_t dim, float eps,
                               hipStream_t stream);
+// Diagnostic only: rounds an FP16 activation buffer in place onto a bfp16
+// shared-exponent grid with "bits" magnitude bits, emulating the NPU operand
+// encoder. A "bits" outside [1, 9] is a no-op, so the default path is
+// untouched.
+void LaunchBfp16RoundTripFp16InPlace(void* buffer, std::size_t count, int bits,
+                                     hipStream_t stream);
 // Packed GGUF weights are scaled in FP32, rounded to FP16 inside the kernel,
 // then multiplied by FP16 activations with FP32 accumulation in K16 order.
 // Supports the Qwen27B Q4 shard's native quant formats and K divisible by 256.

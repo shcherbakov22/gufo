@@ -49,8 +49,8 @@ struct RawIqWeights {
 };
 
 template<gufo::core::GgmlType Type>
-__device__ __forceinline__ RawIqWeights LoadIqRaw(
-    const void* row, unsigned sub, const uint2* header = nullptr) {
+__device__ __forceinline__ RawIqWeights
+LoadIqRaw(const void* row, unsigned sub, const uint2* header = nullptr) {
   static_assert(Type == gufo::core::GgmlType::kIQ4_XS ||
                 Type == gufo::core::GgmlType::kIQ4_NL);
   RawIqWeights weights;
@@ -63,9 +63,8 @@ __device__ __forceinline__ RawIqWeights LoadIqRaw(
         header ? header->y >> (8 * (sb / 2)) : block.scales_l[sb / 2];
     const unsigned high = header ? header->x >> 16 : block.scales_h;
     const __half d = header ? __ushort_as_half(header->x & 65535) : block.d;
-    const int code = static_cast<int>(
-                         ((low >> (4 * (sb & 1))) & 15) |
-                         (((high >> (2 * sb)) & 3) << 4)) -
+    const int code = static_cast<int>(((low >> (4 * (sb & 1))) & 15) |
+                                      (((high >> (2 * sb)) & 3) << 4)) -
                      32;
     weights.scale = __half2float(d) * static_cast<float>(code);
   } else {
@@ -79,7 +78,8 @@ __device__ __forceinline__ RawIqWeights LoadIqRaw(
 // All 16 IQ4 codebook entries are integers represented exactly in FP16.
 // Look up their half bits directly, avoiding signed-byte extraction and
 // conversion for each weight. Scaling still uses the original FP32 product.
-__device__ __forceinline__ HalfWeights DecodeIqRaw(const RawIqWeights& weights) {
+__device__ __forceinline__ HalfWeights
+DecodeIqRaw(const RawIqWeights& weights) {
   union {
     v16bf f;
     uint4 u[2];
@@ -91,24 +91,20 @@ __device__ __forceinline__ HalfWeights DecodeIqRaw(const RawIqWeights& weights) 
     const unsigned select = ((n & 0x08080808U) >> 3) * 255;
     // Low and high bytes of FP16 {-127, -104, -83, -65, -49, -35,
     // -22, -10, 1, 13, 25, 38, 53, 69, 89, 113}, four entries per word.
-    const unsigned lo0 =
-        __builtin_amdgcn_perm(0x00806020U, 0x103080f0U, index);
-    const unsigned lo1 =
-        __builtin_amdgcn_perm(0x109050a0U, 0xc0408000U, index);
-    const unsigned hi0 =
-        __builtin_amdgcn_perm(0xc9cdd0d2U, 0xd4d5d6d7U, index);
-    const unsigned hi1 =
-        __builtin_amdgcn_perm(0x57555452U, 0x504e4a3cU, index);
+    const unsigned lo0 = __builtin_amdgcn_perm(0x00806020U, 0x103080f0U, index);
+    const unsigned lo1 = __builtin_amdgcn_perm(0x109050a0U, 0xc0408000U, index);
+    const unsigned hi0 = __builtin_amdgcn_perm(0xc9cdd0d2U, 0xd4d5d6d7U, index);
+    const unsigned hi1 = __builtin_amdgcn_perm(0x57555452U, 0x504e4a3cU, index);
     const unsigned lo = (lo0 & ~select) | (lo1 & select);
     const unsigned hi = (hi0 & ~select) | (hi1 & select);
     const unsigned c0 = __builtin_amdgcn_perm(hi, lo, 0x05010400U);
     const unsigned c1 = __builtin_amdgcn_perm(hi, lo, 0x07030602U);
-    result.f[4 * i] = static_cast<_Float16>(__fmul_rn(
-        weights.scale, __half2float(__ushort_as_half(c0 & 65535))));
+    result.f[4 * i] = static_cast<_Float16>(
+        __fmul_rn(weights.scale, __half2float(__ushort_as_half(c0 & 65535))));
     result.f[4 * i + 1] = static_cast<_Float16>(
         __fmul_rn(weights.scale, __half2float(__ushort_as_half(c0 >> 16))));
-    result.f[4 * i + 2] = static_cast<_Float16>(__fmul_rn(
-        weights.scale, __half2float(__ushort_as_half(c1 & 65535))));
+    result.f[4 * i + 2] = static_cast<_Float16>(
+        __fmul_rn(weights.scale, __half2float(__ushort_as_half(c1 & 65535))));
     result.f[4 * i + 3] = static_cast<_Float16>(
         __fmul_rn(weights.scale, __half2float(__ushort_as_half(c1 >> 16))));
   }
@@ -136,9 +132,8 @@ struct RawWeights {
   int signed_scale;
 };
 template<gufo::core::GgmlType Type>
-__device__ __forceinline__ RawWeights<Type> LoadRaw(const void* row,
-                                                    unsigned sub,
-                                                    const uint4* header = nullptr) {
+__device__ __forceinline__ RawWeights<Type> LoadRaw(
+    const void* row, unsigned sub, const uint4* header = nullptr) {
   using namespace gufo::hip;
   using gufo::core::GgmlType;
   RawWeights<Type> r{};
@@ -234,8 +229,8 @@ enum class HalfEpilogue { kStore, kSwiGLU, kGateUp, kResidual };
 // Fully scaled FP16 weights and activations; FP32 accumulation in K16 order.
 template<int BM, int BN, int WM, int WN, gufo::core::GgmlType Type,
          HalfEpilogue Epilogue, bool Complete = false,
-         gufo::core::GgmlType UpType = Type, int BKDepth = 4,
-         int Ablate = 0, int GShift = -1>
+         gufo::core::GgmlType UpType = Type, int BKDepth = 4, int Ablate = 0,
+         int GShift = -1>
 __launch_bounds__(WM * WN * 32) __global__
     void HalfPrefillGemmKernel(const void* __restrict__ w,
                                const short* __restrict__ x,
@@ -250,11 +245,10 @@ __launch_bounds__(WM * WN * 32) __global__
   static_assert(BK >= 1 && BK <= 4, "BKDepth out of range");
   // A 256-weight Q5 block spans four K64 iterations. Keep its header in
   // registers for the Q5 and Q4/Q5 kernels that benefit from this reuse.
-  constexpr bool CacheQ5Header =
-      BM == 256 && BN == 256 &&
-      (Type == gufo::core::GgmlType::kQ5_K ||
-       (Type == gufo::core::GgmlType::kQ4_K &&
-        UpType == gufo::core::GgmlType::kQ5_K));
+  constexpr bool CacheQ5Header = BM == 256 && BN == 256 &&
+                                 (Type == gufo::core::GgmlType::kQ5_K ||
+                                  (Type == gufo::core::GgmlType::kQ4_K &&
+                                   UpType == gufo::core::GgmlType::kQ5_K));
   // These IQ4_XS projections benefit from keeping packed weights until
   // LDS commit and reusing the block header. Q3/IQ4_NL mixed pairs retain
   // immediate decoding.
@@ -267,12 +261,13 @@ __launch_bounds__(WM * WN * 32) __global__
         UpType == gufo::core::GgmlType::kIQ4_XS));
   // The mixed Q6 gate is qualified with the fetch-stage decoder; deferring
   // its decode changes dot-product rounding in this kernel specialization.
-  constexpr int DecodeStage = (Type == gufo::core::GgmlType::kQ4_K ||
-                               Type == gufo::core::GgmlType::kQ5_K ||
-                               (Type == gufo::core::GgmlType::kQ6_K && !Mixed) ||
-                               Type == gufo::core::GgmlType::kQ8_0)
-                                  ? 2
-                                  : 0;
+  constexpr int DecodeStage =
+      (Type == gufo::core::GgmlType::kQ4_K ||
+       Type == gufo::core::GgmlType::kQ5_K ||
+       (Type == gufo::core::GgmlType::kQ6_K && !Mixed) ||
+       Type == gufo::core::GgmlType::kQ8_0)
+          ? 2
+          : 0;
   constexpr int kThreads = WM * WN * WaveSize;
   constexpr int RS = BM / 16;
   constexpr int TS = BN / 16;
@@ -308,7 +303,8 @@ __launch_bounds__(WM * WN * 32) __global__
       else if constexpr (Type == gufo::core::GgmlType::kQ5_K)
         group_shift = k <= 8192 ? 5 : 3;
     }
-    if constexpr (GShift >= 0) group_shift = GShift;
+    if constexpr (GShift >= 0)
+      group_shift = GShift;
     const unsigned group = 1U << group_shift;
     unsigned first = (blockIdx.y >> group_shift) << group_shift,
              within = (blockIdx.y & (group - 1)) * gridDim.x + blockIdx.x,
@@ -358,16 +354,14 @@ __launch_bounds__(WM * WN * 32) __global__
     if ((kk & 12) == 0)
       __builtin_memcpy(
           &iq_headers[p],
-          reinterpret_cast<const IQ4XSBlock*>(w_row[p]) + unsigned(kk) / 16,
-          8);
-    raw_iq[p] = LoadIqRaw<gufo::core::GgmlType::kIQ4_XS>(
-        w_row[p], unsigned(kk), &iq_headers[p]);
+          reinterpret_cast<const IQ4XSBlock*>(w_row[p]) + unsigned(kk) / 16, 8);
+    raw_iq[p] = LoadIqRaw<gufo::core::GgmlType::kIQ4_XS>(w_row[p], unsigned(kk),
+                                                         &iq_headers[p]);
   };
   const auto fetch_up = [&](int p, int kk) {
     if constexpr (Mixed) {
       if constexpr (UpRaw) {
-        if constexpr (CacheQ5Header &&
-                      UpType == gufo::core::GgmlType::kQ5_K) {
+        if constexpr (CacheQ5Header && UpType == gufo::core::GgmlType::kQ5_K) {
           if ((kk & 12) == 0)
             __builtin_memcpy(
                 &headers[p],
@@ -388,7 +382,10 @@ __launch_bounds__(WM * WN * 32) __global__
       } else {
         gufo::hip::QuantSub16 q;
         gufo::hip::DecodeQuantSub16<true>(UpType, w_row[p], kk, q);
-        union { v16bf f; uint4 u[2]; } packed;
+        union {
+          v16bf f;
+          uint4 u[2];
+        } packed;
 #pragma unroll
         for (int j = 0; j < 16; ++j)
           packed.f[j] = static_cast<_Float16>(__fsub_rn(
@@ -419,12 +416,11 @@ __launch_bounds__(WM * WN * 32) __global__
                            Type == gufo::core::GgmlType::kIQ4_XS) {
           fetch_iq(p, kk);
         } else if constexpr (Type == gufo::core::GgmlType::kIQ4_XS ||
-                           Type == gufo::core::GgmlType::kIQ4_NL) {
+                             Type == gufo::core::GgmlType::kIQ4_NL) {
           const auto packed = LoadIqHalf<Type>(w_row[p], unsigned(kk));
           ra[p][0] = packed.low;
           ra[p][1] = packed.high;
-        }
-        else {
+        } else {
           gufo::hip::QuantSub16 q;
           gufo::hip::DecodeQuantSub16<true>(Type, w_row[p], kk, q);
           union {
@@ -459,7 +455,10 @@ __launch_bounds__(WM * WN * 32) __global__
       // compiler fold the dependent decode and delete s_b, which measures
       // something other than the fetch.
       if ((Ablate & 32) == 0 && idx < BN * BK && (Complete || kk < ksteps)) {
-        const short* src = (Ablate & 128) != 0 ? x_row[p] + static_cast<std::size_t>(kk & 3) * 16 : x_row[p] + static_cast<std::size_t>(kk) * 16;
+        const short* src =
+            (Ablate & 128) != 0
+                ? x_row[p] + static_cast<std::size_t>(kk & 3) * 16
+                : x_row[p] + static_cast<std::size_t>(kk) * 16;
         rb[p][0] = *reinterpret_cast<const uint4*>(src);
         rb[p][1] = *reinterpret_cast<const uint4*>(src + 8);
       } else {
@@ -472,7 +471,10 @@ __launch_bounds__(WM * WN * 32) __global__
     if constexpr (Mixed) {
       if constexpr (UpRaw) {
         gufo::hip::QuantSub16 q = DecodeRaw<UpType>(raw_up[p]);
-        union { v16bf f; uint4 u[2]; } packed;
+        union {
+          v16bf f;
+          uint4 u[2];
+        } packed;
 #pragma unroll
         for (int j = 0; j < 16; ++j)
           packed.f[j] = static_cast<_Float16>(__fsub_rn(
@@ -530,9 +532,9 @@ __launch_bounds__(WM * WN * 32) __global__
   // rather than running in the post-barrier bubble with the matrix pipe idle.
   const auto decode_ra = [&]() {
     if constexpr ((Ablate & (512 | 1024)) != 0) {
-      static_assert(DecodeStage == 2 && !Mixed && !CacheIqHeader &&
-                    !CacheQ5Header,
-                    "ablation 512 covers only the plain deferred-decode path");
+      static_assert(
+          DecodeStage == 2 && !Mixed && !CacheIqHeader && !CacheQ5Header,
+          "ablation 512 covers only the plain deferred-decode path");
 #pragma unroll
       for (int p = 0; p < PFA; ++p) {
         const int idx = p * kThreads + tid;
@@ -565,10 +567,12 @@ __launch_bounds__(WM * WN * 32) __global__
   decode_ra();
   for (int ks0 = 0; ks0 < ksteps; ks0 += BK) {
     PC_START();
-    if constexpr ((Ablate & 2) == 0) commit();
+    if constexpr ((Ablate & 2) == 0)
+      commit();
     PC_END(pc_commit);
     PC_START();
-    if constexpr ((Ablate & 1) == 0) __syncthreads();
+    if constexpr ((Ablate & 1) == 0)
+      __syncthreads();
     PC_END(pc_barrier);
     PC_START();
     if constexpr ((Ablate & 4) == 0 && (Ablate & 256) == 0) {
@@ -584,10 +588,10 @@ __launch_bounds__(WM * WN * 32) __global__
       for (int i = 0; i < WRS; ++i) {
         a[i] = LoadSwizzled(&s_a[ks][(wr * WRS) + i][sl ^ (ks & 3)][0]);
       }
-      // Ablation 4096: batch every B fragment load ahead of the MMA block. In the
-      // shipped order each B fragment is loaded and consumed back to back, so its
-      // load-to-use distance is zero; batching gives all of them the MMA block to
-      // land behind.
+      // Ablation 4096: batch every B fragment load ahead of the MMA block. In
+      // the shipped order each B fragment is loaded and consumed back to back,
+      // so its load-to-use distance is zero; batching gives all of them the MMA
+      // block to land behind.
       if constexpr ((Ablate & 4096) != 0) {
         v16bf bb[WTS];
 #pragma unroll
@@ -618,32 +622,35 @@ __launch_bounds__(WM * WN * 32) __global__
         }
       }
       if constexpr ((Ablate & 4) == 0 && (Ablate & 256) != 0) {
-        if (ks == BK / 2 - 1 && ks0 + BK < ksteps) fetch(ks0 + BK);
+        if (ks == BK / 2 - 1 && ks0 + BK < ksteps)
+          fetch(ks0 + BK);
       }
       if constexpr ((Ablate & 512) != 0) {
-        if (ks == BK / 2 - 1 && ks0 + BK < ksteps) decode_ra();
+        if (ks == BK / 2 - 1 && ks0 + BK < ksteps)
+          decode_ra();
       }
       // Ablation 1024: stagger the decode to a warp-dependent sub-stage.
       // Each warp has its own PC on RDNA3, so the warps no longer all enter
       // the decode together after the same barrier and the matrix pipe keeps
       // being fed by the warps still issuing MMAs.
       if constexpr ((Ablate & 1024) != 0) {
-        if (ks == (wave & (BK - 1)) && ks0 + BK < ksteps) decode_ra();
+        if (ks == (wave & (BK - 1)) && ks0 + BK < ksteps)
+          decode_ra();
       }
     }
     if constexpr ((Ablate & (16 | 2048 | 8192)) != 0 ||
                   (BM == 256 && BN == 256 &&
                    ((Type == gufo::core::GgmlType::kIQ4_XS &&
-                    (!Mixed || UpType != gufo::core::GgmlType::kQ5_K)) ||
-                   (Type == gufo::core::GgmlType::kIQ4_NL &&
-                    UpType == gufo::core::GgmlType::kIQ4_XS) ||
-                   Type == gufo::core::GgmlType::kQ3_K ||
-                   Type == gufo::core::GgmlType::kQ2_K ||
-                   Type == gufo::core::GgmlType::kIQ3_S ||
-                   Type == gufo::core::GgmlType::kIQ3_XXS ||
-                   Type == gufo::core::GgmlType::kIQ2_XS ||
-                   Type == gufo::core::GgmlType::kIQ2_S ||
-                   Type == gufo::core::GgmlType::kIQ2_XXS))) {
+                     (!Mixed || UpType != gufo::core::GgmlType::kQ5_K)) ||
+                    (Type == gufo::core::GgmlType::kIQ4_NL &&
+                     UpType == gufo::core::GgmlType::kIQ4_XS) ||
+                    Type == gufo::core::GgmlType::kQ3_K ||
+                    Type == gufo::core::GgmlType::kQ2_K ||
+                    Type == gufo::core::GgmlType::kIQ3_S ||
+                    Type == gufo::core::GgmlType::kIQ3_XXS ||
+                    Type == gufo::core::GgmlType::kIQ2_XS ||
+                    Type == gufo::core::GgmlType::kIQ2_S ||
+                    Type == gufo::core::GgmlType::kIQ2_XXS))) {
       // Interleave LDS reads with WMMA after the grid decoders. Mixed Q5
       // decoders retain the compiler's default instruction schedule.
       // Ablations 2048/8192 select the other iglp_opt immediates; 16 keeps
@@ -657,7 +664,8 @@ __launch_bounds__(WM * WN * 32) __global__
     }
     PC_END(pc_loop);
     PC_START();
-    if constexpr ((Ablate & 1) == 0) __syncthreads();
+    if constexpr ((Ablate & 1) == 0)
+      __syncthreads();
     PC_END(pc_barrier);
   }
 #if defined(GUFO_FP16_PROTO_CLOCK)
@@ -677,7 +685,8 @@ __launch_bounds__(WM * WN * 32) __global__
   const auto store = [&](std::size_t index, float value) {
     if constexpr ((Ablate & 8) != 0) {
       // Epilogue ablation: keep the accumulators live, never store.
-      if (value == 1.0e38F) y[index] = value;
+      if (value == 1.0e38F)
+        y[index] = value;
     } else if constexpr (Epilogue == HalfEpilogue::kSwiGLU) {
       const float g = gate[index];
       const float sig = 1.0F / (1.0F + expf(-g));
@@ -810,8 +819,8 @@ __global__ void HalfNorm(const float* x, const float* residual,
   }
 }
 __global__ void HalfNorm5120(const float* __restrict__ x,
-                              const float* __restrict__ weight,
-                              __half* __restrict__ out, float eps) {
+                             const float* __restrict__ weight,
+                             __half* __restrict__ out, float eps) {
   constexpr unsigned Dim = 5120, Elements = Dim / 256;
   const unsigned row = blockIdx.x, tid = threadIdx.x;
   const std::size_t base = std::size_t(row) * Dim;
@@ -844,14 +853,50 @@ __global__ void HalfCast(const float* x, __half* y, std::size_t n) {
   if (i < n)
     y[i] = __float2half_rn(x[i]);
 }
+
+// Diagnostic: round every 8 consecutive FP16 activations onto a shared-exponent
+// grid with "bits" magnitude bits, in place. This is what the NPU path's bfp16
+// operand encoder does to its A operand, minus the byte packing, so the
+// model-level cost of that encoding can be measured with the held-out
+// instrument instead of argued from a per-GEMM number. The 8-element group is
+// the real one -- consecutive k within one row -- and row lengths are multiples
+// of 8, so no group straddles rows.
+__global__ void Bfp16RoundTripFp16Kernel(__half* data, std::size_t count,
+                                         int bits) {
+  const std::size_t group =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t base = group * 8;
+  if (base + 8 > count) {
+    return;
+  }
+  float value[8];
+  float amax = 0.0F;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    value[i] = __half2float(data[base + i]);
+    amax = fmaxf(amax, fabsf(value[i]));
+  }
+  if (amax == 0.0F) {
+    return;
+  }
+  // amax lands in [0.5, 1) * 2^exponent, so this step reproduces the encoder's
+  // 2^(max_biased_exponent - 127 - (mbits - 1)) grid.
+  int exponent = 0;
+  (void)frexpf(amax, &exponent);
+  const float step = ldexpf(1.0F, exponent - bits);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    data[base + i] = __float2half(rintf(value[i] / step) * step);
+  }
+}
 }  // namespace
 void LaunchBatchedRMSNormFp16(const float* x, const float* residual,
                               const float* weight, float* sum_out, void* out,
                               std::size_t batch, std::size_t dim, float eps,
                               hipStream_t stream) {
   if (dim == 5120 && residual == nullptr && sum_out == nullptr) {
-    HalfNorm5120<<<batch, 256, 0, stream>>>(
-        x, weight, static_cast<__half*>(out), eps);
+    HalfNorm5120<<<batch, 256, 0, stream>>>(x, weight,
+                                            static_cast<__half*>(out), eps);
     return;
   }
   HalfNorm<<<batch, 256, 0, stream>>>(x, residual, weight, sum_out,
@@ -860,6 +905,17 @@ void LaunchBatchedRMSNormFp16(const float* x, const float* residual,
 void LaunchFloatToFp16(const float* x, void* y, std::size_t n,
                        hipStream_t stream) {
   HalfCast<<<(n + 255) / 256, 256, 0, stream>>>(x, static_cast<__half*>(y), n);
+}
+
+void LaunchBfp16RoundTripFp16InPlace(void* buffer, std::size_t count, int bits,
+                                     hipStream_t stream) {
+  if (buffer == nullptr || count < 8 || bits < 1 || bits >= 10) {
+    return;
+  }
+  const std::size_t groups = count / 8;
+  Bfp16RoundTripFp16Kernel<<<static_cast<unsigned int>((groups + 255) / 256),
+                             256, 0, stream>>>(static_cast<__half*>(buffer),
+                                               groups * 8, bits);
 }
 template<HalfEpilogue Epilogue>
 void DirectGemm(gufo::core::GgmlType type, const void* w, const void* x,
@@ -971,58 +1027,49 @@ bool TryLaunchBatchedDualQuantGEMMSwiGLUFp16(
     gufo::core::GgmlType gate_type, gufo::core::GgmlType up_type,
     const void* gate_weights, const void* up_weights, const void* x, void* y,
     std::size_t batch, std::size_t m, std::size_t k, hipStream_t stream) {
-  const auto launch = [&]<gufo::core::GgmlType Type,
-                          gufo::core::GgmlType UpType = Type>() {
-    const auto tile = [&]<bool Full>() {
-      HalfPrefillGemmKernel<256, 256, 8, 4, Type, HalfEpilogue::kGateUp, Full,
-                            UpType>
-          <<<dim3((batch + 255) / 256, (m + 127) / 128), 1024, 0, stream>>>(
-              gate_weights, static_cast<const short*>(x),
-              static_cast<float*>(y), batch, m, k, nullptr, up_weights);
-    };
-    if constexpr ((Type == gufo::core::GgmlType::kQ4_K ||
-                   Type == gufo::core::GgmlType::kQ5_K) &&
-                  (UpType == gufo::core::GgmlType::kQ4_K ||
-                   UpType == gufo::core::GgmlType::kQ5_K)) {
-      if (m % 128 == 0 && batch % 256 == 0) {
-        tile.template operator()<true>();
-        return;
-      }
-    }
-    tile.template operator()<false>();
-  };
+  const auto launch =
+      [&]<gufo::core::GgmlType Type, gufo::core::GgmlType UpType = Type>() {
+        const auto tile = [&]<bool Full>() {
+          HalfPrefillGemmKernel<256, 256, 8, 4, Type, HalfEpilogue::kGateUp,
+                                Full, UpType>
+              <<<dim3((batch + 255) / 256, (m + 127) / 128), 1024, 0, stream>>>(
+                  gate_weights, static_cast<const short*>(x),
+                  static_cast<float*>(y), batch, m, k, nullptr, up_weights);
+        };
+        if constexpr ((Type == gufo::core::GgmlType::kQ4_K ||
+                       Type == gufo::core::GgmlType::kQ5_K) &&
+                      (UpType == gufo::core::GgmlType::kQ4_K ||
+                       UpType == gufo::core::GgmlType::kQ5_K)) {
+          if (m % 128 == 0 && batch % 256 == 0) {
+            tile.template operator()<true>();
+            return;
+          }
+        }
+        tile.template operator()<false>();
+      };
   using gufo::core::GgmlType;
   // Mixed pairs keep independent row strides and decoders. Qualify each
   // pairing: a shared input alone does not guarantee a faster kernel.
   if (gate_type != up_type) {
     if (gate_type == GgmlType::kQ4_K && up_type == GgmlType::kQ5_K) {
       launch.template operator()<GgmlType::kQ4_K, GgmlType::kQ5_K>();
-    } else if (gate_type == GgmlType::kIQ4_XS &&
-               up_type == GgmlType::kQ5_K) {
+    } else if (gate_type == GgmlType::kIQ4_XS && up_type == GgmlType::kQ5_K) {
       launch.template operator()<GgmlType::kIQ4_XS, GgmlType::kQ5_K>();
-    } else if (gate_type == GgmlType::kQ4_K &&
-               up_type == GgmlType::kIQ4_XS) {
+    } else if (gate_type == GgmlType::kQ4_K && up_type == GgmlType::kIQ4_XS) {
       launch.template operator()<GgmlType::kQ4_K, GgmlType::kIQ4_XS>();
-    } else if (gate_type == GgmlType::kIQ4_XS &&
-               up_type == GgmlType::kQ4_K) {
+    } else if (gate_type == GgmlType::kIQ4_XS && up_type == GgmlType::kQ4_K) {
       launch.template operator()<GgmlType::kIQ4_XS, GgmlType::kQ4_K>();
-    } else if (gate_type == GgmlType::kQ6_K &&
-               up_type == GgmlType::kQ5_K) {
+    } else if (gate_type == GgmlType::kQ6_K && up_type == GgmlType::kQ5_K) {
       launch.template operator()<GgmlType::kQ6_K, GgmlType::kQ5_K>();
-    } else if (gate_type == GgmlType::kIQ4_XS &&
-               up_type == GgmlType::kQ3_K) {
+    } else if (gate_type == GgmlType::kIQ4_XS && up_type == GgmlType::kQ3_K) {
       launch.template operator()<GgmlType::kIQ4_XS, GgmlType::kQ3_K>();
-    } else if (gate_type == GgmlType::kQ3_K &&
-               up_type == GgmlType::kIQ4_XS) {
+    } else if (gate_type == GgmlType::kQ3_K && up_type == GgmlType::kIQ4_XS) {
       launch.template operator()<GgmlType::kQ3_K, GgmlType::kIQ4_XS>();
-    } else if (gate_type == GgmlType::kIQ4_NL &&
-               up_type == GgmlType::kIQ4_XS) {
+    } else if (gate_type == GgmlType::kIQ4_NL && up_type == GgmlType::kIQ4_XS) {
       launch.template operator()<GgmlType::kIQ4_NL, GgmlType::kIQ4_XS>();
-    } else if (gate_type == GgmlType::kIQ4_NL &&
-               up_type == GgmlType::kQ5_K) {
+    } else if (gate_type == GgmlType::kIQ4_NL && up_type == GgmlType::kQ5_K) {
       launch.template operator()<GgmlType::kIQ4_NL, GgmlType::kQ5_K>();
-    } else if (gate_type == GgmlType::kQ5_K &&
-               up_type == GgmlType::kIQ4_NL) {
+    } else if (gate_type == GgmlType::kQ5_K && up_type == GgmlType::kIQ4_NL) {
       launch.template operator()<GgmlType::kQ5_K, GgmlType::kIQ4_NL>();
     } else {
       return false;

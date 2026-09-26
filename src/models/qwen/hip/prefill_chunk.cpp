@@ -615,6 +615,14 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       DumpActivationOnce(arena_.d_scratch_bf16,
                          batch_size * hidden_size * sizeof(std::uint16_t),
                          batch_size, hidden_size);
+      // Diagnostic: perturb the FFN input activation onto the NPU path's bfp16
+      // operand grid, in place, so the GEMMs below consume it. Unset leaves the
+      // activation untouched and the run bit-identical to before.
+      if (const char* bits = std::getenv("GUFO_BFP16_FFN_BITS")) {
+        LaunchBfp16RoundTripFp16InPlace(arena_.d_scratch_bf16,
+                                        batch_size * hidden_size,
+                                        std::atoi(bits), arena_.stream);
+      }
     } else if (ffn_feeds_q8_only) {
       // The post-attention residual add folds into the norm: one pass reads the
       // hidden state and the attention output, writes the updated hidden state
