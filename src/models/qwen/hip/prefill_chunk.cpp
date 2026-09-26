@@ -233,6 +233,11 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                 Int4MixedActivation(act, batch_size, k, arena_.stream);
             if (mixed != nullptr) {
               act = mixed;
+              if (std::getenv("GUFO_INT4_REPORT") != nullptr) {
+                std::fprintf(stderr,
+                             "int4-mixed applies: type=%s m=%zu k=%zu\n",
+                             std::string(core::ToString(w.type)).c_str(), m, k);
+              }
             }
           }
           if (act != nullptr) {

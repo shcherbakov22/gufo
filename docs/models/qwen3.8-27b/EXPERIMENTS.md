@@ -404,6 +404,69 @@ perplexity or KL moves by less than the run-to-run spread of two fp16 seeds, the
 int4 path is worth implementing; if it moves materially, the 2.2x is not
 available at four activation bits and the direction closes.
 
+### Is the int8 baseline global, and where the int4 opportunity actually is
+
+Both worth checking, because the mixed comparison only means something if the
+baseline is global and the grid really reaches the eligible projections.
+
+**The int8 baseline is global.** On the forced q8 path `reads_q8_act` is true for
+every predicate-role tensor in this shard -- the token-type enumeration found
+zero non-native roles -- so every GEMM reads the q8_1 activation. The mixed test
+then changes only the eligible GEMMs, so the two rows are like-for-like.
+
+**Coverage is real, and it includes the big projections.** An instrumented run
+(`GUFO_INT4_REPORT`) confirms the grid reaches every eligible role:
+
+| type | m | k | calls | role |
+| --- | ---: | ---: | ---: | --- |
+| Q4_K | 10240 | 5120 | 92 | attn_qkv |
+| Q4_K | 48 | 5120 | 84 | ssm_alpha |
+| Q4_K | 5120 | 6144 | 52 | ssm_out |
+| Q4_K | 6144 | 5120 | 44 | attn_gate |
+| Q4_K | 12288 | 5120 | 32 | attn_q |
+| Q3_K | 17408 | 5120 | 32 | ffn_gate |
+| Q4_K | 1024 | 5120 | 28 | attn_k |
+| Q4_K | 5120 | 17408 | 16 | ffn_down |
+| Q3_K | 48 | 5120 | 12 | ssm_beta |
+| Q4_K | 17408 | 5120 | 4 | ffn_up |
+| Q2_K | 48 | 5120 | 4 | ssm_beta (the one Q2_K) |
+
+**But the payoff is capped well below 2x, by the quantization mix rather than the
+kernel.** Weight elements are proportional to GEMM FLOPs, so the eligible share
+is the FLOP share:
+
+| role | all (M el) | int4-eligible (M el) | share |
+| --- | ---: | ---: | ---: |
+| ffn_down | 5793.4 | 356.5 | 6.2% |
+| ffn_gate | 5793.4 | 713.0 | 12.3% |
+| ffn_up | 5793.4 | 89.1 | 1.5% |
+| attn_qkv | 2516.6 | 1258.3 | 50.0% |
+| attn_gate | 1509.9 | 408.9 | 27.1% |
+| ssm_out | 1509.9 | 377.5 | 25.0% |
+| attn_q | 1069.5 | 566.2 | 52.9% |
+| attn_output | 534.8 | 31.5 | 5.9% |
+| attn_k | 89.1 | 36.7 | 41.2% |
+| ssm_alpha | 11.8 | 2.5 | 20.8% |
+| ssm_beta | 11.8 | 3.7 | 31.2% |
+| attn_v | 89.1 | 0.0 | 0.0% |
+| **total** | **24722.8** | **3843.9** | **15.5%** |
+
+Read that two ways:
+
+* the eligible share is **15.5% of prefill FLOPs**, so at a 2.2x rate on that
+  fraction the whole-model ceiling is `1 / (0.845 + 0.155/2.2) = 1.09` -- about
+  **9% faster prefill**, not 2x;
+* the reason is that the FFN is 70% of prefill and only **6.7%** of it is
+  eligible, while attention/SSM is 30% of prefill and **36.6%** of it is. The
+  shard's FFN is IQ3_S/IQ4_XS/Q5_K, which is excluded at any width or by width.
+
+So the int4 kernel buys ~9% on this shard for a 2.0e-2 activation regression on
+15.5% of the FLOPs. The larger lever is the quantisation mix: a shard whose FFN
+were Q4_K rather than IQ would put ~70% of prefill on the eligible side and make
+the 2.2x worth implementing. That is a model decision with its own quality
+question, and it is where the value is -- which is what the eligibility analysis
+at the top of this section already said, now with the FLOP share attached.
+
 
 ## Deferred: Q2_K native prefill (chunked-path eligibility)
 
