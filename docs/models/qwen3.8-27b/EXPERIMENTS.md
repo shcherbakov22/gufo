@@ -3911,8 +3911,26 @@ error is not independent of the per-element shared-exponent shift. It costs noth
 throughput or memory, so **round-to-nearest should be the default in the repack**; the ~2x
 figure that would have followed from the earlier 8-bit gate is not reachable.
 
-This also sets the bar for the next question. The remaining uncertainty is not the encoder but
-the *activations*: the numbers above use a standard normal A, and the true FFN input has
-outliers, which a shared exponent handles worse. Re-running with real activations is the next
-measurement, not another synthetic pattern.
+**Real activations change nothing, and that is the useful result.** `GUFO_DUMP_ACTIVATION`
+writes the post-FFN-norm FFN input (fp16, batch x hidden) from a real prefill, so A can be a
+real activation rather than a synthetic draw. The hypothesis was that the true FFN input has
+outliers a per-8 shared exponent handles worse than a Gaussian. It does not: the dumped
+activation has max|a| = 50.3 against the Gaussian's 5.5, but its per-8 `amax/rms` is 1.89
+(Gaussian 1.84; p90 2.33 vs 2.22). The outliers are rare and do not co-occur in blocks, so the
+shared-exponent cost is set by each block's own dynamic range, not by the tail.
+
+| A operand | encoding | weights only | activations only | both |
+|---|---|---|---|---|
+| standard normal | truncate | 1.23% | 1.27% | 1.88% |
+| real FFN input (layer 0, 2048 x 5120) | truncate | 1.16% | 1.19% | **1.81%** |
+| real FFN input | round-to-nearest | 0.71% | 0.76% | **1.04%** |
+
+Real weights throughout (`blk.0.ffn_gate.weight`, IQ3_XXS, via
+`tools/qwen27b/atb_real_weights.cpp`), 2000 sampled cells, on the device. The device stays
+exact on the real activation with round-to-nearest on (PASS against the quantisation-aware
+reference).
+
+So the headline is **1.8% RMS with the shipped encoder and 1.0% with round-to-nearest**, on
+real weights and real activations. The synthetic A was not hiding anything, which retroactively
+justifies the earlier synthetic probes as well.
 
