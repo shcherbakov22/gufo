@@ -3831,3 +3831,65 @@ and `blk.0.ffn_down.weight` through the same host path and compare against a flo
 That would exercise the encoder on the actual weight distribution rather than a constructed
 one, and it is the next step regardless of this result.
 
+## Real IQ3_XXS FFN weights through the NPU path
+
+The falsifier above is now satisfied, and it moved the quality number.
+
+**Setup.** `blk.0.ffn_gate.weight` and `blk.0.ffn_down.weight` were pulled from the shipped
+shard (type 18, IQ3_XXS, 34.1 MB of raw blocks each) and dequantised with the production
+decoder (`tools/qwen27b/atb_real_weights.cpp`, linked against `ggml_dequant.cpp`), then
+transposed into the ATB B layout (row-major K x N). A is a fixed-seed standard normal
+(M x K); the bfp16 error is a per-element relative effect, so the output error is insensitive
+to A's scale. Both operands are loaded into the vendored host through new `ATB_AFILE` /
+`ATB_BFILE` hooks and run at the real geometry on the xclbin compiled for each K.
+
+**The kernel is exact on real weights.** Against a reference built from the host's own
+`floatToBfp16` round trip, both shapes **PASS**, and both also pass against the float
+reference:
+
+| shape | quantisation-aware reference | float reference |
+|---|---|---|
+| 2048 x 5120 x 17408 | PASS | PASS |
+| 2048 x 17408 x 5120 | PASS | PASS |
+
+The float-reference PASS is not evidence of accuracy -- it passes because `abs_tol = 0.5` is
+loose against an output whose RMS is about 0.73. The number below, not the pass/fail, is the
+one that matters.
+
+**What bfp16 costs, measured as relative error on the GEMM output** (2000 sampled cells,
+RMS of the difference over RMS of the reference):
+
+| shape | weights only | activations only | both |
+|---|---|---|---|
+| 2048 x 5120 x 17408 (gate/up) | 1.23% | 1.27% | **1.88%** |
+| 2048 x 17408 x 5120 (down) | 1.28% | 1.33% | **2.26%** |
+
+The two contributions are close to independent: `sqrt(1.23^2 + 1.27^2) = 1.77%` against the
+measured 1.88%.
+
+**This corrects the earlier bfp16 quality gate.** That gate reported 0.31% RMS for 8-bit
+magnitudes and concluded the conversion was "numerically close to free". It modelled
+**round-to-nearest**, but `floatToBfp16` in `block_datatypes/helper.h` keeps `mbits = 7` and
+rounds by **arithmetic right shift** (line 103) -- truncation toward -inf. The chain is:
+
+| model | weight-side RMS |
+|---|---|
+| 8-bit, round-to-nearest (what the gate measured) | 0.31% |
+| 7-bit, round-to-nearest | 0.62% |
+| 7-bit, truncation (what the host actually emits) | 1.24% |
+
+and the measured weight-side output error at the gate/up shape is **1.23%**. The factor of 4
+is entirely accounted for: the gate tested a different encoder than the one in use.
+
+**Consequence.** The NPU path is not free numerically. It adds about 2% RMS to the FFN
+outputs, split evenly between the weights and the activations. Whether that is acceptable is
+an end-to-end question (perplexity with and without the conversion), not something to assume
+from a rounding model. The throughput and concurrency case is unaffected: 32.4-32.9 TFLOPS,
+1.3% iGPU cost, 1.68x prefill.
+
+**A free factor of two is available.** The 7-bit/truncation combination is our choice, not the
+hardware's: the stored value is just an int8 magnitude times a shared exponent, so the host
+may round to nearest when it encodes. That would take the weight-side contribution from 1.23%
+to about 0.62% and the combined figure from 1.88% to about 1.2%, at no cost to throughput or
+memory. It is a change to our repack, not to the vendored example.
+
