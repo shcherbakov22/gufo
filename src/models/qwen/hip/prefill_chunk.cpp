@@ -31,6 +31,15 @@ bool UseQwen27bFp16Prefill(const models::QwenModelWeights& weights,
   const auto supported = [](const models::QwenTensorRef& tensor) {
     return Fp16PrefillSupports(tensor.type);
   };
+  // ssm_alpha/ssm_beta are dispatched per tensor by gemm_weight instead of
+  // gating the whole model -- but only for F32. The route-resolved fallback for
+  // F32 reads the FP32 normed row, which the fp16 path emits for exactly this
+  // case. Any other foreign type falls back to the BF16 staging buffer, which
+  // holds fp16 under this path, so those must keep gating the whole model.
+  const auto gate_ok = [](const models::QwenTensorRef& tensor) {
+    return Fp16PrefillSupports(tensor.type) ||
+           tensor.type == core::GgmlType::kF32;
+  };
   bool low_bit_ffn = false;
   for (const auto& layer : weights.layers) {
     if (!supported(layer.ffn_gate) || !supported(layer.ffn_up) ||
@@ -44,12 +53,9 @@ bool UseQwen27bFp16Prefill(const models::QwenModelWeights& weights,
           !supported(layer.attn_v) || !supported(layer.attn_output))
         return false;
     } else if (!supported(layer.attn_qkv) || !supported(layer.attn_gate) ||
+               !gate_ok(layer.ssm_alpha) || !gate_ok(layer.ssm_beta) ||
                !supported(layer.ssm_out))
       return false;
-    // ssm_alpha/ssm_beta are deliberately not gated: gemm_weight dispatches
-    // them per tensor, so a foreign type there costs its own projection instead
-    // of taking the whole model off the fp16 path. They are the only supported-
-    // looking roles that never launch a fp16-only kernel directly.
   }
   return low_bit_ffn;
 }

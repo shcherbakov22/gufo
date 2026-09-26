@@ -163,4 +163,11 @@ So the fix is +18.8% and *better* numerics than the original, which makes sense:
 the fp16 WMMA path is more accurate than the int8-activation path the gate was
 forcing every large GEMM onto. The all-native production artifacts take neither
 new code path -- `ssm_gate_needs_fp32` is false, so they pay nothing.
+
+The per-tensor exemption is restricted to **F32**. Any other foreign type in
+`ssm_alpha`/`ssm_beta` still gates the whole model, because the route-resolved
+fallback for a quant type reads the BF16 staging buffer, and under this path that
+buffer holds fp16 -- a Q4_0 gate tensor would be read at the wrong width. F32 is
+safe because its route reads the FP32 normed row, which is the row the extra norm
+pass emits. Re-validated after that restriction: identical, 0.99999970 / 0.0089.
 followed by `gufo bench -m OUT -p 2048 -n 1 -r 1`.
