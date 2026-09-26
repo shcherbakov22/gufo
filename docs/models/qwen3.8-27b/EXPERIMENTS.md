@@ -875,6 +875,25 @@ the K loop plus the 14% between blocks. The realistic route is a persistent-CTA
 schedule, which is a real kernel change rather than a parameter, and is the first
 direction since the Q2_K fix that has a measured mechanism behind it.
 
+### Instrument reliability, honestly
+
+The clock instrument is good enough to have found the cause and not good enough
+to leave running unattended. `clock64()` is a pure function as far as the
+compiler is concerned, so in some instantiations it is commoned up or moved
+across the loop and an accumulator comes back wrapped -- true_block smaller than
+a phase inside it. The reliable readings reproduced across runs (Q4_K true_block
+920,230 with K loop 70.4%, IQ4_XS 913,366 with K loop 69.1%), which is what the
+conclusion rests on. The broken ones are obvious when they happen (any share
+over 100%).
+
+Hardening it properly needs reads the compiler cannot fold. Neither
+`s_memtime` nor `s_memrealtime` assembles for gfx1151 with this toolchain
+("instruction not supported on this GPU"), so the options are a `volatile`
+accumulator, a per-read data dependency, or reading through an
+`s_waitcnt`-separated sequence. Until then, treat any single reading as a
+sanity check and require a repeat before believing a number.
+
+
 
 
 
