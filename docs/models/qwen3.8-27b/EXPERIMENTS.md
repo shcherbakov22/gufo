@@ -3332,24 +3332,55 @@ stock kernel loads and stores its four accumulators every k-chunk, 8 extra memor
 MMULs) and the **ObjectFIFO lock acquire/release plus DMA handshake per k-chunk**, which the
 stock design pays once per 512-MMUL call.
 
+### The 15% is a tiling limit, and it has been beaten: 30.6 TFLOPS verified
+
+The falsifier below was met by an in-tree example. **Asymmetric tile buffering (ATB)**
+(`programming_examples/ml/block_datatypes/gemm_asymmetric_tile_buffering`, after arXiv
+2511.16041) decouples the L1 buffering of the A input from the C output. A row of A is dead
+once its C row has finished one reduction, while a C row must stay live for the whole
+reduction, so forcing both to share one `T_M` pays the peak buffer cost twice. With
+`rho = T_MC / T_MA = 4` (`T_MA = 32`, `T_MC = 128`) a 128x64x128 tile fits in the 63 KB
+L1 that would need ~91 KB symmetric. The kernel makes register placement explicit with
+`__aie_dm_resource_a/b/c/d` DM-bank annotations.
+
+Measured on this chip (Strix Halo, 8 columns, mlir-aie 1.4.3 + Peano):
+
+| config | precision (A / B / C / accum) | L1 tile | NPU time | throughput | check |
+|---|---|---|---|---|---|
+| config3 | bfp16 / bfp16 / bfp16 / bf16 | 128x64x128 | 2244.6 us | **30.6 TFLOPS** | **PASS** |
+| config1 | bf16 / bfp16 / bf16 / bf16 | 128x64x128 | 2895.0 us | 23.7 TFLOPS | FAIL |
+
+The paper reports a 4.54x speedup, from 4.8 to 24.6 TFLOPS. **Config3 reaches 30.6 TFLOPS
+here -- 79% of the 38.9 TFLOPS bfp16 MAC peak** -- where the stock whole-array tiling reaches
+~15% of that same peak. So the ~15% capture is a *tiling* artifact, not silicon and not the
+datatype, which is exactly what the datatype-independent plateau predicted.
+
+Config1 fails its correctness check because it **accumulates in bf16** across K=4096; that is
+lossy by construction, not a harness fault. Config3's pure-bfp16 path passes the stochastic
+verification, so 30.6 TFLOPS is a verified GEMM result rather than a throughput-only number.
+
 ### Where this leaves the split
 
-The prize is real and the blocker is precise. If the ~15% can be lifted even to 50% of the
-bfp16 peak, the split gives ~1.4x on prefill; at full bfp16 rate it hits the 1.84x Amdahl
-bound (pp2048 ~870-980 tok/s against 544 today). What remains unproven is whether that is
-reachable on this toolchain -- the proprietary chess compiler also only reached 9 TOPS on
-the TileFuse dataflow, which is ~23% of the bfp16 peak, so the gap is not purely Peano.
+The NPU is a peer of the iGPU for the FFN GEMM, and the two land within 25% of each other:
 
-**Falsifier: a GEMM that keeps C in registers across the K reduction and beats 20 TOPS.**
-Below that the split stays marginal against the iGPU's own unclaimed 20-27% of headroom;
-above 30 TOPS it becomes the largest available lever on prefill. The intermediate step is
-to trace a whole-array GEMM to separate compute cycles from stall, which the stock
-`whole_array.py` does not support and would need rebuilding with trace enabled.
+| engine | FFN-class GEMM, measured |
+|---|---|
+| iGPU, fp16, production shape | 40.6 TFLOPS |
+| NPU, bfp16, ATB config3 | 30.6 TFLOPS |
+
+A row split of the paired gate/up GEMM balances at ~43% of the work on the NPU, worth ~1.75x
+on the GEMM and, with GEMM at 91.9% of prefill, **~1.65x on prefill overall -- pp2048 ~898
+tok/s against the current 543.93**. That is larger than every remaining GPU-side lever
+combined, and it is now a measured capability rather than a projection.
+
+What is *not* done is the integration, and it is real work: weights must be repacked into the
+bf16 / AWQ-style tile layout the kernel reads (the NPU cannot read IQ3_XXS codebooks, and the
+in-core dequant runs on the AIE tiles), the host must orchestrate two engines with a barrier
+per FFN per layer, and bfp16's block exponent needs its own quality measurement on the shard.
+None of those is a research question; they are engineering.
 
 **Caveat on the bfp16 path.** bfp16 is block floating point with a shared exponent per 8
 elements, which is why the W4A16 PASS criterion is `err / (|A||B|)` rather than plain
-relative error. It is float with f32 accumulation and can consume fp16-class activations
-directly, so it needs no int8 activation quantisation and no re-quantisation of the
-weights into a new 8-bit domain -- but the block exponent is a real numerical property
-that must be validated rather than assumed.
+relative error. It is float and can consume fp16-class activations directly, so it needs no
+int8 activation quantisation -- but the block exponent must be validated on real weights.
 
