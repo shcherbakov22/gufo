@@ -2969,3 +2969,37 @@ quarter of the gap between the shipped 3.84 bpw shard and UD-Q4_K_S -- while lea
 true-token likelihood, which is what perplexity measures, unchanged. For a 2x on 91% of
 prefill FLOPs, that is a materially better position than the 27-row sample suggested, and
 it is the first int4 number in this document that rests on a sample large enough to use.
+
+### The shard that enables the 2x, measured: it costs distribution, not likelihood
+
+The 2x is only reachable on a shard whose weights are linear, and the candidate on disk is
+requant294. Its quality relative to the *shipped* shard is therefore part of the price of
+the 2x, and it had only been measured on the 27-row fixtures. Same instrument, same 513-row
+long-prefix run:
+
+| comparison | rows | mean KL | top-1 | mean NLL delta | implied PPL ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **requant294 vs shipped 3.84bpw** | 513 | 0.02561 | 441/513 | **-6.7e-05** | 1.0000 |
+| requant294 vs UD-Q4_K_S | 513 | 0.01191 | 474/513 | -0.00579 | 0.9942 |
+| shipped 3.84bpw vs UD-Q4_K_S | 513 | 0.01896 | 442/513 | -0.00572 | 0.9943 |
+| int4 activation step, on requant294 | 513 | 0.00392 | 498/513 | -0.00110 | 0.9989 |
+
+Three readings:
+
+1. **requant294 is closer to the reference than the shipped shard is** -- 0.0119 and 474/513
+   against 0.0190 and 442/513, both on 513 rows. The 27-row result held up.
+2. **Switching to the eligible shard costs distribution but not likelihood.** Against the
+   shipped shard it is 0.0256 mean KL with 72 top-1 flips in 513, and a teacher-forced NLL
+   delta of -6.7e-05 -- indistinguishable from zero. The two shards predict different
+   tokens without either being less likely on the true one.
+3. **The int4 activation grid costs about a sixth of the shard switch** -- 0.0039 against
+   0.0256, 15 top-1 flips against 72 -- and, like it, no NLL cost. So on the likelihood
+   metric the entire int4 package is free, and the dominant term is a shard choice, not the
+   activation grid.
+
+**The caveat that limits this: 513 tokens is a thin sample for an NLL delta.** The implied
+PPL ratios are near 1 but their standard errors are not printed, and a per-token NLL spread
+of order 0.1 over 513 tokens puts the standard error of the mean near 0.004 -- the same
+order as the int4 delta itself. So \"no NLL cost\" here means \"below the resolution of
+513 tokens\", not \"measured at zero\". A real perplexity run over tens of thousands of
+tokens is the acceptance test for the kernel, and it is the next measurement, not this one.
