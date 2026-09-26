@@ -1271,6 +1271,54 @@ occupancy allows. The compiler cannot do this itself because `s_barrier` is a
 scheduling fence. The ceiling on the gain is the decode's share of the 7.3%
 commit -- a few percent of the block, not a third of it.
 
+### The decode hoist: tried, bit-exact, and refuted
+
+That lever was implemented and measured behind a `HoistDecode` template flag in
+one binary, so both arms come from the same build. Q4_K 256x256 w8n4 bk4, M=17408
+K=5120 batch=2048, median of three passes. Both arms are numerically exact
+(`mismatch=0`), which is the point of choosing `DecodeRaw` rather than the
+fetch-stage decoder: the arithmetic is untouched, only the placement moves.
+
+| placement of the hoisted decode | VGPRs | spills | ms | vs commit-window decode |
+| --- | --- | --- | --- | --- |
+| in `commit()` (current) | 192 | 0 | **12.21** | -- |
+| head of the region, right after `fetch()` | 191 | 0 | 12.83 | **+5.1%** |
+| tail of the region, after the K loop | 192 | **209** | 60.87 | **+398%** |
+
+Both placements fail, for two different reasons, and together they close the
+idea rather than just this implementation of it.
+
+**The head placement loses the latency hiding.** In the current kernel the fetch
+at iteration *i* loads the next stage into `raw[]`, and the decode does not touch
+those registers until `commit()` at iteration *i+1* -- a full K loop plus a
+barrier later. That deferral is what hides the global-load latency, and it is not
+incidental: it is why the gap exists. Decoding immediately after the fetch
+removes the slack, so the decode stalls on loads that have not landed. It is
+serial either way, just serial in a worse place.
+
+**The tail placement is the version that would actually work, and the register
+file forbids it.** The whole point was to put the decode inside the K loop's
+instruction stream so the MMAs would cover it. At that point in the schedule the
+live set is the accumulators (64 VGPRs), the MMA operand fragments (about 48),
+the raw weights from `fetch` (8) and the decoded weights (8), on top of
+addressing and loop state. The compiler responds by spilling 209 registers, and
+at 128x128 w4n2 (256 threads, more per-thread budget pressure) 253 -- five times
+slower. There is no placement that both preserves the one-stage deferral and
+avoids the live-range conflict, because preserving the deferral is what forces
+`raw[]` to stay live across the K loop in the first place.
+
+One curiosity worth recording rather than acting on: at 128x128 w4n2, where two
+blocks are resident, the *head* placement measured 12.67 ms against 12.92 ms for
+the unhoisted form -- a 1.9% gain. That is the second block absorbing the stall,
+and it is consistent with everything above; it is also far too small to chase.
+
+The 7.3% commit is therefore not recoverable by reordering. That also bounds
+what was ever available: the window holds one decode and four `ds_store_b128`
+per thread, and at 1024 threads that store is 64 KiB per stage, roughly 512
+cycles at 128 B/cycle. If the window is store-bandwidth-bound, the decode's share
+of it is small enough that perfect hoisting would have been worth a few percent
+at best -- which is what the head placement measured, as a loss.
+
 
 
 
