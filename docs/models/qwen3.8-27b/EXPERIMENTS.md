@@ -4388,3 +4388,34 @@ Still untested, and not on the critical path: whether a `/dev/dma_heap/system` d
 by *both* drivers would give zero-copy, or whether HIP can export its own allocation for XRT to
 import in the other direction. Either would recover the 2%; neither is needed to proceed.
 
+## Both operands are now producible on the GPU, in the ATB layouts
+
+`tools/qwen27b/atb_encode_a.hip` is the A side: an FP16 activation `[rows, K]` into the bfp16 A
+L1 layout, same 2x1/8x8 shuffle and same shared-exponent encoder as the B pack, one thread per
+8-element group. Validated against the CPU oracle in `atb_act_bench.cpp` on a 2048 x 5120
+activation with injected outliers:
+
+| check | result |
+| --- | ---: |
+| bytes | 11,796,480 |
+| **exponent mismatches** | **0** |
+| mantissa mismatches | 11.7%, one grid step |
+
+Zero exponent mismatches is the layout proof, same as for B: the exponent byte encodes which 8
+values share it, so a wrong grouping moves whole groups. The mantissa difference is the same
+rounding-mode difference as B -- the CPU oracle truncates the mantissa to 7 bits before rounding,
+the kernel rounds the exact value -- and all differences are adjacent grid points, with the GPU
+the more accurate of the two.
+
+So the operand side of the split is complete and verified:
+
+| operand | producer | status |
+| --- | --- | --- |
+| B, weights | `atb_repack` (also in the engine, 1.53 ms/tensor) | layout-exact, all 7 FFN types |
+| A, activations | `atb_encode_a` | layout-exact |
+
+What remains for the split is three things and no unknowns: the **C decoder** (the ATB C layout
+back into the engine's FP32 FFN rows, the inverse of the 2x2/8x8 shuffle plus a bfp16 decode),
+**XRT inside the engine** (a skeleton now exists in `atb_handoff.hip`), and the **row
+partition**. The handoff between them is a copy, bounded at 2%.
+
