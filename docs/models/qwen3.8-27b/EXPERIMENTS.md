@@ -2562,3 +2562,46 @@ weight traffic, both of which are already at their limits.
 **Falsifier: a warp-specialised arm at BK=2 with two slots and a free handoff that beats
 10.6 ms.** Until that exists, warp specialisation on this part is refuted, not merely
 unfinished.
+
+### The K loop is not at its ceiling: the missing measurement
+
+A dedicated probe (`tools/qwen27b/fp16_kloop.hip`) runs the production K loop at the
+production shape -- 256x256, w8n4, BK=4, identical `s_a`/`s_b` layout and swizzle -- with
+the decode, the commit and the global fetch stripped out. A store the compiler cannot prove
+dead keeps the invariant LDS reads from being hoisted out of the stage loop. Interleaved,
+5 arms with a duplicated production control:
+
+| arm | median ms | TFLOPS | vs control |
+| --- | ---: | ---: | ---: |
+| production control A | 9.026 | 40.45 | -- |
+| pure K loop, LDS reads + barriers | 8.779 | 41.58 | +2.7% |
+| pure K loop, barriers removed | 16.844 | 21.67 | -86.6% |
+| **MMA only (fragments in registers)** | **7.330** | **49.80** | **+18.8%** |
+| production control B | 8.868 | 41.17 | +1.7% |
+
+Three things follow.
+
+1. **The old 50.67 TF "K-loop-only" number was an artifact.** That arm removed the commit,
+   so nothing wrote `s_a`/`s_b`, so the stage loop's LDS reads were loop-invariant and got
+   hoisted -- it was an MMA-only measurement wearing a K-loop label. The proper MMA-only
+   figure measured here, 49.80 TF, lands on it almost exactly. The 48.35 TF "peak tool"
+   number was never the thing being compared against.
+2. **Staging is nearly free.** The real kernel is 8.868-9.026 ms and the pure K loop is
+   8.779 ms: the decode, the commit and the global fetch together cost only **1-3%**, not
+   the 11.9% the fetch ablation suggested. They fit in issue slots the matrix pipe leaves
+   idle. This is the strongest evidence yet that fp16 staging was never the problem.
+3. **The headroom is in the LDS fragment feed and the two barriers per stage.** Dropping
+   from 41.58 to 49.80 TF -- **16.5%** -- is what removing the LDS reads and barriers buys.
+   That is the largest single identified fp16 gap and it is inside the K loop, not around
+   it.
+
+Caveat, stated because it limits the conclusion: the two hypotheses inside point 3 cannot
+be separated from these arms. The no-barrier control came out 2x *slower* than the barrier
+version, which is the opposite of what a barrier costs and means the scheduler produced a
+different and much worse loop for that instantiation. Until a no-barrier arm behaves, the
+16.5% is "LDS feed + barriers", not either one alone.
+
+**Falsifier: a K-loop variant that keeps the LDS feed and the barriers but beats 41.58 TF**
+-- that would mean the 16.5% is recoverable and the ceiling is higher still. Conversely,
+any claim that fp16 prefill is at its ceiling is now dead: the measured MMA-only rate at
+this exact shape is 49.80 TF while the shipped kernel runs at 40.45.
