@@ -2527,3 +2527,38 @@ split barriers and a full `s_barrier` is exactly the coupling being removed.
 
 The prize is the whole staging gap: the BK=2 K loop shares the BK=4 floor of 6.16 ms, and
 the 2.6 ms that BK=2 loses today is precisely per-stage staging that overlap would hide.
+
+### Warp specialisation: correct, and still slower
+
+The kernel is built. 16 producer warps (8 for A, 8 for B) fill one of three LDS slots
+while 16 consumer warps run WMMA on another; the handoff is LDS arrive/wait counters
+with `atomicAdd` and a monotonic target, and there is one `__syncthreads()` at kernel
+entry to zero them. BK=1 with three slots is what fits: at BK=2 a double-buffered A+B
+tile is exactly 65536 bytes and there is no room left for the counters.
+
+It is **numerically exact** -- `max|diff| = 0` and 0 mismatches over 35,651,584 outputs
+against the production kernel -- so the protocol, the counter arithmetic and the fragment
+layout are all right. It is also much slower:
+
+| arm | median ms | TFLOPS | vs production |
+| --- | ---: | ---: | ---: |
+| production `256x256 w8n4 bk4` | 10.638 | 34.32 | -- |
+| warp-specialised (correct) | 16.529 | 22.09 | **1.554x** |
+| warp-specialised, handoff removed (UB) | 11.095 | 32.90 | 1.043x |
+
+The third arm is the important one. Removing the waits and the atomics makes the result
+garbage, but it bounds what *any* handoff could achieve: **with a free handoff the design
+is still 4.3% behind the kernel it is meant to replace.** The handoff as written costs
+5.43 ms, 49% of the runtime, but even spending nothing on it does not win.
+
+The reason is the shape the LDS budget forced. BK=1 means 320 handoffs and a K-block of
+16 MMAs, so the consumer's LDS-to-MMA pipeline restarts every stage, and only 16 consumer
+warps - 4 per SIMD - are left to feed the matrix pipe. The overlap gain never materialises
+because the per-stage critical path grew by more than the decode it was hiding. The escape
+is BK=2 with 2 slots and 160 stages, which needs more than 64 KiB once counters are
+included; shrinking the tile to make room doubles either the activation traffic or the
+weight traffic, both of which are already at their limits.
+
+**Falsifier: a warp-specialised arm at BK=2 with two slots and a free handoff that beats
+10.6 ms.** Until that exists, warp specialisation on this part is refuted, not merely
+unfinished.
