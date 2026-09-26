@@ -2102,3 +2102,48 @@ The commit is also cleanly partitionable: `ks = idx % BK` assigns every thread t
 exactly one K sub-stage, so the commit can be cut into `BK` pieces and each piece
 issued during the matching sub-stage of the K loop, with a second LDS buffer so
 the write does not collide with the read. That is the next structural change.
+
+
+### The first fp16 double-buffer attempt: register-bound, and it hung the GPU
+
+Implementation: split the four LDS sub-stages into two buffers of two
+(`kStep = BK/2`), commit buffer 0 in the prologue, then each iteration reads one
+buffer while committing the next into the other -- **one barrier per iteration
+instead of two**, with the fetch still overlapping the K loop.
+
+**It does not work, and the reason is measurable before running anything.** A
+compile-only resource probe (`hipFuncGetAttributes` + occupancy, no launch):
+
+| variant | static LDS | private/scratch | VGPRs |
+| --- | ---: | ---: | ---: |
+| `Stages=1` (production) | 65536 | **0** | 136 |
+| `Stages=2` (double buffer) | 65536 | **136 B/thread** | **192** |
+
+192 VGPRs is **exactly the ceiling for 1024 threads** on this part
+(196608 VGPRs per CU / 1024). The runtime `buf` index forces the compiler to keep
+both buffers' addressing live at once, so it hits the ceiling and **spills 136
+bytes per thread to scratch**. This is the same VGPR wall the previous
+double-buffering attempts hit ("35 spills"); the design reproduced it rather than
+avoiding it.
+
+**The full-size run of that variant hung the GPU hard enough to require a host
+restart, and I could not confirm the mechanism.** `dmesg` is not permitted on
+this box (`read kernel buffer failed: Operation not permitted`) and
+`journalctl -k` contains no amdgpu reset for the period -- its most recent
+entries are from 13:01, so kernel GPU messages are simply not being captured here.
+What is established is the correlation: a 192-VGPR, 136-bytes-of-scratch kernel
+was built, launched at production size, and wedged the device. The mechanism is
+not proven, and the change was reverted.
+
+**Two conclusions that change the method:**
+
+1. **Probe the resource footprint before launching anything new.** The probe above
+   is compile-only, takes seconds, and would have flagged this variant as
+   dangerous before it touched the GPU. Every future kernel variant gets this
+   check first, and a tiny-grid run under a hard timeout before a full-size one.
+2. **A runtime buffer index is the wrong mechanism here.** It is what pushes the
+   register pressure over the edge. The next attempt must keep the LDS addressing
+   *immediate* by making the buffer alternation compile-time -- unrolling the loop
+   by two so the compiler sees two constant-indexed bodies rather than one
+   variable-indexed one -- which is also how the existing kernel gets its
+   registers down to 136.
