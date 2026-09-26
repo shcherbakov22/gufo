@@ -4261,3 +4261,54 @@ and writes to stdout; the engine version reads the resident `layer.ffn_*.data` a
 type and writes into the double buffer. That is also where the split lands, since both need the
 same per-layer hook.
 
+## Regression hunt: every busy CPU core costs 2-3% of prefill
+
+The standing pp2048 reference is 543.93, and the box now reads 456-498. Two hypotheses were
+tested and one of them holds.
+
+**Not thermal.** A full cooldown -- eight minutes idle, then the same benchmark -- gave 490.84
+before and 492.94 after, no recovery. Temperatures during runs sit at 90-92 C edge, and the
+platform profile is `balanced`, but neither is a step change.
+
+**Not code.** This session's engine changes are additive and environment-gated: `+119` lines,
+zero deletions, and every one of them behind a `getenv`. The hot kernel
+(`HalfPrefillGemmKernel`) is untouched; the additions are a separate diagnostic kernel, a
+separate repack kernel, and two guarded call sites.
+
+**It is CPU load, and it is measurable.** Adding known busy cores and re-running the identical
+benchmark:
+
+| busy cores added | pp2048 | cost |
+| ---: | ---: | ---: |
+| 0 | 498.72 +/- 8.39 | -- |
+| 1 | 486.79 +/- 4.99 | -2.4% |
+| 2 | 476.96 +/- 4.33 | -4.4% |
+| 4 | 466.90 +/- 1.60 | -6.4% |
+| 8 | 375.93 +/- 6.50 | **-24.6%** |
+
+**About 2-3% of prefill per busy core**, which is the signature of a power-capped SoC rather
+than a CPU-starved host: this box caps at ~95 W (95.9 W observed at the peak) and CPU watts come
+out of the same budget as the iGPU's. It also explains the earlier "cross-session drift" of 8.5%
+-- it was never drift, it was whatever else the machine was doing.
+
+**The engine is one of those busy cores.** The host thread spins in `libhsa-runtime64` for the
+entire prefill (see the previous section), which is one busy core and so **~2.4% of pp2048** --
+self-inflicted, in our control, and recoverable by replacing the spinning wait at the chunk
+boundary with a blocking one. The desktop accounts for roughly another one to two cores
+(measured concurrently: this GUI's renderer 63-100%, waterfox 24-38%, btop 10%, niri 5-14%),
+which is a further 3-6%.
+
+**This also settles the activation-packing plan.** Two sections ago I budgeted the A encode at
+5.53 ms per layer on 16 CPU threads and called it hidden under the GPU's 59 ms. The cost model
+was wrong: 8 busy cores already cost 24.6%, so 16 threads of encoding would cost far more than
+the ~10% the split is playing for. **The A operand has to be encoded on the GPU**, next to the B
+repack that already runs there for 1.45 ms/layer. The measurement does not just qualify that
+correction, it makes the CPU path untenable.
+
+**And a measurement-methodology note that applies to this whole document**: every pp2048 in it
+was taken with a browser, a terminal and a compositor running, and this session's numbers were
+additionally taken *while streaming results to a GUI on the same box*. At 2-3% per busy core
+that is several percent of uncertainty on every figure. The 543.93 reference is not
+reproducible on a loaded desktop, and the 8-core row shows the sensitivity is not linear at the
+top end either.
+
