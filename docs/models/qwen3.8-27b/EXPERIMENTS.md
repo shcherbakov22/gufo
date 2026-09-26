@@ -2041,7 +2041,11 @@ Three conclusions, and only the third is new work:
 
 1. **Nothing in the unused set is a second route to 2x.** F16-accumulate, the one
    candidate that would have doubled the fp16 path at a precision cost, is 1.02x.
-   The fp16 kernel really is at its hardware ceiling.
+   **This is a statement about the ceiling, not about the kernel.** 48.35 TFLOPS is
+   the widest the f16 MMA gets on this part; the production kernel reaches about
+   **32 TFLOPS, or 66% of it**, so roughly **34% -- about +50% on the GEMM -- is
+   structural and still on the table.** An earlier revision of this section called
+   the kernel "at its hardware ceiling", which conflated the two and was wrong.
 2. **The int4 lever is confirmed available, and confirmed narrow.** It is the same
    16x16x16 shape, reachable today, and gated entirely by `linearity` of the
    weight codes -- the eligibility problem, not a kernel problem.
