@@ -893,6 +893,37 @@ accumulator, a per-read data dependency, or reading through an
 `s_waitcnt`-separated sequence. Until then, treat any single reading as a
 sanity check and require a repeat before believing a number.
 
+### Correction: there is no inter-block gap
+
+The 14% "inter-block and tail gap" reported above is an arithmetic error of
+mine. I divided by the nominal 2.9 GHz, but the clock the instrument reads is the
+one the part actually runs at under load, about 2.5 GHz. Check it: 28 rounds x
+920,230 ticks = 25.77M cycles; the wall time was 10.33 ms; 25.77e6 / 10.33e-3 =
+2.49 GHz. At that frequency the block time times the round count accounts for the
+wall time exactly, so every cycle is inside a block and there is no gap to
+recover.
+
+That makes the whole picture self-consistent instead of leaving a residual:
+
+* block = 100% accounted -- K loop 70.4% and at the MMA peak, `commit` 7.3%,
+  barriers 6.5%, `fetch` 2.9%, epilogue + init 12.9%;
+* persistent CTAs lost 4% because there was no launch or tail overhead to remove,
+  only loop overhead to add;
+* 128x128 with two blocks per CU lost 27-50% because the overhead is throughput,
+  not latency, so a second resident block cannot fill it.
+
+The fp16 prefill deficit is now fully explained and none of it is a mystery:
+70.4% is the K loop running at the machine MMA rate, and the other 29.6% is block
+overhead that is required in kind -- LDS stores to stage the operands (7.3%), the
+barriers that cooperative staging needs (6.5%), the global operand loads (2.9%),
+and the output write plus the pre-loop setup (12.9%). The output alone is 143 MB
+per GEMM, which at the measured epilogue rate is about 7% of the runtime.
+
+The only piece with visible headroom is that output rate: 143 MB in ~1.33 ms is
+108 GB/s where the box can do roughly double. A coalescing change could plausibly
+recover a few percent. Everything else is pinned.
+
+
 ### Persistent CTAs: bit-exact, and 4% slower
 
 Implemented the persistent schedule -- 20 blocks, one per CU, each striding
