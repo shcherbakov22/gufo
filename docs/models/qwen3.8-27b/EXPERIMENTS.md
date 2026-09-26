@@ -3312,17 +3312,25 @@ The obvious suspect was L1 operand bandwidth, since a GEMM must load operands pe
 Measuring the int8 MAC rate at 0, 1 and 2 vector L1 loads per MAC
 (`tools/qwen27b/npu_peak_feed.py`):
 
-| L1 loads per MAC | per-tile | 32 tiles | % of peak |
-|---|---|---|---|
-| 1 | 1.617 | **51.75** | **91%** |
-| 2 | 1.118 | 35.76 | 63% |
+| L1 loads per MAC | 65,536 MACs/call | 262,144 MACs/call |
+|---|---|---|
+| 0 (register-resident) | 10.84 | 28.43 |
+| 1 | 51.75 | **53.92** (95% of peak) |
+| 2 | 35.76 | 37.30 (66% of peak) |
 
-**One L1 vector load per MAC is essentially free.** The whole-array GEMM performs exactly
-one operand load per MAC, so its operand feed is not what caps it at 15%. That eliminates
-the intuitive explanation and moves the target to the two things this probe deliberately
-excludes: the **C-accumulator round-trip to L1** (the stock kernel loads and stores its
-four accumulators every k-chunk, 8 extra memory ops per 4 MMULs) and the per-call
-preamble/postamble and ObjectFIFO lock traffic.
+**One L1 vector load per MAC is essentially free** -- 95% of peak. The 1- and 2-load arms
+are *flat* across a 4x change in work per call, while the 0-load arm rises 2.6x over the
+same span: per-call cost is exactly what the streaming arms are insensitive to, and they are
+already amortised at the work the GEMM actually does (a 64^3 tile is 262,144 MACs per
+kernel call). The 0-load arm is therefore not a valid reference at small work per call --
+it measures per-call overhead, not MAC rate.
+
+The whole-array GEMM performs exactly one operand load per MAC, so its operand feed is not
+what caps it at 15%. That eliminates the intuitive explanation and moves the target to the
+two things this probe deliberately excludes: the **C-accumulator round-trip to L1** (the
+stock kernel loads and stores its four accumulators every k-chunk, 8 extra memory ops per 4
+MMULs) and the **ObjectFIFO lock acquire/release plus DMA handshake per k-chunk**, which the
+stock design pays once per 512-MMUL call.
 
 ### Where this leaves the split
 
