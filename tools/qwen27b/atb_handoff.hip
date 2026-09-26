@@ -90,7 +90,10 @@ int main(int argc, char** argv) {
   device.register_xclbin(xclbin);
   xrt::hw_context context(device, xclbin.get_uuid());
   auto kernel = xrt::kernel(context, kernel_name);
-  const auto opcode = kernel.group_id(0);
+  // The ERT start-CU opcode is the literal 3, not group_id(0). Passing the group id
+  // leaves C untouched, so a probe that only compares two views of the same
+  // buffer reports success while nothing ran.
+  const unsigned int opcode = 3;
 
   auto bo_instr = xrt::bo(device, instr.size() * sizeof(std::uint32_t),
                           XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
