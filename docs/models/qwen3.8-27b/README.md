@@ -4,7 +4,7 @@ Dense text/image model on gfx1151. Production target GGUFs are **UD-Q4_K_XL**
 (16.35 GiB weights) and **UD-Q8_K_XL** (29.30 GiB); request state and an optional
 draft/projector need additional memory. BF16 targets are reference-only.
 
-[Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md)
+[Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md) · [K_S artifact gates](KS-ARTIFACT-GATES.md)
 
 ## Load and run
 
