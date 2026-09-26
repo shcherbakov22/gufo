@@ -3482,8 +3482,15 @@ efficient engine here by a wide margin -- 31 TFLOPS for ~30 W against the iGPU's
 ~73-96 W.
 
 Recomputing with the *concurrent* NPU rate: balance at t = 24.6/(40.6+24.6) = 0.377, giving
-1.61x on the GEMM and **~1.53x on prefill** rather than 1.65x. The 21% derate costs about a
-tenth of the projected gain, which is worth paying.
+1.61x on the split GEMM work rather than 1.65x. The 21% derate costs about a tenth of the
+projected gain, which is worth paying.
+
+**Corrected:** the prefill figure above was given as ~1.53x, and the one at the end of this
+section as ~1.68x. Both implicitly assume the split covers essentially all of prefill's GEMM
+work. It does not -- the plan splits the **FFN**, which the model-level accounting in this
+document puts at **67% of GEMM FLOPs**. Amdahl then gives `1/(0.33 + 0.67/1.61) = **1.34x**`
+here and `1/(0.33 + 0.67/1.781) = **1.42x**` for the 31.5 TF case. The 1.61x and 1.78x GEMM
+figures are correct; only their translation into prefill was wrong.
 
 Caveat: pp2048 read 497.80 tok/s in this run against the 543.93 recorded baseline, an 8.5%
 cross-session drift, so absolute numbers from different sessions are not comparable. Solo
@@ -3626,8 +3633,8 @@ which was not done.
 **Practical impact.** The iGPU's real FFN GEMM rate is ~30 or ~39 TF depending on which
 harness matches the model, and the model-level wall-clock rate of 29.7 TF is independent
 evidence for ~30. Note the direction if the slow harness is the truthful one: the NPU at
-32.4 TF would be the *faster* engine, and the split worth more than the 1.53x computed from
-40.6 TF. Either way the NPU conclusion is unaffected.
+32.4 TF would be the *faster* engine, and the split worth more than the 1.34x prefill figure
+computed from 40.6 TF. Either way the NPU conclusion is unaffected.
 
 **Resolved: it is the GPU boost clock, and the clock is data-dependent.** Reversing the run
 order removes ramp-up as an explanation -- each binary keeps its own clock regardless of when
@@ -3659,8 +3666,15 @@ yet compared on equal footing.
 
 Recomputing the split with the corrected iGPU rate (~31.5 TF under production conditions)
 against the concurrent NPU rate (24.6 TF): balance at t = 24.6/(31.5+24.6) = 0.438, giving
-1.78x on the GEMM and **~1.68x on prefill** rather than 1.53x. On this evidence the NPU is at
-*parity* with the iGPU rather than behind it.
+1.78x on the split GEMM work. On this evidence the NPU is at *parity* with the iGPU rather than
+behind it.
+
+**Corrected:** the prefill figure here was given as ~1.68x. With the FFN at 67% of GEMM FLOPs,
+Amdahl gives `1/(0.33 + 0.67/1.781) = **1.42x**`. 1.68x would require the split to cover 92.5%
+of prefill -- every GEMM the model runs, not just the FFN -- and that is not affordable: the
+non-FFN weights are another ~5.13 GiB, which at 9 bits/weight would add ~13 GiB packed on top of
+the 18.21 GiB the FFN alone needs. **The projection is ~1.42x on prefill, and it remains a
+projection**: no run has ever had the NPU computing part of the model.
 
 ### The NPU throughput is data-independent, but the ATB correctness test is not a real test
 
@@ -3905,8 +3919,9 @@ is entirely accounted for: the gate tested a different encoder than the one in u
 **Consequence.** The NPU path is not free numerically. It adds about 2% RMS to the FFN
 outputs, split evenly between the weights and the activations. Whether that is acceptable is
 an end-to-end question (perplexity with and without the conversion), not something to assume
-from a rounding model. The throughput and concurrency case is unaffected: 32.4-32.9 TFLOPS,
-1.3% iGPU cost, 1.68x prefill.
+from a rounding model. The throughput is unaffected -- 32.4-32.9 TFLOPS at 1.3% iGPU cost -- but
+the prefill projection is **1.42x, not 1.68x** (see the correction in the concurrency section),
+and it is a projection rather than a measurement.
 
 **A free 1.6x is available, and now measured.** The 7-bit/truncation combination is our
 choice, not the hardware's: the stored value is just an int8 magnitude times a shared
