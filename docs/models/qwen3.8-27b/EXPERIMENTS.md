@@ -3641,6 +3641,43 @@ against the concurrent NPU rate (24.6 TF): balance at t = 24.6/(31.5+24.6) = 0.4
 1.78x on the GEMM and **~1.68x on prefill** rather than 1.53x. On this evidence the NPU is at
 *parity* with the iGPU rather than behind it.
 
+### The NPU throughput is data-independent, but the ATB correctness test is not a real test
+
+The same synthetic-data concern that inflated the iGPU numbers could have applied to the NPU's
+32.4 TFLOPS, whose ATB harness also uses degenerate data. It does not. Replacing the harness's
+deliberately permutation-invariant pattern (B all ones, A in {1,2} -- documented in the source
+as "so the host-side layout shuffle is permutation-invariant on the data") with signed
+mixed-magnitude operands:
+
+| operands | throughput | result |
+|---|---|---|
+| stock (all ones / {1,2}) | 30726 GFLOPS | PASS |
+| A real, B = 1 | 28216 | FAIL 1000/1000 |
+| A = 1, B real | 30934 | FAIL 1000/1000 |
+| both real | 30713 | FAIL 909/1000 |
+
+Throughput is **unchanged** -- the FFN gate/up shape reads 11262 us with real operands against
+11258.8 us with all ones, and 4096x4096x2048 reads 2230 us against 2211 us -- so the NPU's
+number is not a synthetic-data artifact. That question is closed.
+
+**But correctness is now open, and it matters more.** Every non-uniform variant fails,
+including the shape the stock test passes. The stock pattern cannot detect layout errors *by
+construction*: its own comment says the values are constant within every L1 sub-tile precisely
+so the shuffle is invisible. "PASS" therefore never established that the A shuffle, the B
+shuffle and the C un-shuffle are correct -- only the accumulation count and the bfp16 writeback
+path.
+
+It is not yet determined whether the failure is a layout bug in the ATB pipeline or an
+assumption in the host's reference path, because the vendored example was *modified* rather
+than diagnosed. Either way the conclusion for the split is the same: **the ATB kernel's
+correctness on real weights is unverified**, and that is a prerequisite for the repack rather
+than an afterthought. The repack can be written, but it cannot be called validated until a
+layout-sensitive test passes.
+
+This is the third time in this work that a degenerate test pattern has hidden the real answer:
+the fp16 ablation arms that were optimised away, the all-ones GEMM that hid the K dependence,
+and now the all-ones GEMM that hid the layout question.
+
 ## The bfp16 quality gate passes on real weights
 
 The one untested risk in the NPU path was bfp16's block exponent. The B operand is stored as
