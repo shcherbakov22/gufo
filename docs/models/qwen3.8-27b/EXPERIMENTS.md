@@ -3405,6 +3405,32 @@ output width is capped at 4096 and N=17408 needs five launches (four of 4096 plu
 1024). N-splitting is algebraically free -- output columns are independent -- but it is five
 launches per FFN tensor instead of one.
 
+### Concurrency: the iGPU barely notices, the NPU loses 21%
+
+The split only pays if both engines run at once. Measured simultaneously -- gufo prefill
+pp2048 on the iGPU while ATB config3 runs on the NPU -- with SoC power sampled throughout:
+
+| phase | GPU (pp2048) | NPU (ATB config3) | SoC power mean / max |
+|---|---|---|---|
+| GPU solo | 497.80 +- 5.54 tok/s | -- | 73.2 / 95.9 W |
+| NPU solo | -- | 31.1 TFLOPS | 30.3 / 61.9 W |
+| concurrent | **491.13 +- 10.12 tok/s (-1.3%)** | **24.6 TFLOPS (-20.8%)** | 61.9 / 93.0 W |
+
+The iGPU is essentially unperturbed (-1.3%, inside 2 sigma) and the NPU gives up 21%. The
+concurrent ceiling (93.0 W) is no higher than the GPU-solo ceiling (95.9 W), so the SoC is
+power-capped and the budget is being split: the iGPU holds its allocation while the NPU is
+squeezed. This is a power split, not memory-bandwidth contention. The NPU is also the more
+efficient engine here by a wide margin -- 31 TFLOPS for ~30 W against the iGPU's ~40 TF for
+~73-96 W.
+
+Recomputing with the *concurrent* NPU rate: balance at t = 24.6/(40.6+24.6) = 0.377, giving
+1.61x on the GEMM and **~1.53x on prefill** rather than 1.65x. The 21% derate costs about a
+tenth of the projected gain, which is worth paying.
+
+Caveat: pp2048 read 497.80 tok/s in this run against the 543.93 recorded baseline, an 8.5%
+cross-session drift, so absolute numbers from different sessions are not comparable. Solo
+versus concurrent *within* this run is.
+
 ### Where this leaves the split
 
 The NPU is a peer of the iGPU for the FFN GEMM, and the two land within 25% of each other:
