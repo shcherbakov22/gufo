@@ -467,6 +467,59 @@ the 2.2x worth implementing. That is a model decision with its own quality
 question, and it is where the value is -- which is what the eligibility analysis
 at the top of this section already said, now with the FLOP share attached.
 
+### Double-buffering the fp16 stage: blocked by registers, not by LDS
+
+The reasoning that motivated this was sound and worth testing. At BK=4 the fp16
+stage is *exactly* 64 KiB, which is why it is single-buffered, which is why
+`commit()` sits in its own fenced window and why there are two barriers per
+stage. At BK=2 the stage is 32 KiB, so **two** buffers fit exactly: the commit for
+the next stage lands in the other parity, it can be scheduled inside the region
+the MMAs occupy, and one barrier per stage suffices.
+
+Implemented as a `DoubleBuffer` template arm and measured in one binary against
+the BK=4 baseline. Every configuration is bit-exact (`mismatch=0`); medians of
+three passes:
+
+| variant | LDS | VGPRs | spills | ms | vs baseline |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 256x256 bk4 single (baseline) | 65536 | 192 | 0 | 11.79 | -- |
+| 256x256 bk2 single | 32768 | 191 | 0 | 14.14 | +20% |
+| 256x256 bk2 **double** | 65536 | 192 | **35** | 19.15 | **+62%** |
+| 128x128 w4n2 bk4 single | 32768 | 170 | 0 | 12.75 | +8% |
+| 128x128 w4n2 bk4 **double** | 65536 | 256 | **157** | 46.67 | **+296%** |
+| 128x128 w4n2 bk2 double | 65536 | -- | -- | 14.80 | +26% |
+
+The LDS arithmetic works and the occupancy confirms it -- the double-buffered arms
+report exactly one block per CU, which is what two 32 KiB stages require. What
+breaks is the register file. Overlapping the commit with the MMAs means the
+accumulators (64 VGPRs), the MMA operand fragments (about 48), the raw weights
+already fetched for the next stage and the decode's temporaries are all live at
+the same instant. The compiler spills 35 registers at 256x256/bk2 and 157 at
+128x128, and the spill cost (a fifth to a third of the runtime) swamps the barrier
+saving it was meant to buy.
+
+**This is the second independent confirmation of the same wall.** The decode hoist
+failed identically -- 209 spills when the decode alone moved into the MMA region.
+The staging work is VALU and LDS, not MMA, so overlapping it with the MMAs is
+exactly what requires its registers to be live alongside the accumulators and
+operands, and there is not room. The pairing is not "LDS limits, registers spare":
+both are spent.
+
+The arithmetic also says the idea would not have paid even spill-free, which is
+worth recording so it is not retried. Comparing the two single-buffered arms
+isolates the cost of stage granularity: bk2 carries 160 extra barriers **and** 80
+extra stage boundaries for +2.35 ms. Halving the barriers back to 160 recovers
+about 1.2 ms, and moving the commit (7.3% of the block, 0.86 ms) into the overlap
+region recovers at most another 0.86 ms, landing near 12.1 ms -- about 2.5%
+*worse* than the 11.79 ms baseline. Doubling the stage count costs more than the
+fence it removes.
+
+The only shape that keeps 80 stages is BK=4, and BK=4 at 256x256 is 128 KiB for
+two buffers. So the fenced commit window is not recoverable this way either: the
+kernel's structure is what 64 KiB of LDS *and* the accumulator-and-operand VGPR
+budget jointly permit, and both attempts to beat it died on the register half of
+that pair rather than the LDS half.
+
 
 ## Deferred: Q2_K native prefill (chunked-path eligibility)
 
