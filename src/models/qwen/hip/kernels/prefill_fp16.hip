@@ -235,7 +235,7 @@ enum class HalfEpilogue { kStore, kSwiGLU, kGateUp, kResidual };
 template<int BM, int BN, int WM, int WN, gufo::core::GgmlType Type,
          HalfEpilogue Epilogue, bool Complete = false,
          gufo::core::GgmlType UpType = Type, int BKDepth = 4,
-         int Ablate = 0>
+         int Ablate = 0, int GShift = -1>
 __launch_bounds__(WM * WN * 32) __global__
     void HalfPrefillGemmKernel(const void* __restrict__ w,
                                const short* __restrict__ x,
@@ -308,6 +308,7 @@ __launch_bounds__(WM * WN * 32) __global__
       else if constexpr (Type == gufo::core::GgmlType::kQ5_K)
         group_shift = k <= 8192 ? 5 : 3;
     }
+    if constexpr (GShift >= 0) group_shift = GShift;
     const unsigned group = 1U << group_shift;
     unsigned first = (blockIdx.y >> group_shift) << group_shift,
              within = (blockIdx.y & (group - 1)) * gridDim.x + blockIdx.x,
@@ -564,8 +565,9 @@ __launch_bounds__(WM * WN * 32) __global__
         }
       }
     }
-    if constexpr (BM == 256 && BN == 256 &&
-                  ((Type == gufo::core::GgmlType::kIQ4_XS &&
+    if constexpr ((Ablate & 16) != 0 ||
+                  (BM == 256 && BN == 256 &&
+                   ((Type == gufo::core::GgmlType::kIQ4_XS &&
                     (!Mixed || UpType != gufo::core::GgmlType::kQ5_K)) ||
                    (Type == gufo::core::GgmlType::kIQ4_NL &&
                     UpType == gufo::core::GgmlType::kIQ4_XS) ||
@@ -575,7 +577,7 @@ __launch_bounds__(WM * WN * 32) __global__
                    Type == gufo::core::GgmlType::kIQ3_XXS ||
                    Type == gufo::core::GgmlType::kIQ2_XS ||
                    Type == gufo::core::GgmlType::kIQ2_S ||
-                   Type == gufo::core::GgmlType::kIQ2_XXS)) {
+                   Type == gufo::core::GgmlType::kIQ2_XXS))) {
       // Interleave LDS reads with WMMA after the grid decoders. Mixed Q5
       // decoders retain the compiler's default instruction schedule.
       __builtin_amdgcn_iglp_opt(0);
@@ -600,7 +602,10 @@ __launch_bounds__(WM * WN * 32) __global__
   // keeps the original orientation and LDS transpose, which is faster for
   // its decoder's register schedule.
   const auto store = [&](std::size_t index, float value) {
-    if constexpr (Epilogue == HalfEpilogue::kSwiGLU) {
+    if constexpr ((Ablate & 8) != 0) {
+      // Epilogue ablation: keep the accumulators live, never store.
+      if (value == 1.0e38F) y[index] = value;
+    } else if constexpr (Epilogue == HalfEpilogue::kSwiGLU) {
       const float g = gate[index];
       const float sig = 1.0F / (1.0F + expf(-g));
       reinterpret_cast<__half*>(y)[index] =

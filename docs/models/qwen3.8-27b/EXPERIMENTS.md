@@ -2279,3 +2279,57 @@ The fp16 kernel is at a genuine structural optimum for this design on this part.
 Further gain requires a different *design*, not a different configuration -- and the
 one design that would break these constraints was measured to be worth at most 5.5%,
 so it is not worth its risk.
+
+
+### The harness was biased; corrected decomposition and re-measurements
+
+Every ablation and A/B above ran its arms **sequentially in a fixed order**, which loads
+the GPU progressively. A null check had already exposed the size of that: two
+byte-identical binaries measured **-2.6%** on the mean with per-round swings to -8% when
+one was always run second, and later sessions read the *same* production configuration at
+**8.34 ms and 9.09 ms -- ~9% apart -- with the first-run arm always fastest.**
+
+Rebuilt as **interleaved rounds with the arm order alternated every round**, reporting the
+median plus the min/max. Re-measured decomposition, m=17408, k=5120, batch=2048, 7 rounds:
+
+| ablated | median ms | min | max | TFLOPS | gain |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| baseline | 9.181 | 8.864 | 9.256 | 39.77 | -- |
+| no barriers | 8.558 | 8.466 | 8.810 | 42.66 | **+6.8%** |
+| no commit (all staging) | 7.206 | 7.082 | 7.287 | 50.67 | +21.5% |
+| no fetch | 8.237 | 8.143 | 8.287 | 44.32 | +10.3% |
+| no epilogue | 9.129 | 8.982 | 9.284 | 39.99 | +0.6% |
+
+Commit **1.03 ms**, fetch **0.94 ms**, barriers **0.62 ms**, epilogue **~0**. The earlier
+sequential figures are superseded, and the barrier number was the one most wrong
+(4.6% -> **6.8%**).
+
+Re-measured on the same interleaved harness, the items that had been decided on the biased
+one:
+
+| item | sequential | interleaved | verdict |
+| --- | ---: | ---: | --- |
+| double buffer (`Stages=2`) | -10.1% | **-11.0%** (9.640 vs 8.688 ms, ranges disjoint) | **stands** |
+| `iglp_opt(0)` for Q4_K | -2.8% | **+0.5%** (ranges overlap) | neutral |
+| epilogue ablation | +0.8% *slower* | **+0.6% faster** | epilogue is negligible |
+
+And the grid swizzle, which had never been swept (`GShift`, production default 3):
+
+| group_shift | median ms | TFLOPS | delta |
+| ---: | ---: | ---: | ---: |
+| -1 (default 3) | 9.157 | 39.87 | -- |
+| 0 | 9.371 | 38.96 | **-2.3%** |
+| 1 | 9.199 | 39.69 | -0.5% |
+| 2 | 9.125 | 40.01 | +0.3% |
+| 4 | 9.196 | 39.70 | -0.4% |
+| 5 | 9.163 | 39.84 | -0.1% |
+
+The shipped heuristic is already at the optimum; shift 0 is clearly worse and the rest is
+inside noise. Not a lever.
+
+**The residual that remains:** even interleaved, the session-to-session spread is ~5% --
+the same production configuration read 42.02 and 39.87 TFLOPS in consecutive runs.
+Interleaving cancels ordering bias *within* a run but not across runs, so only within-run
+comparisons are trustworthy at the few-percent level. Every ablation in this kernel
+(`Ablate` bits 1/2/4/8/16) and the grid swizzle (`GShift`) are kept as defaulted
+compile-time diagnostics so they can be re-run on the interleaved harness.
