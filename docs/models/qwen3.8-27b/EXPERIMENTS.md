@@ -2057,3 +2057,48 @@ Three conclusions, and only the third is new work:
    contiguously. A shuffle-based transpose is the alternative the hardware still
    offers there. It is untested, and it is the only thing this survey turned up
    that is both unused and aimed at a measured cost.
+
+
+### The fp16 staging gap, decomposed by ablation
+
+Compile-time ablation flags on the real kernel (`int Ablate = 0`, defaulted, so
+production is bit-identical -- the q4kxl equivalence test passes unchanged). All
+arms at m=17408, k=5120, batch=2048, Q4_K, 256x256 w8n4, Complete=true, in one
+process:
+
+| ablated | ms | TFLOPS |
+| --- | ---: | ---: |
+| baseline | 9.188 | 39.7 |
+| fetch only (commit kept) | 8.299 | 44.0 |
+| barriers only | 8.772 | 41.6 |
+| commit + fetch (all staging) | 7.251 | **50.4** |
+
+**Production dispatch and a direct instantiation of the same template agree to
+0.5% in the same process** (9.245 against 9.297 ms). That also retires the
+per-format numbers above: those were taken back to back on a thermally loaded
+GPU, and the true rate for Q4_K at this shape is **39.5 TFLOPS, not 32.3**. Any
+part of the "format-insensitive plateau" that was read as a steady ~20% format
+effect was substantially heat, and that conclusion needs re-measuring before it
+is relied on again.
+
+Decomposition of the **2.04 ms (22%)** that staging and barriers cost:
+
+| component | ms | share | mechanism |
+| --- | ---: | ---: | --- |
+| commit (LDS stores) | **1.15** | 12.5% | LDS-write bound |
+| fetch (global loads + decode) | 0.89 | 9.7% | issue and latency |
+| barriers | 0.42 | 4.6% | serialisation |
+
+The commit is **LDS write bandwidth**, and the arithmetic confirms it: 64 KB per
+CTA per stage, times 80 stages, times 1088 CTAs is **5.6 GB** of LDS writes, which
+at 128 B/cycle across 20 CUs and 2.49 GHz floors at **0.87 ms**. Measured 1.15 ms.
+
+The K loop reads only about 3 KB of LDS per stage against those 16 KB of writes,
+so the port is roughly 30% used during the K loop -- **there is spare LDS
+bandwidth to hide the commit in**, which is the opposite of the conclusion the
+earlier barrier/LDS-capacity chain reached.
+
+The commit is also cleanly partitionable: `ks = idx % BK` assigns every thread to
+exactly one K sub-stage, so the commit can be cut into `BK` pieces and each piece
+issued during the matching sub-stage of the K loop, with a second LDS buffer so
+the write does not collide with the read. That is the next structural change.

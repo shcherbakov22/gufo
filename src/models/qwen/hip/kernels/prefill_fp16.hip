@@ -234,7 +234,8 @@ enum class HalfEpilogue { kStore, kSwiGLU, kGateUp, kResidual };
 // Fully scaled FP16 weights and activations; FP32 accumulation in K16 order.
 template<int BM, int BN, int WM, int WN, gufo::core::GgmlType Type,
          HalfEpilogue Epilogue, bool Complete = false,
-         gufo::core::GgmlType UpType = Type, int BKDepth = 4>
+         gufo::core::GgmlType UpType = Type, int BKDepth = 4,
+         int Ablate = 0>
 __launch_bounds__(WM * WN * 32) __global__
     void HalfPrefillGemmKernel(const void* __restrict__ w,
                                const short* __restrict__ x,
@@ -531,14 +532,16 @@ __launch_bounds__(WM * WN * 32) __global__
   fetch(0);
   for (int ks0 = 0; ks0 < ksteps; ks0 += BK) {
     PC_START();
-    commit();
+    if constexpr ((Ablate & 2) == 0) commit();
     PC_END(pc_commit);
     PC_START();
-    __syncthreads();
+    if constexpr ((Ablate & 1) == 0) __syncthreads();
     PC_END(pc_barrier);
     PC_START();
-    if (ks0 + BK < ksteps)
-      fetch(ks0 + BK);
+    if constexpr ((Ablate & 4) == 0) {
+      if (ks0 + BK < ksteps)
+        fetch(ks0 + BK);
+    }
     PC_END(pc_fetch);
     PC_START();
 #pragma unroll
@@ -579,7 +582,7 @@ __launch_bounds__(WM * WN * 32) __global__
     }
     PC_END(pc_loop);
     PC_START();
-    __syncthreads();
+    if constexpr ((Ablate & 1) == 0) __syncthreads();
     PC_END(pc_barrier);
   }
 #if defined(GUFO_FP16_PROTO_CLOCK)
