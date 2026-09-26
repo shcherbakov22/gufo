@@ -2605,3 +2605,44 @@ different and much worse loop for that instantiation. Until a no-barrier arm beh
 -- that would mean the 16.5% is recoverable and the ceiling is higher still. Conversely,
 any claim that fp16 prefill is at its ceiling is now dead: the measured MMA-only rate at
 this exact shape is 49.80 TF while the shipped kernel runs at 40.45.
+
+### The 16.5% is the LDS fragment feed, not the barriers
+
+The previous probe could not separate the two because its no-barrier arm came out 2x
+slower than the barrier version, which is impossible for a barrier. That arm is discarded
+and replaced by one holding the barriers constant while the fragment feed is removed, so
+the two terms become a clean difference:
+
+| arm | median ms | TFLOPS | vs control |
+| --- | ---: | ---: | ---: |
+| production control A | 9.055 | 40.32 | -- |
+| pure K loop: LDS feed + barriers | 8.927 | 40.90 | +1.4% |
+| pure K loop: no LDS feed, barriers kept | 7.536 | 48.44 | +16.8% |
+| MMA only, no barriers | 7.424 | 49.17 | +18.0% |
+| production control B | 8.969 | 40.70 | +0.9% |
+
+Because arms 2 and 3 differ only in the fragment feed, and arms 3 and 4 only in the
+barriers, the gap decomposes without ambiguity:
+
+| term | cost | share of the 16.5% |
+| --- | ---: | ---: |
+| LDS fragment feed | 1.391 ms | **15.2%** |
+| the two `s_barrier`s per stage | 0.112 ms | **1.2%** |
+| decode + commit + global fetch | ~0.13 ms | ~1.4% |
+
+**The barriers are essentially free and the staging is essentially free. The entire
+remaining fp16 gap is the LDS fragment feed.** This also retires the \"barriers cost 6.8%\"
+figure from the old sequential harness; measured interleaved, at the production shape, the
+two barriers per stage cost 1.2%.
+
+That is consistent with the arithmetic: the feed moves ~24 KiB per stage per CU against an
+LDS that can move megabytes in the same window, so it is not bandwidth. It is the
+latency/issue pattern of the fragment loads -- 12 `ds_load_b128` per sub-stage feeding 8
+MMAs, with 21 `s_waitcnt` per stage -- and the two swizzles that shape it have never been
+touched: the `^ (ks & 3)` row-index xor, and the `(row ^ (row >> 2)) & 1` uint4 ordering
+inside `LoadSwizzled`. Those, plus prefetching the next sub-stage's fragments into registers
+across sub-stages, are now the only fp16 levers left, and they are all inside this 15.2%.
+
+**Falsifier: a K-loop variant that keeps the LDS feed and beats 40.90 TF** -- i.e. that
+closes part of the 15.2% -- or an arm showing the feed can be made free, which would put the
+fp16 ceiling back above 48 TF.

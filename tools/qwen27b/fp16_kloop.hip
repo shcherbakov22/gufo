@@ -44,20 +44,20 @@ __global__ void __launch_bounds__(1024) PureKernel(
     cb[i] = (_Float16)(8 - i);
   }
   for (int ks0 = 0; ks0 < ksteps; ks0 += PBK) {
-    if constexpr (Mode == 0) __syncthreads();
+    if constexpr (Mode == 0 || Mode == 3) __syncthreads();
 #pragma unroll
     for (int ks = 0; ks < PBK; ++ks) {
       gufo::hip::v16bf a[PWRS];
 #pragma unroll
       for (int i = 0; i < PWRS; ++i)
-        a[i] = Mode == 2
+        a[i] = Mode >= 2
                    ? ca
                    : gufo::hip::LoadSwizzled(
                          &s_a[ks][wr * PWRS + i][sl ^ (ks & 3)][0]);
 #pragma unroll
       for (int j = 0; j < PWTS; ++j) {
         const gufo::hip::v16bf b =
-            Mode == 2 ? cb
+            Mode >= 2 ? cb
                       : gufo::hip::LoadSwizzled(
                             &s_b[ks][wt * PWTS + j][sl ^ (ks & 3)][0]);
 #pragma unroll
@@ -69,7 +69,7 @@ __global__ void __launch_bounds__(1024) PureKernel(
     // from being hoisted out of the stage loop.
     if (ks0 == 0x40000000)
       (&s_b[0][0][0][0])[tid & 15] = (short)acc[0][0][0];
-    if constexpr (Mode == 0) __syncthreads();
+    if constexpr (Mode == 0 || Mode == 3) __syncthreads();
   }
   unsigned row_tile = blockIdx.y, token_tile = blockIdx.x;
   {
@@ -112,8 +112,9 @@ void LaunchPure(const void* w, const short* x, float* y, int batch, int m,
 }
 
 constexpr int kArms = 5;
-const char* kNames[kArms] = {"ctrl A", "pure K loop +bar",
-                             "pure K loop -bar", "MMA only", "ctrl B"};
+const char* kNames[kArms] = {"ctrl A", "K loop: LDS +bar",
+                             "K loop: no LDS +bar", "MMA only -bar",
+                             "ctrl B"};
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -151,7 +152,7 @@ int main(int argc, char** argv) {
         switch (a) {
           case 0: LaunchProd(w, (const short*)x, (float*)y, batch, m, k); break;
           case 1: LaunchPure<0>(w, (const short*)x, (float*)y, batch, m, k); break;
-          case 2: LaunchPure<1>(w, (const short*)x, (float*)y, batch, m, k); break;
+          case 2: LaunchPure<3>(w, (const short*)x, (float*)y, batch, m, k); break;
           case 3: LaunchPure<2>(w, (const short*)x, (float*)y, batch, m, k); break;
           case 4: LaunchProd(w, (const short*)x, (float*)y, batch, m, k); break;
         }
