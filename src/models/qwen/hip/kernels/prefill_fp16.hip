@@ -215,6 +215,12 @@ __device__ __forceinline__ gufo::hip::QuantSub16 DecodeRaw(
   return q;
 }
 
+#if defined(GUFO_FP16_PROTO_CLOCK)
+// Phase accumulators written by block (0,0) thread 0: commit, barrier,
+// fetch, K loop -- in GPU clock cycles, summed over every stage.
+__device__ unsigned long long g_proto_clock[8];
+#endif
+
 enum class HalfEpilogue { kStore, kSwiGLU, kGateUp, kResidual };
 
 // Fully scaled FP16 weights and activations; FP32 accumulation in K16 order.
@@ -501,12 +507,28 @@ __launch_bounds__(WM * WN * 32) __global__
       }
     }
   };
+#if defined(GUFO_FP16_PROTO_CLOCK)
+  unsigned long long pc_commit = 0, pc_barrier = 0, pc_fetch = 0, pc_loop = 0;
+  unsigned long long pc_t0 = 0;
+#define PC_START() pc_t0 = clock64()
+#define PC_END(acc) (acc) += clock64() - pc_t0
+#else
+#define PC_START()
+#define PC_END(acc)
+#endif
   fetch(0);
   for (int ks0 = 0; ks0 < ksteps; ks0 += BK) {
+    PC_START();
     commit();
+    PC_END(pc_commit);
+    PC_START();
     __syncthreads();
+    PC_END(pc_barrier);
+    PC_START();
     if (ks0 + BK < ksteps)
       fetch(ks0 + BK);
+    PC_END(pc_fetch);
+    PC_START();
 #pragma unroll
     for (int ks = 0; ks < BK; ++ks) {
       v16bf a[WRS];
@@ -543,8 +565,21 @@ __launch_bounds__(WM * WN * 32) __global__
       // decoders retain the compiler's default instruction schedule.
       __builtin_amdgcn_iglp_opt(0);
     }
+    PC_END(pc_loop);
+    PC_START();
     __syncthreads();
+    PC_END(pc_barrier);
   }
+#if defined(GUFO_FP16_PROTO_CLOCK)
+  if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+    g_proto_clock[0] = pc_commit;
+    g_proto_clock[1] = pc_barrier;
+    g_proto_clock[2] = pc_fetch;
+    g_proto_clock[3] = pc_loop;
+  }
+#undef PC_START
+#undef PC_END
+#endif
 
   // Orient WMMA output as [token][row] for coalesced direct stores. IQ3_S
   // keeps the original orientation and LDS transpose, which is faster for

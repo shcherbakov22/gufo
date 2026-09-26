@@ -769,6 +769,54 @@ ISA and occupancy reaches 100% of the 48.3 TFLOPS ceiling, while the real kernel
 reaches 64-66% with no unit saturated. Acting on that needs stall data this ASIC
 does not expose.
 
+### In-kernel clock instrumentation: the phase breakdown
+
+Since the ASIC exposes no stall counters and rocprofv3 cannot sample PCs, the
+kernel is instrumented directly. `prefill_fp16.hip` under
+`-DGUFO_FP16_PROTO_CLOCK` wraps each stage phase in `clock64()` and accumulates
+four per-block totals into a `__device__` array, which the host reads with
+`hipMemcpyFromSymbol`. Zero cost when the macro is off (verified: default build
+unaffected). The scratch driver is ~150 lines and lives outside the repo.
+
+Block (0,0) of Q4_K at gate/up m=17408 k=5120 batch 2048, cycles and share of
+the estimated block lifetime (wall time / 28 sequential blocks per CU):
+
+| phase | cycles | share |
+| --- | ---: | ---: |
+| `commit()` (registers to LDS) | 65,846 | 6.4% |
+| `__syncthreads()` x2 | 75,590 | 7.4% |
+| `fetch()` (global loads + decode) | 24,339 | 2.4% |
+| K loop (LDS reads + 8 WMMA per step) | ~474k-639k | 46-62% |
+| **unaccounted** | **~380k** | **~37%** |
+
+The unaccounted third is the interesting part, and it is not the epilogue: the
+store ablation already showed that costs nothing measurable. The candidates are
+block launch and drain, the partial last round of the grid (544 blocks over 20
+CUs leaves 4 blocks in round 28 with 16 CUs idle), LDS init at block start, and
+the initial `fetch(0)` plus its `commit()`. Twenty-eight rounds x per-block
+fixed overhead would land exactly here.
+
+That is a different lead from everything tried so far: it says a large part of
+the deficit may not be in the kernel body at all, but in how the grid executes.
+It is directly testable with the same instrument -- record `clock64()` at the
+top of the kernel and at the end of the epilogue, and compare one block.s true
+duration against wall_time / rounds. If the true block duration is well under
+that quotient, the gap is inter-block overhead and the fix is grid shaping
+(fewer, longer-lived blocks) rather than anything inside the K loop.
+
+Instrument caveat: one of the four accumulators comes back wrapped in some runs,
+which is `clock64()` reads being reordered by the compiler rather than a real
+negative duration. The reads need a compiler barrier between them before the
+per-phase numbers are trustworthy to better than a factor check. The shares
+above reproduce across runs for the phases that do not wrap.
+
+And the K loop itself, measured directly here, is the same story as the counters:
+it is 46-62% of the block and it runs at roughly 63% of the MMA rate its own
+instruction stream should sustain. So the deficit is still not explained -- but
+it is now located to a specific phase with a working instrument, and the
+unaccounted third is a concrete, testable alternative to the K loop.
+
+
 
 
 
