@@ -217,8 +217,16 @@ __device__ __forceinline__ gufo::hip::QuantSub16 DecodeRaw(
 
 #if defined(GUFO_FP16_PROTO_CLOCK)
 // Phase accumulators written by block (0,0) thread 0: commit, barrier,
-// fetch, K loop -- in GPU clock cycles, summed over every stage.
+// fetch, K loop -- in GPU clock cycles, summed over every stage. Slots 4 and 5
+// hold that block's start and end timestamps.
 __device__ unsigned long long g_proto_clock[8];
+// The barrier keeps two reads from being commoned up or reordered; without it
+// the compiler is free to fold them and the deltas come back wrapped.
+__device__ __forceinline__ unsigned long long ProtoClock() {
+  unsigned long long value = clock64();
+  asm volatile("" : "+v"(value));
+  return value;
+}
 #endif
 
 enum class HalfEpilogue { kStore, kSwiGLU, kGateUp, kResidual };
@@ -284,6 +292,9 @@ __launch_bounds__(WM * WN * 32) __global__
   const int wr = wave / WN;
   const int wt = wave % WN;
 
+#if defined(GUFO_FP16_PROTO_CLOCK)
+  const unsigned long long proto_block_start = ProtoClock();
+#endif
   unsigned row_tile = blockIdx.y, token_tile = blockIdx.x;
   {
     // Wider row groups improve input reuse for these large projections.
@@ -510,8 +521,8 @@ __launch_bounds__(WM * WN * 32) __global__
 #if defined(GUFO_FP16_PROTO_CLOCK)
   unsigned long long pc_commit = 0, pc_barrier = 0, pc_fetch = 0, pc_loop = 0;
   unsigned long long pc_t0 = 0;
-#define PC_START() pc_t0 = clock64()
-#define PC_END(acc) (acc) += clock64() - pc_t0
+#define PC_START() pc_t0 = ProtoClock()
+#define PC_END(acc) (acc) += ProtoClock() - pc_t0
 #else
 #define PC_START()
 #define PC_END(acc)
@@ -681,6 +692,12 @@ __launch_bounds__(WM * WN * 32) __global__
       }
     }
   }
+#if defined(GUFO_FP16_PROTO_CLOCK)
+  if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+    g_proto_clock[4] = proto_block_start;
+    g_proto_clock[5] = ProtoClock();
+  }
+#endif
 }
 
 __global__ void HalfNorm(const float* x, const float* residual,
