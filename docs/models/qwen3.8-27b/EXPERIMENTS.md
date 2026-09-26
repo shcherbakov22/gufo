@@ -3084,3 +3084,61 @@ which is why the decision stands.
 
 **Falsifier: a published quality-first quant whose header is more than ~30% linear, or a
 rotation-based uniform-int4 shard.** Either would reopen the direction.
+
+## Can an operand be shared without LDS? No, and it is an instruction-set fact
+
+The 64 KiB LDS budget is the single constraint behind every blocked fp16 lever (BK=8, stride
+padding, two CTAs per CU, warp specialisation, LDS-resident tables). If an operand could be
+distributed between warps in registers, all of them would open at once. The capability
+survey had already flagged two RDNA lane-exchange instructions as available and unused, so
+this was the one remaining hardware question.
+
+**Every lane-exchange instruction exists on gfx1151.** Compiled and encoded, not assumed:
+
+| instruction | status | scope |
+| --- | --- | --- |
+| `v_permlane16_b32` | encodes | within a 16-lane group, one wave |
+| `v_permlane16_swap_b32` | encodes | swaps the two 16-lane halves |
+| `v_permlane32_swap_b32` | encodes | swaps the two 16-lane halves |
+| `ds_swizzle_b32` | encodes | cross-lane, **routed through LDS** |
+| `v_mov_b32_dpp` | encodes | within a row, one wave |
+
+**They are all intra-warp.** That is the whole answer. The A fragment is shared across 4
+warps and the B fragment across 8, so the sharing this kernel needs is inter-warp -- the one
+thing none of these can do. There is no cross-warp register path on the hardware, and the
+only instruction that crosses lanes at full width, `ds_swizzle_b32`, does it *by way of LDS*.
+
+One apparent opening looked worth chasing and is closed. The ISA shows every
+`v_wmma_f32_16x16x16_f16` taking three 8-VGPR operands, so the A operand is 16 halves per
+lane = 1024 B for a 512 B matrix -- 2x duplication, exactly what `LoadSwizzled` produces by
+having lanes 0-15 and 16-31 read the same rows. If the upper half-warp's registers were
+ignored the fragment load could drop from two `ds_load_b128` to one.
+
+`tools/qwen27b/mma_operand_scope.hip` answers that, and because it is a correctness question
+the answer is exact -- zero the upper half-warp's operands and bit-compare the accumulator:
+
+| case | differing values of 256 |
+| --- | ---: |
+| baseline (self-comparison) | 0 |
+| A upper half-warp zeroed | **128** |
+| B upper half-warp zeroed | **128** |
+| both | 128 |
+
+So all 32 lanes' operand registers are consumed. The duplication is the layout the
+instruction wants, and the distinct bytes read -- 512 B per fragment, six per sub-stage, 48
+`ds_load_b128` per warp per stage -- are already the matrix size, which is the minimum.
+
+**Conclusion: the LDS wall is architectural, not budgetary.** LDS is the only inter-warp
+operand path, so every scheme that needs to share an operand must pay LDS, and the fragment
+feed is already at its data floor. That closes the question that the whole fp16 search kept
+running into, and it closes it the right way -- by instruction-set fact rather than by having
+run out of ideas.
+
+One residue is left unbuilt and deliberately so: `v_permlane32_swap_b32` could let the two
+half-warps read *different* halves of each row, replacing two `ds_load_b128` with one plus a
+permute, halving the LDS instruction count at constant traffic. It is not worth building --
+the request-count experiment reduced LDS requests 4x and measured *slower*, so request count
+is known not to track time here.
+
+**Falsifier: a cross-warp register exchange on gfx1151 that does not use LDS.** The table
+above is exhaustive over the instructions the assembler accepts.
