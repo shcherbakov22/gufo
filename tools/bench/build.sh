@@ -71,7 +71,8 @@ for t in "${targets[@]}"; do
   # Host-side quant helpers (QuantizedRowBytes and friends) live in one TU.
   host_sources=()
   if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ||
-        "$src" -ef tools/qwen27b/prefill_fp16_bench.hip ]]; then
+        "$src" -ef tools/qwen27b/prefill_fp16_bench.hip ||
+        "$src" -ef tools/qwen27b/prefill_bk_bench.hip ]]; then
     host_sources+=(src/core/quant/ggml_dequant.cpp)
   fi
   if ((${#native_sources[@]})) || ((${#host_sources[@]})); then

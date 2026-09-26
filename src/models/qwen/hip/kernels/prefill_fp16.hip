@@ -234,7 +234,7 @@ enum class HalfEpilogue { kStore, kSwiGLU, kGateUp, kResidual };
 // Fully scaled FP16 weights and activations; FP32 accumulation in K16 order.
 template<int BM, int BN, int WM, int WN, gufo::core::GgmlType Type,
          HalfEpilogue Epilogue, bool Complete = false,
-         gufo::core::GgmlType UpType = Type>
+         gufo::core::GgmlType UpType = Type, int BKDepth = 4>
 __launch_bounds__(WM * WN * 32) __global__
     void HalfPrefillGemmKernel(const void* __restrict__ w,
                                const short* __restrict__ x,
@@ -245,7 +245,8 @@ __launch_bounds__(WM * WN * 32) __global__
   constexpr bool Mixed = Paired && Type != UpType;
   constexpr bool UpRaw = UpType == gufo::core::GgmlType::kQ4_K ||
                          UpType == gufo::core::GgmlType::kQ5_K;
-  constexpr int BK = 4, WaveSize = 32;
+  constexpr int BK = BKDepth, WaveSize = 32;
+  static_assert(BK >= 1 && BK <= 4, "BKDepth out of range");
   // A 256-weight Q5 block spans four K64 iterations. Keep its header in
   // registers for the Q5 and Q4/Q5 kernels that benefit from this reuse.
   constexpr bool CacheQ5Header =

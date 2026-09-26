@@ -1074,6 +1074,67 @@ has plenty of multiply throughput; what it lacks is a way to overlap the staging
 that feeds it. The fp16 instruction.s 48-52 TFLOPS is its own ceiling, and the
 same silicon does 105 TFLOPS on int4, which is the only door left.
 
+### LDS efficiency, taken to the end: the last axis is BK
+
+The open question was whether LDS *use* could be made more efficient, as opposed
+to merely being under-utilised. Every axis except one was already pinned:
+
+| axis | state | evidence |
+| --- | --- | --- |
+| footprint | exact, no padding | `s_a`/`s_b` are precisely `BM*BK*16`/`BN*BK*16` halves |
+| bandwidth | about 6% of the port | 5.2 MB written per block; 0.75 reads per MMA |
+| transaction width | maximal | `ds_read_b128`/`ds_write_b128` throughout |
+| bank conflicts | zero | `SQC_LDS_BANK_CONFLICT` ~ 0; constant-payload test flat |
+| fragment ratio | 0.75 loads per MMA | `(WRS+WTS)/(WRS*WTS)` at `(2,4)` |
+
+The one axis never swept was **BK**, which had been hardcoded to 4. It is an LDS
+axis: `BK*(BM+BN)*32 = 64 KiB` exactly at 256x256, so `BK` is what the 64 KiB
+buys. Making it a template parameter (`BKDepth`, defaulted to 4, so production is
+bit-identical) and sweeping it, Q4_K, M=17408 K=5120 batch=2048, three passes:
+
+| variant | tile | BK | VGPRs | spill | LDS | blocks/CU | ms |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | 256x256 w8n4 | 4 | 192 | 0 | 65536 | 1 | **12.22** |
+| 1 | 128x256 w4n4 | 2 | 191 | 0 | 24576 | 2 | 14.14 |
+| 2 | 128x256 w4n4 | 4 | 256 | 4 | 49152 | 1 | 13.90 |
+| 3 | 128x256 w4n8 | 2 | 135 | 0 | 24576 | 2 | 18.77 |
+| 4 | 256x256 w8n4 | 2 | 191 | 0 | 32768 | 1 | 14.30 |
+
+All five are numerically exact (`mismatch=0`), so halving the stage depth is
+correct; it is simply slower.
+
+Three readings, and the first is the one that matters:
+
+1. **Variant 4 vs 0 isolates the stage count.** Same tile, same 1024 threads,
+   same VGPR count, same fragment ratio, same one block per CU; the only
+   difference is 160 stages instead of 80. **Halving BK costs 17%.** Fitting
+   `T = T_k + N*c` to the two points gives `c ~ 26 us` per 80 stages, so the
+   per-stage overhead is real and large. Extrapolating the same line, `BK=8`
+   (40 stages) would be about 8.5% faster -- which is the price the 64 KiB LDS
+   cap is charging, and it is an estimate, not a measurement, because LDS cannot
+   hold a `BK=8` stage at this tile.
+2. **The second resident block buys nothing.** Variant 1 is the configuration
+   the earlier chain said would be needed to hide the drain: 24 KiB of LDS, two
+   blocks per CU, 8 waves per SIMD, *and the same 0.75 loads per MMA as
+   production*. It still loses 16%. Compared against variant 2, which is the same
+   tile and thread count at `BK=4` with one block per CU, the extra block is
+   worth less than the doubled stage count costs: 14.14 against 13.90. Step 5 of
+   the chain above is now measured, not argued -- the overlap does not pay for
+   the extra stage boundaries, even without the fragment-ratio penalty that
+   disqualified 128x128.
+3. **The fragment ratio is a strong lever and 0.75 is its floor here.** Variant 3
+   is exact and has the second block, and is 54% slower because it reads 1.0 LDS
+   loads per MMA instead of 0.75. LDS reads are on the critical path after all.
+   But at 1024 threads and a 256x256 tile there are exactly 8 MMAs per wave, so
+   the feasible splits are `(1,8),(2,4),(4,2),(8,1)` and `0.75` is the minimum
+   of that set. The `0.5` split needs 16 accumulators, 256 VGPRs, and spills --
+   variant 2 is what that looks like.
+
+So LDS use is not improvable on any axis, and the reason is not that LDS is
+fast: it is that **BK is the parameter LDS capacity buys, and the kernel is
+already spending all 64 KiB on the largest BK that fits.** The residual overhead
+is rent on that ceiling.
+
 
 
 
