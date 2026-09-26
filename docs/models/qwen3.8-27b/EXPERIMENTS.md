@@ -816,7 +816,64 @@ instruction stream should sustain. So the deficit is still not explained -- but
 it is now located to a specific phase with a working instrument, and the
 unaccounted third is a concrete, testable alternative to the K loop.
 
+### The cause: the K loop is optimal, the block overheads are not overlapped
 
+The clock instrument settles it. Q4_K, gate/up, m=17408 k=5120 batch 2048,
+544 blocks over 28 rounds of 20 CUs:
+
+| | cycles | share of block |
+| --- | ---: | ---: |
+| `commit()` | — | 7.3% |
+| `__syncthreads()` x2 | — | 6.5% |
+| `fetch()` | — | 2.9% |
+| **K loop** | 648,295 | **70.4%** |
+| initial fetch + epilogue | — | 12.9% |
+| true block | 920,230 | 100% |
+| inter-block + tail gap | — | 14.0% of wall |
+
+The decisive arithmetic, all on wall-clock-comparable quantities:
+
+* MACs per block = 256 x 256 x 5120 = 335.5M; x 544 blocks = 1.825e11 MACs.
+* K loop share of wall = 0.704 x 10.33 ms = 7.27 ms.
+* K loop rate = 1.825e11 / 7.27e-3 = **25.1 TMAC/s**.
+* Pure-MMA harness, wall clock, same 8 accumulator chains: 24.2-26.2 TMAC/s.
+
+**The K loop runs at the machine.s MMA peak.** It is not starved, not
+latency-bound, not LDS-bound. Every counter and ablation that pointed at the
+inner loop was pointing at something already at 100%.
+
+The deficit is the other 30%:
+
+* 16.7% is per-stage block work -- `commit()` 7.3%, two barriers 6.5%, `fetch()`
+  2.9%. Forty stages of it, none of it overlapped with anything, because there
+  is exactly one block per CU.
+* 12.9% is the initial fetch plus the store epilogue.
+* 14.0% is wall time that is not block execution at all: block launch and drain
+  between 28 rounds, plus the last round where 544 = 27 x 20 + 4 leaves 16 CUs
+  idle while 4 blocks finish.
+
+That is the whole 34%, and it is consistent with every earlier measurement: the
+tile sweep (smaller tiles lose more per-block reuse than they gain in overlap),
+the flat occupancy curve (the MMA rate does not need more waves), the store
+ablation (the epilogue instructions are not the cost -- they are the *unoverlapped*
+time), and the LDS and decode ablations (the K loop has slack it does not need
+because it is not the limit).
+
+The fix is therefore overlap, not a faster inner loop:
+
+1. **Persistent blocks.** One block per CU that loops over work items removes
+   the launch/drain between rounds and lets one tile.s epilogue overlap the next
+   tile.s fetch. That targets the 14% gap and part of the 12.9%.
+2. **Fewer stages.** The 14% of commit+barrier is per stage; BK=8 would halve
+   it, but BK=4 already fills the 64 KiB LDS budget at BM=BN=256, so this needs a
+   tile that trades reuse for stages -- which the tile sweep says loses.
+3. **The epilogue** is 12.9% and is the largest single non-K-loop item. It is not
+   slow in itself; it is serial with everything else.
+
+So: theoretically fixable, and the target is the ~30% of block time that is not
+the K loop plus the 14% between blocks. The realistic route is a persistent-CTA
+schedule, which is a real kernel change rather than a parameter, and is the first
+direction since the Q2_K fix that has a measured mechanism behind it.
 
 
 
