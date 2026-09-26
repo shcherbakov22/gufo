@@ -2720,6 +2720,40 @@ example a probe where halving the loads approximately halves their cost. Until o
 any attribution of the fp16 gap to a specific loop resource is unsupported, including the
 ones this document records above it.
 
+### The isolated probe is not predictive: batched loads lose 4.7% in the real kernel
+
+Batching every B fragment load ahead of the MMA block -- so none is consumed back to
+back with its own load -- measured **+3.8%** in the pure probe (8.858 against 9.207 ms,
+control spread 2.6%). The same change, gated as ablation 4096 and A/B'd in the production
+kernel, measures **-4.7%**:
+
+| arm | median ms | TFLOPS | vs control |
+| --- | ---: | ---: | ---: |
+| production control A | 8.781 | 41.57 | -- |
+| batched B loads (4096) | 9.195 | 39.70 | **-4.7%** |
+| batched + decode in K loop (5120) | 9.213 | 39.63 | -4.9% |
+| production control B | 8.771 | 41.62 | +0.1% |
+
+With a 0.1% control residual this is not marginal, and the sign has flipped. That is the
+methodological result of this section: **the isolated K-loop probe can falsify a hypothesis
+but cannot predict a production gain.** The probe reproduces the inner loop's instructions
+but not the schedule the compiler produces for the whole kernel, and at 103 instructions for
+32 MMAs that schedule is what sets the time. Every probe-based gain in this document -- the
+fragment-traffic model, the request-rate model, prefetch, batching -- either failed to
+transport or was withdrawn when checked in the kernel.
+
+The practical consequence is that fp16 candidates must be screened by A/B in the production
+kernel behind an ablation bit, using the interleaved harness with its duplicated control,
+and not in the probe. That harness has now shown a 0.1% residual on a 6-round run, which is
+good enough to resolve a 1% effect.
+
+Production is unchanged: the batched path is default-off, and `q4kxl quant equivalence`
+passes.
+
+**Falsifier: a probe arm and a production arm of the same change disagreeing in sign.**
+One such pair now exists above, so the probe is retired as a screen and kept only as a
+source of ISA-level facts.
+
 ### The 4x4 warp split does not transport to the real kernel
 
 The probe's +2.9% was measured on the pure loop. Applied to the production kernel -- same

@@ -584,16 +584,37 @@ __launch_bounds__(WM * WN * 32) __global__
       for (int i = 0; i < WRS; ++i) {
         a[i] = LoadSwizzled(&s_a[ks][(wr * WRS) + i][sl ^ (ks & 3)][0]);
       }
+      // Ablation 4096: batch every B fragment load ahead of the MMA block. In the
+      // shipped order each B fragment is loaded and consumed back to back, so its
+      // load-to-use distance is zero; batching gives all of them the MMA block to
+      // land behind.
+      if constexpr ((Ablate & 4096) != 0) {
+        v16bf bb[WTS];
 #pragma unroll
-      for (int j = 0; j < WTS; ++j) {
-        const v16bf b =
-            LoadSwizzled(&s_b[ks][(wt * WTS) + j][sl ^ (ks & 3)][0]);
+        for (int j = 0; j < WTS; ++j)
+          bb[j] = LoadSwizzled(&s_b[ks][(wt * WTS) + j][sl ^ (ks & 3)][0]);
 #pragma unroll
-        for (int i = 0; i < WRS; ++i) {
-          if constexpr (Type == gufo::core::GgmlType::kIQ3_S)
-            acc[i][j] = WmmaHalf(a[i], b, acc[i][j]);
-          else
-            acc[i][j] = WmmaHalf(b, a[i], acc[i][j]);
+        for (int j = 0; j < WTS; ++j) {
+#pragma unroll
+          for (int i = 0; i < WRS; ++i) {
+            if constexpr (Type == gufo::core::GgmlType::kIQ3_S)
+              acc[i][j] = WmmaHalf(a[i], bb[j], acc[i][j]);
+            else
+              acc[i][j] = WmmaHalf(bb[j], a[i], acc[i][j]);
+          }
+        }
+      } else {
+#pragma unroll
+        for (int j = 0; j < WTS; ++j) {
+          const v16bf b =
+              LoadSwizzled(&s_b[ks][(wt * WTS) + j][sl ^ (ks & 3)][0]);
+#pragma unroll
+          for (int i = 0; i < WRS; ++i) {
+            if constexpr (Type == gufo::core::GgmlType::kIQ3_S)
+              acc[i][j] = WmmaHalf(a[i], b, acc[i][j]);
+            else
+              acc[i][j] = WmmaHalf(b, a[i], acc[i][j]);
+          }
         }
       }
       if constexpr ((Ablate & 4) == 0 && (Ablate & 256) != 0) {

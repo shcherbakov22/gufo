@@ -11,11 +11,12 @@ using gufo::core::GgmlType;
 
 namespace {
 
-// Pure K-loop probe at the production shape (256x256, BK=4, same s_a/s_b layout
-// and swizzle, no decode/commit/global fetch). MWA/MWB are the warp split, so
-// the LDS fragment bytes per MMA, 512*(1/WRS + 1/WTS), can be traded against the
-// number of warps available to hide MMA latency. Mode 3 replaces the fragments
-// with registers to isolate the LDS feed from everything else.
+// Pure K-loop probe, production shape (256x256, BK=4, same s_a/s_b layout and
+// swizzle, no decode/commit/global fetch). Mode 0 is the shipped order, where
+// each B fragment is loaded inside the j loop and used immediately. Mode 6
+// batches all six fragment loads ahead of the MMA block, so every load has the
+// whole MMA block to land behind. Mode 5 reuses one sub-stage's fragments for
+// all four (a schedule probe, semantically wrong). Mode 3 drops the LDS feed.
 constexpr int PBM = 256, PBN = 256, PBK = 4, PKS = 16;
 constexpr int PRS = PBM / 16, PTS = PBN / 16;
 
@@ -49,25 +50,39 @@ __global__ void __launch_bounds__(1024) PureKernel(
     __syncthreads();
 #pragma unroll
     for (int ks = 0; ks < PBK; ++ks) {
-      // Mode 5 reuses one sub-stage's fragments for all four, cutting the LDS
-      // request count 4x to test whether requests or bytes set the feed cost.
       const int lks = (Mode == 5) ? 0 : ks;
-      gufo::hip::v16bf a[WRS];
-#pragma unroll
-      for (int i = 0; i < WRS; ++i)
-        a[i] = Mode == 3
-                   ? ca
-                   : gufo::hip::LoadSwizzled(
-                         &s_a[lks][wr * WRS + i][sl ^ (lks & 3)][0]);
-#pragma unroll
-      for (int j = 0; j < WTS; ++j) {
-        const gufo::hip::v16bf b =
-            Mode == 3 ? cb
-                      : gufo::hip::LoadSwizzled(
-                            &s_b[lks][wt * WTS + j][sl ^ (lks & 3)][0]);
+      gufo::hip::v16bf a[WRS], b[WTS];
+      if constexpr (Mode == 6) {
 #pragma unroll
         for (int i = 0; i < WRS; ++i)
-          acc[i][j] = gufo::hip::WmmaHalf(b, a[i], acc[i][j]);
+          a[i] = gufo::hip::LoadSwizzled(
+              &s_a[lks][wr * WRS + i][sl ^ (lks & 3)][0]);
+#pragma unroll
+        for (int j = 0; j < WTS; ++j)
+          b[j] = gufo::hip::LoadSwizzled(
+              &s_b[lks][wt * WTS + j][sl ^ (lks & 3)][0]);
+#pragma unroll
+        for (int j = 0; j < WTS; ++j)
+#pragma unroll
+          for (int i = 0; i < WRS; ++i)
+            acc[i][j] = gufo::hip::WmmaHalf(b[j], a[i], acc[i][j]);
+      } else {
+#pragma unroll
+        for (int i = 0; i < WRS; ++i)
+          a[i] = Mode == 3
+                     ? ca
+                     : gufo::hip::LoadSwizzled(
+                           &s_a[lks][wr * WRS + i][sl ^ (lks & 3)][0]);
+#pragma unroll
+        for (int j = 0; j < WTS; ++j) {
+          const gufo::hip::v16bf bj =
+              Mode == 3 ? cb
+                        : gufo::hip::LoadSwizzled(
+                              &s_b[lks][wt * WTS + j][sl ^ (lks & 3)][0]);
+#pragma unroll
+          for (int i = 0; i < WRS; ++i)
+            acc[i][j] = gufo::hip::WmmaHalf(bj, a[i], acc[i][j]);
+        }
       }
     }
     if (ks0 == 0x40000000)
@@ -107,16 +122,16 @@ void LaunchProd(const void* w, const short* x, float* y, int batch, int m,
       <<<grid, 1024>>>(w, x, y, batch, m, k, nullptr);
 }
 
-template<int Mode, int MWA, int MWB>
+template<int Mode>
 void LaunchPure(const void* w, const short* x, float* y, int batch, int m,
                 int k) {
   const dim3 grid((batch + 255) / 256, (m + 255) / 256);
-  PureKernel<Mode, MWA, MWB><<<grid, MWA * MWB * 32>>>(w, x, y, batch, m, k);
+  PureKernel<Mode><<<grid, 1024>>>(w, x, y, batch, m, k);
 }
 
 constexpr int kArms = 5;
-const char* kNames[kArms] = {"ctrl A", "LDS 48 req/warp",
-                             "LDS 12 req/warp", "no LDS feed", "ctrl B"};
+const char* kNames[kArms] = {"ctrl A", "shipped order",
+                             "batched loads", "no LDS feed", "ctrl B"};
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -135,7 +150,7 @@ int main(int argc, char** argv) {
   hipMemset(w, 0, rb * m);
   hipMemset(x, 0, (std::size_t)batch * k * 2);
   hipMemset(y, 0, yN * 4);
-  LaunchPure<5, 8, 4>(w, (const short*)x, (float*)y, batch, m, k);
+  LaunchPure<6>(w, (const short*)x, (float*)y, batch, m, k);
   hipError_t e = hipDeviceSynchronize();
   if (e != hipSuccess) {
     std::printf("launch failed: %s\n", hipGetErrorString(e));
@@ -153,9 +168,9 @@ int main(int argc, char** argv) {
         const auto s0 = std::chrono::steady_clock::now();
         switch (a) {
           case 0: LaunchProd(w, (const short*)x, (float*)y, batch, m, k); break;
-          case 1: LaunchPure<0, 8, 4>(w, (const short*)x, (float*)y, batch, m, k); break;
-          case 2: LaunchPure<5, 8, 4>(w, (const short*)x, (float*)y, batch, m, k); break;
-          case 3: LaunchPure<3, 8, 4>(w, (const short*)x, (float*)y, batch, m, k); break;
+          case 1: LaunchPure<0>(w, (const short*)x, (float*)y, batch, m, k); break;
+          case 2: LaunchPure<6>(w, (const short*)x, (float*)y, batch, m, k); break;
+          case 3: LaunchPure<3>(w, (const short*)x, (float*)y, batch, m, k); break;
           case 4: LaunchProd(w, (const short*)x, (float*)y, batch, m, k); break;
         }
         hipDeviceSynchronize();
@@ -171,7 +186,7 @@ int main(int argc, char** argv) {
     std::sort(v.begin(), v.end());
     const double med = v[v.size() / 2];
     if (a == 0) a0 = med;
-    std::printf("%-18s median=%8.3f min=%8.3f max=%8.3f tflops=%6.2f (%+.1f%%)\n",
+    std::printf("%-16s median=%8.3f min=%8.3f max=%8.3f tflops=%6.2f (%+.1f%%)\n",
                 kNames[a], med, v.front(), v.back(), fl / (med * 1e9),
                 100.0 * (a0 - med) / a0);
     std::fflush(stdout);

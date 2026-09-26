@@ -13,9 +13,9 @@ namespace {
 constexpr int kArms = 4;
 // Arms 0 and 3 are the SAME configuration: the gap between them is the
 // residual bias left in the interleaved harness.
-const char* kNames[kArms] = {"ctrl A", "decode in K loop",
-                             "staggered decode", "ctrl B"};
-constexpr int kAbl[kArms] = {0, 512, 1024, 0};
+const char* kNames[kArms] = {"ctrl A", "batched B loads",
+                             "batched + decode in K", "ctrl B"};
+constexpr int kAbl[kArms] = {0, 4096, 5120, 0};
 
 template<int Ablate>
 void Launch(const void* w, const short* x, float* y, int batch, int m, int k) {
@@ -67,8 +67,8 @@ int main(int argc, char** argv) {
       for (int i = 0; i < 4; ++i) {
         switch (a) {
           case 0: ms += Run<0>(w, (const short*)x, (float*)y, batch, m, k, 1); break;
-          case 1: ms += Run<512>(w, (const short*)x, (float*)y, batch, m, k, 1); break;
-          case 2: ms += Run<1024>(w, (const short*)x, (float*)y, batch, m, k, 1); break;
+          case 1: ms += Run<4096>(w, (const short*)x, (float*)y, batch, m, k, 1); break;
+          case 2: ms += Run<5120>(w, (const short*)x, (float*)y, batch, m, k, 1); break;
           case 3: ms += Run<0>(w, (const short*)x, (float*)y, batch, m, k, 1); break;
         }
       }
