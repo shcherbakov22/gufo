@@ -3670,7 +3670,8 @@ path.
 It is not yet determined whether the failure is a layout bug in the ATB pipeline or an
 assumption in the host's reference path, because the vendored example was *modified* rather
 than diagnosed. Either way the conclusion for the split is the same: **the ATB kernel's
-correctness on real weights is unverified**, and that is a prerequisite for the repack rather
+correctness on real weights is unverified** -- SUPERSEDED, see "Resolved: the ATB correctness
+failure was the host's tile geometry" below; the cause was a missing `-w/-y/-z` host argument, and that is a prerequisite for the repack rather
 than an afterthought. The repack can be written, but it cannot be called validated until a
 layout-sensitive test passes.
 
@@ -3708,4 +3709,125 @@ All three preconditions for the NPU path now hold on measured evidence: the GEMM
 our geometry (32.4-32.9 TFLOPS, CPU-reference PASS), it runs concurrently with the iGPU at a
 1.3% cost to the latter, and the format conversion is numerically free. What remains is
 engineering -- the repack, the orchestration, and the row-split on the iGPU side.
+
+## Resolved: the ATB correctness failure was the host's tile geometry
+
+The section above concluded that the ATB layout could not be trusted, because every
+data-dependent probe failed. **That conclusion was wrong, and the cause was our own
+invocation, not the design.**
+
+`gemm_atb_bfp_test.cpp` takes the L1 tile shape as CLI options -- `-w` (m), `-y` (k), `-z`
+(n) -- and defaults all three to **64**. config3 is compiled for `m=128, k=64, n=128`. Every
+run so far omitted those flags, so all three layout functions were handed the wrong tile
+shape:
+
+| layout function | arguments | value used | correct value |
+|---|---|---|---|
+| `layout_A_L1_2x1_8x8block` | L1_block_m, L1_block_k | 64, 64 | **128, 64** |
+| `layout_transpose_L1_1x2_8x8block` | L1_block_k, L1_block_n | 64, 64 | **64, 128** |
+| `layout_inverse_C_L1_2x2_8x8block` | L1_block_m, L1_block_n | 256, 64 | **512, 128** |
+
+The stock all-ones pattern cannot see this, and says so itself: its comment in the test
+explains the values are constant within every L1 sub-tile "so the host-side layout shuffle is
+permutation-invariant on the data". That is why it passed while every other probe failed, and
+why the `ATB_CSET` sweep *appeared* to identify `(4m, n)` as the C tile: it was re-deriving a
+tile from the 64-based geometry, which made a bookkeeping error look like a device property.
+
+The correct invocation leaves the `ATB_CSET` / `ATB_ABLK` defaults alone (they are already
+`(n_aie_rows*m, n)` and 1) and only supplies the geometry:
+
+```
+./atb_bfp_test.exe -x build/<K>.xclbin -i build/<K>.bin -k MLIR_AIE \
+  -M <M> -K <K> -N <N> -w 128 -y 64 -z 128 --warmup 1 --iters 2
+```
+
+**Result -- `M=4096 K=4096 N=2048`, k4096 xclbin:**
+
+| probe | result |
+|---|---|
+| stock (all ones) | PASS |
+| identity (one nonzero per row, total nz = 2048) | **PASS** |
+| ramp (C = j+1 through full K) | PASS |
+| tile-a / tile-b | PASS |
+| pseudo-random A and B | PASS |
+
+**Result -- the real FFN shapes, each on the xclbin compiled for its own K:**
+
+| shape | xclbin | identity | ramp | tile-a/b | pseudo-random |
+|---|---|---|---|---|---|
+| 2048 x 5120 x 17408 (gate/up) | gateupfix | PASS | PASS | PASS | FAIL 1000/1000 |
+| 2048 x 17408 x 5120 (down) | downfix | PASS | PASS | PASS | FAIL 1000/1000 |
+
+So the A shuffle, the B shuffle and the C un-shuffle are all correct at real geometry. The
+only remaining failure is the pseudo-random pattern, and that is **not** a GEMM defect.
+
+## The residual failure is the bfp16 input encoder, proved two ways
+
+Two independent tests isolate it.
+
+**(1) Exactly representable random data.** `ATB_QRAND` uses the *same* mod-29 / mod-31
+pseudo-random patterns, divided by 32 and 64 instead of multiplied by 0.05 and 0.03. Both
+are dyadic rationals with few enough significant bits to be exact in bfp16, so the device's
+inputs equal the host's bit-for-bit. Same structure, same layout, same K:
+
+```
+2048 x 5120 x 17408, ATB_QRAND=1 -> PASS, 32.46 TFLOPS (11246 us)
+```
+
+**(2) A quantization-aware reference.** `ATB_QUANTREF` replaces the reference's A and B with
+the host's *own* `floatToBfp16` -> `bfp16ebs8ToFloat` round trip, regrouped into the
+8-element shared-exponent blocks the device actually sees (for A the shuffled and row-major
+block memberships coincide; for B they do not, so B is regrouped by `(n-column, k-block)`):
+
+```
+2048 x 5120 x 17408, ATB_A_REAL/B_REAL + ATB_QUANTREF -> PASS
+2048 x 5120 x 17408, ATB_A_REAL/B_REAL (unquantized control) -> FAIL 1000/1000, max rel 170%
+```
+
+The device reproduces the reference *exactly* once the reference is computed from the data
+the device was actually given. The GEMM, the accumulation and the C path are correct.
+
+**What the encoder does.** `floatToBfp16` in `block_datatypes/helper.h` keeps `mbits = 7`
+magnitude bits per element with one shared exponent per 8 elements, and rounds by
+**arithmetic right shift** (line 103), i.e. truncation toward -inf, not round-to-nearest.
+Measured on the pseudo-random pattern:
+
+| operand | mean raw | mean quantised | bias | rms err |
+|---|---|---|---|---|
+| A | 4.8e-09 | -0.00323 | **-0.00323** | 0.0039 |
+| B | -0.4091 | -0.41319 | **-0.00404** | 0.0056 |
+
+Both biases are negative, as truncation-toward--inf implies.
+
+**Why it looks catastrophic on this pattern and not on real weights.** The `A_REAL`/`B_REAL`
+pattern is periodic in k with periods 29 and 31, so over the 899-element common period the
+products sum to exactly zero and the true C is only the residual partial sum: sd **0.88**,
+against an individual term scale of ~6.4. The observed device values sit around 6-9. The
+apparent "+6.82 constant offset" is therefore not a DC error -- the encoder's measured biases
+predict a DC of only `K * 0.00323 * 0.00404 = 0.067`. It is the near-perfect cancellation
+being destroyed by a ~0.4% input perturbation, which moves C by an amount comparable to the
+*full uncancelled* sum. A badly conditioned probe, not a broken GEMM. The same encoder on
+real weights adds 0.31% RMS against the paper's own 3% quantiser (see the quality gate above).
+
+## One further defect in the vendored test
+
+`layout_transpose_L1_1x2_8x8block` documents its input as row-major with `rows = K`,
+`cols = N`, but the test's B fill comment says "host B is column-major N x K" and it passes
+`b_col_maj = true` to `verify_stochastic`, which then reads `B[k + col*K]`. All three cannot
+hold at once. We fill B row-major K x N and pass `b_col_maj = false`, the only self-consistent
+combination; it is what passes on random data with the correct geometry. As with the tile
+shape, the all-ones pattern is invariant to this too, so the shipped test never exercised it.
+
+## What this does and does not establish
+
+Established: the ATB config3 GEMM computes correctly at our real FFN geometry -- layout,
+accumulation and writeback all verified against a CPU reference on data that is not
+permutation-invariant, at 32.4-32.9 TFLOPS. The earlier "correctness unverified" caveat is
+retracted; the repack is not blocked on the kernel.
+
+Not established, and the falsifier for the above: every probe so far is synthetic. The
+strongest test is the one the repack needs anyway -- feed real IQ3_XXS `blk.0.ffn_gate.weight`
+and `blk.0.ffn_down.weight` through the same host path and compare against a float reference.
+That would exercise the encoder on the actual weight distribution rather than a constructed
+one, and it is the next step regardless of this result.
 
