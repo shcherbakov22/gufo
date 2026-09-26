@@ -11,65 +11,65 @@ using gufo::core::GgmlType;
 
 namespace {
 
-// Pure K-loop ceiling probe at the production shape: 256x256, w8n4, BK=4,
-// same s_a/s_b layout and the same swizzle. No decode, no commit, no global
-// fetch. Mode 0 keeps the two barriers per stage, mode 1 drops them, and
-// mode 2 holds the fragments in registers so no LDS traffic remains.
+// Pure K-loop probe at the production shape (256x256, BK=4, same s_a/s_b layout
+// and swizzle, no decode/commit/global fetch). MWA/MWB are the warp split, so
+// the LDS fragment bytes per MMA, 512*(1/WRS + 1/WTS), can be traded against the
+// number of warps available to hide MMA latency. Mode 3 replaces the fragments
+// with registers to isolate the LDS feed from everything else.
 constexpr int PBM = 256, PBN = 256, PBK = 4, PKS = 16;
 constexpr int PRS = PBM / 16, PTS = PBN / 16;
-constexpr int PWRS = PRS / 8, PWTS = PTS / 4;
 
-template<int Mode>
+template<int Mode, int MWA = 8, int MWB = 4>
 __global__ void __launch_bounds__(1024) PureKernel(
     const void* __restrict__, const short* __restrict__,
     float* __restrict__ y, int batch, int m, int k) {
+  constexpr int NT = MWA * MWB * 32;
+  constexpr int WRS = PRS / MWA, WTS = PTS / MWB;
   __shared__ short s_a[PBK][PRS][16][PKS];
   __shared__ short s_b[PBK][PTS][16][PKS];
   const int tid = (int)threadIdx.x;
   const int wave = tid / 32, lane = tid % 32, sl = lane & 15;
-  const int wr = wave / 4, wt = wave % 4;
+  const int wr = wave / MWB, wt = wave % MWB;
   {
     const int na = PBK * PRS * 16 * PKS, nb = PBK * PTS * 16 * PKS;
-    for (int i = tid; i < na; i += 1024)
+    for (int i = tid; i < na; i += NT)
       (&s_a[0][0][0][0])[i] = (short)((i & 15) - 8);
-    for (int i = tid; i < nb; i += 1024)
+    for (int i = tid; i < nb; i += NT)
       (&s_b[0][0][0][0])[i] = (short)((i & 15) - 8);
   }
   __syncthreads();
   const int ksteps = k / 16;
-  gufo::hip::v8f acc[PWRS][PWTS] = {};
+  gufo::hip::v8f acc[WRS][WTS] = {};
   gufo::hip::v16bf ca, cb;
   for (int i = 0; i < 16; ++i) {
     ca[i] = (_Float16)(i - 8);
     cb[i] = (_Float16)(8 - i);
   }
   for (int ks0 = 0; ks0 < ksteps; ks0 += PBK) {
-    if constexpr (Mode == 0 || Mode == 3) __syncthreads();
+    __syncthreads();
 #pragma unroll
     for (int ks = 0; ks < PBK; ++ks) {
-      gufo::hip::v16bf a[PWRS];
+      gufo::hip::v16bf a[WRS];
 #pragma unroll
-      for (int i = 0; i < PWRS; ++i)
-        a[i] = Mode >= 2
+      for (int i = 0; i < WRS; ++i)
+        a[i] = Mode == 3
                    ? ca
                    : gufo::hip::LoadSwizzled(
-                         &s_a[ks][wr * PWRS + i][sl ^ (ks & 3)][0]);
+                         &s_a[ks][wr * WRS + i][sl ^ (ks & 3)][0]);
 #pragma unroll
-      for (int j = 0; j < PWTS; ++j) {
+      for (int j = 0; j < WTS; ++j) {
         const gufo::hip::v16bf b =
-            Mode >= 2 ? cb
+            Mode == 3 ? cb
                       : gufo::hip::LoadSwizzled(
-                            &s_b[ks][wt * PWTS + j][sl ^ (ks & 3)][0]);
+                            &s_b[ks][wt * WTS + j][sl ^ (ks & 3)][0]);
 #pragma unroll
-        for (int i = 0; i < PWRS; ++i)
+        for (int i = 0; i < WRS; ++i)
           acc[i][j] = gufo::hip::WmmaHalf(b, a[i], acc[i][j]);
       }
     }
-    // A write the compiler cannot prove dead keeps the invariant LDS reads
-    // from being hoisted out of the stage loop.
     if (ks0 == 0x40000000)
       (&s_b[0][0][0][0])[tid & 15] = (short)acc[0][0][0];
-    if constexpr (Mode == 0 || Mode == 3) __syncthreads();
+    __syncthreads();
   }
   unsigned row_tile = blockIdx.y, token_tile = blockIdx.x;
   {
@@ -84,11 +84,11 @@ __global__ void __launch_bounds__(1024) PureKernel(
   const int r_block = (int)row_tile * PBM, t_block = (int)token_tile * PBN;
   const int hi = lane / 16;
 #pragma unroll
-  for (int i = 0; i < PWRS; ++i)
+  for (int i = 0; i < WRS; ++i)
 #pragma unroll
-    for (int j = 0; j < PWTS; ++j) {
-      const int row = r_block + ((wr * PWRS + i) * 16) + sl;
-      const int t0 = t_block + ((wt * PWTS + j) * 16);
+    for (int j = 0; j < WTS; ++j) {
+      const int row = r_block + ((wr * WRS + i) * 16) + sl;
+      const int t0 = t_block + ((wt * WTS + j) * 16);
 #pragma unroll
       for (int l = 0; l < 8; ++l)
         y[std::size_t(t0 + 2 * l + hi) * m + row] = acc[i][j][l];
@@ -104,17 +104,16 @@ void LaunchProd(const void* w, const short* x, float* y, int batch, int m,
       <<<grid, 1024>>>(w, x, y, batch, m, k, nullptr);
 }
 
-template<int Mode>
+template<int Mode, int MWA, int MWB>
 void LaunchPure(const void* w, const short* x, float* y, int batch, int m,
                 int k) {
   const dim3 grid((batch + 255) / 256, (m + 255) / 256);
-  PureKernel<Mode><<<grid, 1024>>>(w, x, y, batch, m, k);
+  PureKernel<Mode, MWA, MWB><<<grid, MWA * MWB * 32>>>(w, x, y, batch, m, k);
 }
 
-constexpr int kArms = 5;
-const char* kNames[kArms] = {"ctrl A", "K loop: LDS +bar",
-                             "K loop: no LDS +bar", "MMA only -bar",
-                             "ctrl B"};
+constexpr int kArms = 6;
+const char* kNames[kArms] = {"ctrl A", "32w 8x4 LDS", "16w 4x4 LDS",
+                             "16w 4x4 no LDS", "32w 8x4 no LDS", "ctrl B"};
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -133,7 +132,7 @@ int main(int argc, char** argv) {
   hipMemset(w, 0, rb * m);
   hipMemset(x, 0, (std::size_t)batch * k * 2);
   hipMemset(y, 0, yN * 4);
-  LaunchPure<0>(w, (const short*)x, (float*)y, batch, m, k);
+  LaunchPure<0, 4, 4>(w, (const short*)x, (float*)y, batch, m, k);
   hipError_t e = hipDeviceSynchronize();
   if (e != hipSuccess) {
     std::printf("launch failed: %s\n", hipGetErrorString(e));
@@ -151,10 +150,11 @@ int main(int argc, char** argv) {
         const auto s0 = std::chrono::steady_clock::now();
         switch (a) {
           case 0: LaunchProd(w, (const short*)x, (float*)y, batch, m, k); break;
-          case 1: LaunchPure<0>(w, (const short*)x, (float*)y, batch, m, k); break;
-          case 2: LaunchPure<3>(w, (const short*)x, (float*)y, batch, m, k); break;
-          case 3: LaunchPure<2>(w, (const short*)x, (float*)y, batch, m, k); break;
-          case 4: LaunchProd(w, (const short*)x, (float*)y, batch, m, k); break;
+          case 1: LaunchPure<0, 8, 4>(w, (const short*)x, (float*)y, batch, m, k); break;
+          case 2: LaunchPure<0, 4, 4>(w, (const short*)x, (float*)y, batch, m, k); break;
+          case 3: LaunchPure<3, 4, 4>(w, (const short*)x, (float*)y, batch, m, k); break;
+          case 4: LaunchPure<3, 8, 4>(w, (const short*)x, (float*)y, batch, m, k); break;
+          case 5: LaunchProd(w, (const short*)x, (float*)y, batch, m, k); break;
         }
         hipDeviceSynchronize();
         const auto s1 = std::chrono::steady_clock::now();

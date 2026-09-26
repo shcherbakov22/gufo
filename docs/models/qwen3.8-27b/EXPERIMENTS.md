@@ -2646,3 +2646,47 @@ across sub-stages, are now the only fp16 levers left, and they are all inside th
 **Falsifier: a K-loop variant that keeps the LDS feed and beats 40.90 TF** -- i.e. that
 closes part of the 15.2% -- or an arm showing the feed can be made free, which would put the
 fp16 ceiling back above 48 TF.
+
+### The LDS feed is fragment traffic, and the warp split sets it
+
+Three levers were tried against the 15.2% LDS feed, in the pure K-loop probe.
+
+**Prefetching is neutral.** Holding the next sub-stage's six fragments in registers so
+each load has a full sub-stage of MMAs to land behind: 8.928 ms against 8.944 ms for the
+shipped order. Load-to-use distance is not the cost, so the compiler was already scheduling
+far enough ahead.
+
+**Padding the fragment row stride is impossible.** Rows sit 32 B apart, so rows 0, 4, 8 and
+12 all start on bank 0. Widening the stride to 40 B or 48 B does not just fit badly, it
+does not link: `local memory (81920) exceeds limit (65536)`. The tile already occupies all
+64 KiB, so the bank pattern cannot be changed by padding.
+
+**The warp split is the lever, and the traffic model predicts it exactly.** A fragment
+costs its warp 16 rows x 32 B = 512 B, so the LDS bytes per MMA are
+`512 * (1/WRS + 1/WTS)`. At 32 warps the tile forces WRS=2, WTS=4 -> 384 B/MMA. At 16 warps
+it allows WRS=4, WTS=4 -> 256 B/MMA, a 33% cut:
+
+| arm | median ms | TFLOPS | vs control |
+| --- | ---: | ---: | ---: |
+| production control A | 9.381 | 38.91 | -- |
+| 32 warps, 8x4, LDS feed | 9.415 | 38.77 | -0.4% |
+| 16 warps, 4x4, LDS feed | 9.113 | 40.06 | +2.9% |
+| 16 warps, 4x4, no LDS feed | 7.875 | 46.36 | +16.1% |
+| 32 warps, 8x4, no LDS feed | 7.662 | 47.65 | +18.3% |
+| production control B | 9.184 | 39.75 | +2.1% |
+
+The LDS feed costs 1.753 ms at 32 warps and 1.238 ms at 16 -- **a 29% reduction against
+the 33% the model predicts**, which confirms the feed is fragment traffic and not latency.
+But the no-feed baselines move the other way (7.662 against 7.875): 16 warps are 2.8% worse
+at hiding MMA latency, because the CU has four warps per SIMD instead of eight. The net is
++2.9-3.2%, and the control spread in the same run is 2.1%, so the net is marginal while the
+feed reduction is not.
+
+Trading the other way is blocked: with 32 warps the tile fixes WRS=2, WTS=4, and getting 16
+MMAs per warp would need a 512-row or 512-column tile, which does not fit in 64 KiB. So
+the 64 KiB LDS budget sets the fragment traffic, the barrier count, the BK depth and the
+warp split all at once -- it is the single constraint behind every blocked lever this
+document has recorded.
+
+**Falsifier: applying the 4x4 warp split to the production kernel and beating it by more
+than the ~2% control spread.**
