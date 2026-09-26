@@ -3608,6 +3608,39 @@ evidence for ~30. Note the direction if the slow harness is the truthful one: th
 32.4 TF would be the *faster* engine, and the split worth more than the 1.53x computed from
 40.6 TF. Either way the NPU conclusion is unaffected.
 
+**Resolved: it is the GPU boost clock, and the clock is data-dependent.** Reversing the run
+order removes ramp-up as an explanation -- each binary keeps its own clock regardless of when
+it runs:
+
+| binary | time | steady-state clock | TFLOPS/MHz |
+|---|---|---|---|
+| fp16_bench_ab (zeroed operands) | 9.645 ms | 2622 MHz | 0.01443 |
+| prefill_fp16_bench (real weights) | 11.845 ms | 2141 MHz | 0.01439 |
+
+Efficiency per clock agrees to **0.3%**, so there is no code discrepancy at all: the 26% is
+entirely frequency. This part has three SCLK levels (600 / 1408 / 2900 MHz) and never reaches
+the top one here. Sweeping the weight pattern inside prefill_fp16_bench moves the settled clock
+from 2193 MHz (pattern 0) to 2060 MHz (pattern 2), with the time following, so the clock is
+data-dependent: zeroed operands toggle fewer bits, draw less switching power, and let the part
+boost ~20% higher.
+
+**Consequence: every hand-written bench in this document that zeroes its operands is inflated
+by that boost**, including the 38-40 TF figures for the FFN kernel and the 40.6 TF used to size
+the split earlier. The representative number is the one measured with real weight data:
+**~31-32 TF at the clock real data induces**, which is also what the model-level wall-clock rate
+of 29.7 TF implies. There is no unclaimed 20-30% of iGPU headroom -- the observation that
+started this hunt was an artifact of synthetic data, and so was the "non-FFN GEMMs are slower"
+inference before it.
+
+The same caveat applies to the NPU's 32.4 TFLOPS, whose ATB harness initialises A and B to all
+ones. Whether the NPU's clock is data-dependent was not measured, so the two engines are not
+yet compared on equal footing.
+
+Recomputing the split with the corrected iGPU rate (~31.5 TF under production conditions)
+against the concurrent NPU rate (24.6 TF): balance at t = 24.6/(31.5+24.6) = 0.438, giving
+1.78x on the GEMM and **~1.68x on prefill** rather than 1.53x. On this evidence the NPU is at
+*parity* with the iGPU rather than behind it.
+
 ## The bfp16 quality gate passes on real weights
 
 The one untested risk in the NPU path was bfp16's block exponent. The B operand is stored as
