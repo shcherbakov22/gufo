@@ -2484,3 +2484,46 @@ every parameter that would amortise them is behind the LDS wall. The one move le
 change which warps hold matrix work: a producer/consumer split, so the warps that fetch
 and decode are never the warps the matrix pipe is waiting on. That is a warp-mapping
 rewrite, not a parameter, and it is the next experiment.
+
+### Staggering the decode by warp is also neutralised by the scheduler
+
+If every warp enters the decode together -- they all just passed the same barrier -- the
+matrix pipe starves for the whole block. RDNA3 gives each warp its own PC, so the decode
+can be moved to a warp-dependent sub-stage: `if (ks == (wave & (BK-1))) decode();`. No
+new synchronisation, no extra registers (within one iteration the commit reads `ra` and
+the K loop then overwrites it, so a single buffer suffices).
+
+| arm | median ms | TFLOPS | delta |
+| --- | ---: | ---: | ---: |
+| control A | 8.661 | 42.15 | -- |
+| decode in K loop (512) | 8.791 | 41.53 | -1.5% |
+| staggered decode (1024) | 9.132 | 39.98 | **-5.4%** |
+| control B | 8.754 | 41.70 | -1.1% |
+
+The ISA explains it. `Ablate=1024` has a 229-instruction body against 218, VGPRs 136->153,
+and decode still split `[1, 73, 1]` across the barrier regions versus `[0, 75, 1]` for the
+control. The compiler recognised that the four warp-dependent branches are mutually
+exclusive, merged them back into a single decode block, and sank it below the barrier
+again. The stagger never reached the hardware, and the 11 extra instructions plus 17
+extra VGPRs are the branch overhead that causes the regression.
+
+That is three independent attempts to move the decode off the critical path -- source
+placement inside the K loop, the `iglp_opt` scheduler hint, and per-warp staggering --
+all ISA-verified as no-ops at the machine level. **Per-warp instruction scheduling cannot
+express this overlap**, because the work has to move to *different warps*, not to a
+different point in the same warp's stream. That is exactly what a producer/consumer split
+does, and it is now the only route left rather than a preference.
+
+### The producer/consumer design is forced into one shape
+
+The LDS budget fixes everything else. Overlap requires two LDS slots (producers fill slot
+B while consumers read slot A); at BK=4 one slot is already 64 KiB, so two slots force
+**BK=2** (16 KiB A + 16 KiB B per slot, 2 slots = 64 KiB). The MMA mapping then forces
+the warp split: 256x256 tile / 16x16 fragments = 256 warp-tiles, so 16 consumer warps
+give 16 accumulators each (128 VGPRs, near but under the 192 ceiling) and 16 warps are
+free to produce. No other split works -- 24 consumer warps cannot map a 16-row fragment
+grid. Synchronisation must be LDS arrive/wait counters, because gfx1151 has no named or
+split barriers and a full `s_barrier` is exactly the coupling being removed.
+
+The prize is the whole staging gap: the BK=2 K loop shares the BK=4 floor of 6.16 ms, and
+the 2.6 ms that BK=2 loses today is precisely per-stage staging that overlap would hide.

@@ -496,7 +496,7 @@ __launch_bounds__(WM * WN * 32) __global__
         short* dst = &s_a[ks][placed / 16][placed % 16][0];
         if (Mixed && row % 32 >= 16) {
           commit_up(p, dst, row);
-        } else if constexpr (DecodeStage != 0 && (Ablate & 512) == 0) {
+        } else if constexpr (DecodeStage != 0 && (Ablate & (512 | 1024)) == 0) {
           gufo::hip::QuantSub16 q = DecodeRaw<Type>(raw[p]);
           union {
             v16bf f;
@@ -529,7 +529,7 @@ __launch_bounds__(WM * WN * 32) __global__
   // of in the commit, so the ~90 VALU of Q4_K decode overlap live matrix work
   // rather than running in the post-barrier bubble with the matrix pipe idle.
   const auto decode_ra = [&]() {
-    if constexpr ((Ablate & 512) != 0) {
+    if constexpr ((Ablate & (512 | 1024)) != 0) {
       static_assert(DecodeStage == 2 && !Mixed && !CacheIqHeader &&
                     !CacheQ5Header,
                     "ablation 512 covers only the plain deferred-decode path");
@@ -601,6 +601,13 @@ __launch_bounds__(WM * WN * 32) __global__
       }
       if constexpr ((Ablate & 512) != 0) {
         if (ks == BK / 2 - 1 && ks0 + BK < ksteps) decode_ra();
+      }
+      // Ablation 1024: stagger the decode to a warp-dependent sub-stage.
+      // Each warp has its own PC on RDNA3, so the warps no longer all enter
+      // the decode together after the same barrier and the matrix pipe keeps
+      // being fed by the warps still issuing MMAs.
+      if constexpr ((Ablate & 1024) != 0) {
+        if (ks == (wave & (BK - 1)) && ks0 + BK < ksteps) decode_ra();
       }
     }
     if constexpr ((Ablate & 16) != 0 ||
