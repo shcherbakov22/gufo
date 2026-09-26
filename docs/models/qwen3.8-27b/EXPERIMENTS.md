@@ -2004,43 +2004,52 @@ the epilogue's scalar 2-byte stores are forced by the accumulator fragment layou
 widened without the very transpose IQ3_S already pays for.
 
 
-### Why the plateau is hardware: the only wide MMA on gfx1151 is iu4
 
-The one lever with a 2x label that had never been checked is the WMMA K width.
-Every measurement in this document -- the 48.35 TFLOPS fp16 ceiling, the iu8
-ceiling, every tile sweep -- used `16x16x16`. LLVM declares a `16x16x32` f16
-shape, and a 32-wide K MMA is exactly what makes the iu4 ceiling 2.1x higher, so
-if f16 had one the fp16 path would double. It does not. Checked three ways:
+### gfx1151 capability survey: two corrections, and what is left unused
 
-1. **Device limits** (`hipDeviceGetAttribute`, gfx1151): LDS 65536 B per CU and
-   65536 B per block, 196608 VGPRs per CU, 2048 threads per CU. A `BK=8` stage at
-   256x256 needs `(256+256)*8*32 = 131072` B, so **the earlier "BK=8 cannot
-   exist" claim is now measured rather than assumed** -- it is correct.
-2. **No clang builtin**: every spelling of `__builtin_amdgcn_wmma_f32_16x16x32_f16*`
-   fails to compile, while the 16x16x16 form is accepted.
-3. **The intrinsic is gfx12.5-only.** `int_amdgcn_wmma_f32_16x16x32_f16` is
-   declared inside `defset list<Intrinsic> AMDGPUWMMAIntrinsicsGFX1250` -- RDNA4.
-   gfx1151 is RDNA3.5. The assembler rejects the mnemonic accordingly.
+**I got the int4 mechanism wrong in an earlier revision of this section, and the
+document already had it right.** The 2x int4 ceiling does *not* come from a 32-wide
+MMA. It comes from `wmma_i32_16x16x16_iu4` -- the **same 16x16x16 shape** -- which
+retires about twice the instructions per second of iu8 and carries half-size
+operand fragments (2 VGPRs against 4). `Deferred: INT4 WMMA doubles matrix
+throughput` says exactly this, and the 32-wide `wmma_i32_16x16x32_iu4` is gfx12.
+The claim that `iu4` is "the only wide MMA" was wrong twice over.
 
-What the gfx11 intrinsic set actually offers:
+Verified inventory of what gfx1151 exposes, by compilation and measurement rather
+than by inference:
 
-| shape | f16 | bf16 | iu8 | iu4 |
-| --- | --- | --- | --- | --- |
-| 16x16x16 | yes | yes | yes | yes |
-| 16x16x32 | **no (gfx12.5)** | no | **no** | **yes** |
+| capability | status | evidence |
+| --- | --- | --- |
+| `16x16x16 iu4` MMA (**2x**, the int4 lever) | **available, unused** | compiles: `v_wmma_i32_16x16x16_iu4 v[1:8], v[0:1], v[0:1], v[1:8]` |
+| `16x16x16 f16`, f32 accumulate | available (in use) | `v_wmma_f32_16x16x16_f16` |
+| `16x16x16 f16`, **f16 accumulate** | available, **no faster** | measured **1.02x** f32-acc in an 8-chain loop |
+| `16x16x32 f16` | gfx12.5 only | intrinsic declared in `AMDGPUWMMAIntrinsicsGFX1250` |
+| `16x16x32 iu4`, `16x16x64 iu8`, fp8 / f8f6f4 | gfx12 only | prior section |
+| fp8 conversions (`cvt_pk_fp8_f32`) | gfx12 only | `needs target feature` |
+| `global_load_lds` (VMem -> LDS, no registers) | **not available** | `needs target feature vmem-to-lds` |
+| `s_barrier_signal` / `s_barrier_wait` | **not available** | `needs target feature` |
+| `ds_swizzle_b32` | **available, unused** | compiles |
+| `v_permlane16_b32` | **available, unused** | compiles |
+| VALU int4 dots (`sdot8`/`udot8`) | gfx12 only | prior section |
 
-**So on this silicon the 32-wide MMA exists for int4 and nothing else.** That
-explains both plateaus at once: the fp16 kernel is at the *hardware* f16 ceiling
--- its format-insensitivity, the failed staging levers, and the fact that no
-weight format moves it are all consequences, not mysteries -- and the 2.1x iu4
-ceiling is not a kernel property but the only wide MMA the chip has.
+Device limits, measured with `hipDeviceGetAttribute` on gfx1151: **LDS 65536 B per
+CU and 65536 B per block**, 196608 VGPRs per CU, 2048 threads per CU. A `BK=8`
+stage at 256x256 needs `(256+256)*8*32 = 131072` B, so the "BK=8 cannot exist"
+claim is now **measured rather than assumed** -- it is correct.
 
-The consequence is uncomfortable and worth stating plainly: **the only route to a
-large pp2048 gain on this part is widening how much of the model can use
-`iu4 16x16x32`.** Today that is 15.5% of FLOPs, because eligibility is
-`linear AND <= 4 bits` and the IQ families carry non-linear grid codebooks. Every
-IQ tensor is either already 4-bit (IQ4_XS) or narrower (IQ3_S, IQ3_XXS), so
-widening eligibility means **requantizing those weights onto a linear 4-bit grid**
--- a quality decision, not a kernel one, and the same one the int4 quality work
-was gated on. The fp16 kernel is finished; the remaining question is not how to
-make it faster, but whether the model can afford a different weight format.
+Three conclusions, and only the third is new work:
+
+1. **Nothing in the unused set is a second route to 2x.** F16-accumulate, the one
+   candidate that would have doubled the fp16 path at a precision cost, is 1.02x.
+   The fp16 kernel really is at its hardware ceiling.
+2. **The int4 lever is confirmed available, and confirmed narrow.** It is the same
+   16x16x16 shape, reachable today, and gated entirely by `linearity` of the
+   weight codes -- the eligibility problem, not a kernel problem.
+3. **The one unused primitive with a plausible target is the lane-permute pair.**
+   `ds_swizzle_b32` and `v_permlane16_b32` are available and this engine uses
+   neither. The IQ3_S epilogue -- 34% of fp16 FLOPs -- currently transposes its
+   accumulator through LDS with a `__syncthreads` plus two wave barriers per
+   fragment, precisely because the raw fragment layout cannot be stored
+   contiguously. A shuffle-based transpose is the alternative the hardware still
+   offers there. It is untested, and it is the only thing this survey turned up
+   that is both unused and aimed at a measured cost.
