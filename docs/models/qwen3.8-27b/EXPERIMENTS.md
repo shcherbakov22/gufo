@@ -955,6 +955,45 @@ output mismatches -- while 256x256 agrees with the validated production path.
 `DirectGemm` never selects 128x128, so it has never mattered, but it is a latent
 bug in the small-tile Q6_K path. Recorded, not fixed.
 
+### Corroborating the 70.4%: the peak is the arbiter
+
+The clock instrument is one flaky instrument, so the K-loop share needed an
+independent check. The direct ablation does not work: making the compute loop run
+1..4 of its 4 K steps changes register pressure with the loop bound, so the
+variant at span 1 is a different kernel, not the same kernel minus work. Measured
+in separate binaries (one instantiation each; four in one binary thrashed the
+instruction cache and doubled every number), four interleaved passes:
+
+| K steps per stage | ms |
+| ---: | ---: |
+| 1 | 6.425 |
+| 2 | 6.539 |
+| 3 | 8.026 |
+| 4 (production) | 9.968 |
+
+Those marginal costs are wildly non-uniform -- 0.11 ms for the second step, 1.49
+for the third, 1.94 for the fourth -- which is the confound, not the K loop. A
+naive linear read would put the K loop at about 47% of the runtime.
+
+That reading is impossible, and saying why is the corroboration. The K loop
+performs every MAC by construction: 1.825e11 MACs. A 47% share of 9.97 ms is
+4.69 ms, which is **38.9 TMAC/s** -- above the machine.s measured fp16 WMMA peak
+of 24.2-26.2 TMAC/s, which was itself checked with eight live accumulator chains
+and found flat across the whole occupancy curve. The K loop therefore cannot
+occupy less than 1.825e11 / 26.2e12 = **6.97 ms, or 69.9%** of the runtime. The
+clock instrument says 70.4%. They agree to within half a point, and the two
+methods share no machinery.
+
+So the K loop really is at the MMA peak: the constraint that it cannot exceed the
+measured peak fixes its share at 70%, and at that share its rate is 26.0 TMAC/s,
+right at the ceiling. The remaining 30% is the staging structure and the output
+write, and the ablation.s shape adds one useful detail -- nearly half the K loop.s
+cost lands on the *first* K step of each stage, which is the one that stalls on
+the LDS operands issued after the barrier. The later steps pipeline behind it,
+which is also why manual software pipelining of the operand loads changed
+nothing.
+
+
 
 
 ### Persistent CTAs: bit-exact, and 4% slower
