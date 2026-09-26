@@ -596,6 +596,16 @@ decides between +4% and +40%.
 
 ### Answered: the int8 overhead is instruction issue, not LDS
 
+> **Superseded, and left in place as a warning.** Every instruction count in this
+> section is for `WKQuantA8BlockedWmmaGEMMKernel<128,128,2,4,2,32>` -- the **wave32**
+> control -- not for the wave64 kernel that ships for large-batch prefill. The
+> shipping body runs 9.92 instructions per MMA (31% of issue) and is **stall**-bound,
+> so the two conclusions drawn here (issue-bound, route closed) were aimed at an
+> instantiation production does not use on the shapes that matter. They were reached
+> by measuring a real kernel correctly and then attributing the result to the wrong
+> one. See `int8, closed: the loss is the format, and the production tile is the
+> optimum` at the end of this document.
+
 The in-kernel clock instrumentation that worked for fp16 **does not work here**.
 Repeated runs of the same binary produced K-loop shares of 57%, 76%, 354% and
 726% -- impossible values -- so no phase number from that attempt is reportable.
@@ -1769,7 +1779,8 @@ for the large-batch prefill shapes. The question was whether it could be brought
 nearer its 50.31 TFLOPS instruction ceiling. It cannot, and the residual is not a
 scheduling artifact.
 
-**Correction to the section above.** The earlier verdict that this kernel is
+**Correction to `Answered: the int8 overhead is instruction issue, not LDS`.**
+The earlier verdict that this kernel is
 issue-bound was derived from `WKQuantA8BlockedWmmaGEMMKernel<128,128,2,4,2,32>` at
 26.91 instructions per MMA -- the **wave32** control. That instantiation is only
 reached when the wave64 predicate (`batch >= 96 && m >= 1024 && k >= 1024 &&
@@ -1795,8 +1806,8 @@ same method.
 An `iu8` MMA occupies about 32.5 SIMD-cycles at the measured ceiling. The
 production wave64 body issues 9.92 instructions in that window -- **31% of the
 issue budget** -- while the kernel sits at 48% of its ceiling. It is therefore
-**stall-bound, not issue-bound**, and the spare issue capacity that the section
-above hoped to exploit is already there and already going unused. `fp32/MMA` is
+**stall-bound, not issue-bound**, and the spare issue capacity that that section
+hoped to exploit is already there and already going unused. `fp32/MMA` is
 invariant across every geometry at 6.1-7.9: it is the per-32-block int32 to fp32
 rescale (`v_cvt_f32_i32` into `v_mul_f32` into `v_fma_f32`, per accumulator
 element), and no tile shape or staging depth removes it.
