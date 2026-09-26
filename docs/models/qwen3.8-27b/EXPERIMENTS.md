@@ -2841,3 +2841,46 @@ shard's FLOPs.
 
 **Falsifier: an IQ3_S or IQ3_XXS arm that removes its codebook lookups without adding more
 than the ~8 instructions they cost, and beats 13.72 ms.**
+
+## The held-out metric, run: the int4 activation cost is real, reproducible and small
+
+The int4 recommendation above was to build the held-out metric *before* the kernel, because
+a self-consistency cosine cannot settle \"is 2.0e-2 acceptable\". That metric already
+exists: `qwen27b_target_test <model> <reference>` reports mean KL, total variation, a
+teacher-forced NLL delta and top-1 agreement over 27 logit rows on three fixed prefixes,
+comparing two GGUFs' full 248,320-token distributions. No BF16 target is on disk, so the
+reference is `UD-Q4_K_S` and the candidate is the 3.84 bpw shard; the *differential*
+between the last two rows is the measurement, and one model is resident at a time so it
+fits the 30 GiB box.
+
+| configuration | mean KL | mean TV | mean NLL delta | top-1 |
+| --- | ---: | ---: | ---: | ---: |
+| baseline (production paths) | 0.0147376 | 0.050077 | 0.0061615 | 25/27 |
+| `GUFO_FORCE_Q8_PREFILL=1` (int8 activations) | **0.0147376** | 0.050077 | 0.0061615 | 25/27 |
+| forced q8 + `GUFO_INT4_MIXED=1` | **0.0179338** | 0.055400 | 0.0196409 | **24/27** |
+
+Two results, both exact:
+
+1. **int8 activations cost nothing this instrument can see.** Forcing the q8 path changes the
+   logits to six significant figures -- identical, not merely close.
+2. **Four-bit activations cost a real and reproducible amount.** mean KL +0.0032 (+21.7%),
+   mean NLL delta 3.2x, and one top-1 flip, 25/27 -> 24/27.
+
+**The figure is deterministic.** Run three times, mixed int4 gives 0.0179338 / 24 top-1
+every time and the baseline gives 0.0147376 / 25 every time. That resolves the caveat
+recorded above: the earlier 0.9794 cosine was never shown to be stable, but this KL
+instrument reproduces bit-exactly, so the number may be used.
+
+Reading it: the int4 step is +22% on top of a shard-to-shard difference that is itself
+0.0147 with 2/27 top-1 flips. It is not free -- but it is a fraction of the difference
+between two legitimate quantizations of the same model, and the sample is only 27 rows, so
+the single top-1 flip is one event. Whether that is acceptable is a policy call rather than
+a measurement, but it can now be made on a stable number instead of a cosine.
+
+**The scoping caveat matters more than the number.** `GUFO_FORCE_Q8_PREFILL` changes the
+result by exactly nothing, which means these fixtures never reach the fp16 prefill path at
+all -- they are short teacher-forced rows, so every GEMM runs the q8 route. This therefore
+bounds the cost of four-bit activations on the **short-batch path where int4 is currently
+implemented**, not on the pp2048 fp16 path that holds 78% of the GEMM time. Nothing here
+says what four-bit activations would do to the path where the 2x would actually be taken.
+A fixture of at least 1024 tokens is the prerequisite for that, and it does not exist yet.
