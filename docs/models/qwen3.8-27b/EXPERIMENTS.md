@@ -1849,3 +1849,76 @@ at +398% -- are far outside this floor and stand.
 * `<128,64,4,8,1,Type,32>` (2 blocks/CU, 30 KiB LDS) has never been tuned. With
   `kBN = 64`, a 32-token batch fills half the token tile before anything else is
   considered.
+
+
+## fp16 prefill, measured properly: a verified pp2048 budget
+
+The int8 retraction above ends with a rule: establish that the target is on the
+measured path before optimising it. This is that step for fp16, and it replaces
+the earlier phase estimates in this document, whose in-kernel clock numbers were
+mutually inconsistent with the derived claims.
+
+`rocprofv3 --pmc` over `gufo bench -m Qwen3.8-27B-IQ4_XS-3.84bpw.gguf -p 2048
+-n 1 -r 1`. Kernel timestamps are broken on this box (start == end), but the
+counters are sound, and **`GRBM_COUNT` sums to 9.33e9 cycles = 3.73 s at
+2.49 GHz against a measured 3.86 s wall** -- so the GPU is essentially never idle
+and these shares are the real budget:
+
+| stage | share of GPU-busy cycles |
+| --- | ---: |
+| **fp16 GEMM, all `HalfPrefillGemmKernel<256,256,8,4,...>`** | **78.1%** |
+| int8 GEMM (`<128,64,4,8,1,...>`, the sub-1024-token chunks) | 8.6% |
+| all non-GEMM, fragmented (DeltaNet 2.6%, GEMV 2.8%, attention 1.2%, ...) | ~13% |
+
+For a 2048-token chunk specifically the fp16 share is higher still, because the
+int8 8.6% comes only from the 32- and 16-token chunks. **The fp16 GEMM kernel is
+the prefill.** Nothing else is worth touching until it moves.
+
+### Efficiency by instantiation, and its mechanism
+
+Joining the traced FLOPs per instantiation against the per-instantiation counters
+(`eff = FLOP share / time share`; >1 is faster than the family average):
+
+| type | epilogue | FLOP% | time% | eff | VALU/MFLOP | vgpr | LDS |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| IQ3_S | kStore | 15.44 | 15.57 | 0.99 | 697 | 144 | 65536 |
+| **IQ3_S** | **kResidual** | 11.22 | 12.53 | **0.89** | 681 | 144 | 65536 |
+| IQ3_XXS | kResidual | 11.56 | 12.06 | 0.96 | 637 | 144 | 65536 |
+| IQ3_S | kSwiGLU | 7.32 | 7.91 | 0.93 | 789 | 144 | 65536 |
+| Q4_K | kStore | 8.61 | 7.57 | 1.14 | 482 | 136 | 65536 |
+| IQ3_XXS | kSwiGLU | 6.95 | 7.49 | 0.93 | 744 | 144 | 65536 |
+| IQ3_XXS | kStore | 6.55 | 6.54 | 1.00 | 652 | 144 | 65536 |
+| IQ4_XS | kGateUp | 6.59 | 5.76 | 1.14 | 603 | 192 | 65536 |
+| IQ4_XS | kResidual | 5.38 | 5.04 | 1.07 | 555 | 192 | 65536 |
+| IQ4_XS | kSwiGLU | 5.12 | 5.01 | 1.02 | 658 | 192 | 65536 |
+| IQ4_XS | kStore | 5.15 | 4.60 | 1.12 | 561 | 192 | 65536 |
+| Q3_K | kStore | 3.66 | 3.66 | 1.00 | 704 | 192 | 65536 |
+| Q4_K | kResidual | 3.14 | 2.96 | 1.06 | 478 | 136 | 65536 |
+
+Three things follow, and they replace the earlier account of this kernel:
+
+1. **Efficiency is set by VALU instructions per FLOP**, which is the weight
+   decoder plus the epilogue. Q4_K needs ~480 per MFLOP; the IQ3 family needs
+   637-789, **1.4-1.65x more**, and that ordering reproduces the efficiency
+   ranking. IQ3_S and IQ3_XXS together are **59% of the fp16 FLOPs**.
+2. **Occupancy is identical for every instantiation** -- exactly 65536 B of LDS,
+   one CTA per CU, 32 warps -- so the spread is not occupancy, and there is no
+   spare block anywhere to absorb a stall.
+3. It is **not** LDS-bandwidth or memory bound: `SQC_LDS_BANK_CONFLICT` is
+   0.04-0.11 per LDS op, and `MemUnitBusy` never exceeds 0.3%.
+
+So the kernel is limited by decoder work sitting on the critical path, with the
+64 KiB LDS cap pinning occupancy at one block and the doc's own BK fit charging
+**~26 us per stage boundary, ~17% over the 80 stages**.
+
+### Structural options, with their measured or fitted prizes
+
+| # | change | prize | evidence |
+| --- | --- | ---: | --- |
+| A | cut IQ3 decoder VALU per FLOP | ~5-7% of pp2048 | IQ3 family at 0.89-1.00x against Q4_K's 1.14x on 59% of FLOPs |
+| B | break the 64 KiB cap so BK can reach 8 | ~8.5% of the GEMM | BK=2 vs BK=4 is 17%; the fitted line gives BK=8 |
+| C | remove the `kResidual` read-modify-write | ~1-2% | 31.7% of FLOPs; worst instantiation is IQ3_S kResidual at 0.89x |
+| D | extend gate/up fusion to IQ3_S/IQ3_XXS | ~2% | only 6.6% of FLOPs take the dual path today |
+
+A and B are the structural ones; C and D are narrower. All prizes except the
+0.89x/1.14x spread are extrapolations from the fits above, not measurements.
