@@ -2690,3 +2690,28 @@ document has recorded.
 
 **Falsifier: applying the 4x4 warp split to the production kernel and beating it by more
 than the ~2% control spread.**
+
+### The 4x4 warp split does not transport to the real kernel
+
+The probe's +2.9% was measured on the pure loop. Applied to the production kernel -- same
+tile, same BK, same LDS budget, only WM/WN changed -- it is a clear loss:
+
+| arm | median ms | TFLOPS | vs control |
+| --- | ---: | ---: | ---: |
+| 8x4 control A | 10.320 | 35.38 | -- |
+| 4x4 warp split | 11.337 | 32.20 | **-9.9%** |
+| 8x4 control B | 10.397 | 35.11 | -0.7% |
+
+The two configurations are bit-identical (`max|diff| = 0` over 35,651,584 outputs), so this
+is purely a schedule and occupancy effect, and at 0.7% control spread the -9.9% is solid.
+
+The probe warned, but understated it. Its no-LDS baseline showed 16 warps 2.8% worse at
+hiding MMA latency. The probe has no staging, and the real kernel does: at 512 threads a
+CTA has half as many warps, so the fetch, the decode and the commit have half as many warps
+to hide behind as well. That is the same reason \"staging is nearly free\" was measured at
+1024 threads and only holds there. Losing a third of the fragment traffic is worth about 3%;
+losing half the warps costs about 10%.
+
+**So 8x4 stands, and this closes the warp-split lever.** The falsifier for any future claim
+is the same arm: a 4x4 (or other non-8x4) split beating the production 8x4 kernel on the
+full kernel, not just the inner loop.
