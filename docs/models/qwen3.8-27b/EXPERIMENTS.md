@@ -592,8 +592,49 @@ epilogue, which is exactly what int8 cannot change.
 table applies is not known, because the int8 kernel has never been phase-profiled.
 Its 48% is a fact; whether the missing 52% is a fence/drain that spare LDS can
 absorb, or metadata arithmetic that only a narrower scale format can shrink,
-decides between +4% and +40%. That measurement is the next step, and it is the
-same in-kernel clock instrumentation that closed out the fp16 kernel.
+decides between +4% and +40%.
+
+### Answered: the int8 overhead is instruction issue, not LDS
+
+The in-kernel clock instrumentation that worked for fp16 **does not work here**.
+Repeated runs of the same binary produced K-loop shares of 57%, 76%, 354% and
+726% -- impossible values -- so no phase number from that attempt is reportable.
+The fp16 phase table stands; this kernel's body defeats that technique, and the
+attempt was reverted rather than left in the tree as a trap.
+
+Static ISA analysis is deterministic and answers the question instead. The K-loop
+body of `WKQuantA8BlockedWmmaGEMMKernel<128,128,2,4,2,Q4_K>`, against the fp16
+kernel's:
+
+| | fp16 256x256 bk4 | int8 128x128 bk2 |
+| --- | ---: | ---: |
+| instructions in the loop body | 193 | **861** |
+| WMMAs in the loop body | 32 | 32 |
+| **instructions per MMA** | **6.03** | **26.91** |
+
+**4.5x more instructions per MMA.** The body is 32 WMMA, 40 `ds_load_b128`, 14
+`global_load`, and **572 VALU + 221 SALU**. The fp32 arithmetic inside that is
+`v_cvt_f32_i32` 128, `v_fma_f32` 128, `v_mul_f32` 87, `v_fmac_f32` 83 and
+`v_dual_fmac_f32` 45 -- **471 fp32 operations applying the per-block weight and
+activation scales and the affine offset correction.**
+
+That is the whole story, and it refutes the LDS hypothesis with data:
+
+* the barrier share is the same as fp16 (7.0% against 6.5%) and the commit is
+  *cheaper* (3.7% against 7.3%), so there are no stalls for spare capacity to
+  absorb -- whatever the spare LDS is, nothing is waiting on it;
+* at 26.91 instructions per MMA with about six waves per SIMD, the issue unit is
+  fed roughly **83%** of what it can retire in the ~32.5 cycles an `iu8` MMA
+  occupies per SIMD. The kernel is **issue-bound**, not latency-bound;
+* fp16 at 6.03 instructions per MMA uses about 19% of issue -- that slack is
+  exactly what lets it hold the matrix pipe at 100% while int8 cannot.
+
+So the int8 kernel is not waiting on memory, LDS bandwidth or barriers. It is
+arithmetic-bound, and halving the operand width does not shrink fp32 scale
+application -- which is also why the stage did not halve. Making int8 faster means
+removing per-element operations, not freeing memory; and since the int8 rate
+ceiling is only 4% above fp16's, the return is capped regardless. **The int8
+route is closed on measurement, not on inference.**
 
 
 ## Deferred: Q2_K native prefill (chunked-path eligibility)
