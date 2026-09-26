@@ -2445,3 +2445,42 @@ gfx1151.
 What is left is a producer/consumer split -- warp specialisation -- so that the warps
 that fetch and decode are never the warps holding live matrix work. That is a rewrite of
 the kernel's warp mapping, not a parameter, and it is the next thing to try.
+
+### The decode cannot be moved off the critical path either
+
+The same ISA pass locates the staging precisely. Inside one stage body, the two
+`s_barrier`s split it into regions:
+
+| region | instructions | wmma | decode VALU |
+| --- | ---: | ---: | ---: |
+| before the first barrier | 100 | 30 | **0** |
+| between the barriers | 95 | 2 | **75** |
+| after the second barrier | 23 | 0 | 1 |
+
+So the weight decode is a straight-line block sitting between the publish barrier and
+the next stage's MMAs, with the matrix pipe idle. It is pure register work on `raw`,
+so it is legal to run it inside the *previous* K loop, where the matrix pipe is busy and
+issue is only ~17% occupied. Two ways to ask for that were tried:
+
+| arm | median ms | delta |
+| --- | ---: | ---: |
+| control A | 9.283 | -- |
+| decode moved into the K loop (`Ablate=512`) | 9.421 | **-1.5%** |
+| `__builtin_amdgcn_iglp_opt(0)` (`Ablate=16`) | 9.303 | -0.2% |
+| control B | 9.300 | -0.2% |
+
+**Neither works, and the ISA says why: the decode does not move.** At `Ablate=512` the
+loop body is 216 instructions instead of 218 and the region split is unchanged -- 75
+decode instructions still sit between the barriers and none before the first. The
+AMDGPU machine scheduler treats `s_barrier` as a boundary and re-sinks the register-only
+decode into the post-barrier block even when the source places the call inside the K
+loop. `iglp_opt(0)` is the scheduler hint the other instantiations already use, and it
+is neutral here too. This also re-confirms, on the interleaved harness, the old
+sequential verdict that `iglp_opt` was neutral for Q4_K.
+
+The consequence is that the ~19% staging gap is not reachable from the source. The
+schedule is the compiler's, the barriers are the synchronization the tile needs, and
+every parameter that would amortise them is behind the LDS wall. The one move left is to
+change which warps hold matrix work: a producer/consumer split, so the warps that fetch
+and decode are never the warps the matrix pipe is waiting on. That is a warp-mapping
+rewrite, not a parameter, and it is the next experiment.

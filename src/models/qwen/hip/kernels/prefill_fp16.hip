@@ -496,7 +496,7 @@ __launch_bounds__(WM * WN * 32) __global__
         short* dst = &s_a[ks][placed / 16][placed % 16][0];
         if (Mixed && row % 32 >= 16) {
           commit_up(p, dst, row);
-        } else if constexpr (DecodeStage != 0) {
+        } else if constexpr (DecodeStage != 0 && (Ablate & 512) == 0) {
           gufo::hip::QuantSub16 q = DecodeRaw<Type>(raw[p]);
           union {
             v16bf f;
@@ -525,6 +525,33 @@ __launch_bounds__(WM * WN * 32) __global__
       }
     }
   };
+  // Ablation 512: decode the loaded weights inside the previous K loop instead
+  // of in the commit, so the ~90 VALU of Q4_K decode overlap live matrix work
+  // rather than running in the post-barrier bubble with the matrix pipe idle.
+  const auto decode_ra = [&]() {
+    if constexpr ((Ablate & 512) != 0) {
+      static_assert(DecodeStage == 2 && !Mixed && !CacheIqHeader &&
+                    !CacheQ5Header,
+                    "ablation 512 covers only the plain deferred-decode path");
+#pragma unroll
+      for (int p = 0; p < PFA; ++p) {
+        const int idx = p * kThreads + tid;
+        if (idx < BM * BK) {
+          gufo::hip::QuantSub16 q = DecodeRaw<Type>(raw[p]);
+          union {
+            v16bf f;
+            uint4 u[2];
+          } packed;
+#pragma unroll
+          for (int j = 0; j < 16; ++j)
+            packed.f[j] = static_cast<_Float16>(__fsub_rn(
+                __fmul_rn(q.scale, static_cast<float>(q.q[j])), q.offset));
+          ra[p][0] = packed.u[0];
+          ra[p][1] = packed.u[1];
+        }
+      }
+    }
+  };
 #if defined(GUFO_FP16_PROTO_CLOCK)
   unsigned long long pc_commit = 0, pc_barrier = 0, pc_fetch = 0, pc_loop = 0;
   unsigned long long pc_t0 = 0;
@@ -535,6 +562,7 @@ __launch_bounds__(WM * WN * 32) __global__
 #define PC_END(acc)
 #endif
   fetch(0);
+  decode_ra();
   for (int ks0 = 0; ks0 < ksteps; ks0 += BK) {
     PC_START();
     if constexpr ((Ablate & 2) == 0) commit();
@@ -570,6 +598,9 @@ __launch_bounds__(WM * WN * 32) __global__
       }
       if constexpr ((Ablate & 4) == 0 && (Ablate & 256) != 0) {
         if (ks == BK / 2 - 1 && ks0 + BK < ksteps) fetch(ks0 + BK);
+      }
+      if constexpr ((Ablate & 512) != 0) {
+        if (ks == BK / 2 - 1 && ks0 + BK < ksteps) decode_ra();
       }
     }
     if constexpr ((Ablate & 16) != 0 ||

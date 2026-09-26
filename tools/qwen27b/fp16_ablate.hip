@@ -10,14 +10,12 @@
 using gufo::core::GgmlType;
 
 namespace {
-constexpr int kArms = 5;
-// Arms 0 and 4 are the SAME configuration: the gap between them is the
-// residual bias left in the interleaved harness. Each fetch ablation routes
-// into the zero-fill else branch so raw/rb stay defined and the dependent
-// decode and s_b stores survive.
-const char* kNames[kArms] = {"ctrl A", "no B fetch", "no A fetch",
-                             "no fetch", "ctrl B"};
-constexpr int kAbl[kArms] = {0, 32, 64, 96, 0};
+constexpr int kArms = 4;
+// Arms 0 and 3 are the SAME configuration: the gap between them is the
+// residual bias left in the interleaved harness.
+const char* kNames[kArms] = {"ctrl A", "decode in K loop", "iglp_opt(0)",
+                             "ctrl B"};
+constexpr int kAbl[kArms] = {0, 512, 16, 0};
 
 template<int Ablate>
 void Launch(const void* w, const short* x, float* y, int batch, int m, int k) {
@@ -69,10 +67,9 @@ int main(int argc, char** argv) {
       for (int i = 0; i < 4; ++i) {
         switch (a) {
           case 0: ms += Run<0>(w, (const short*)x, (float*)y, batch, m, k, 1); break;
-          case 1: ms += Run<32>(w, (const short*)x, (float*)y, batch, m, k, 1); break;
-          case 2: ms += Run<64>(w, (const short*)x, (float*)y, batch, m, k, 1); break;
-          case 3: ms += Run<96>(w, (const short*)x, (float*)y, batch, m, k, 1); break;
-          case 4: ms += Run<0>(w, (const short*)x, (float*)y, batch, m, k, 1); break;
+          case 1: ms += Run<512>(w, (const short*)x, (float*)y, batch, m, k, 1); break;
+          case 2: ms += Run<16>(w, (const short*)x, (float*)y, batch, m, k, 1); break;
+          case 3: ms += Run<0>(w, (const short*)x, (float*)y, batch, m, k, 1); break;
         }
       }
       s[a].push_back(ms / 4.0);
