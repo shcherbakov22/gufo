@@ -4419,3 +4419,34 @@ back into the engine's FP32 FFN rows, the inverse of the 2x2/8x8 shuffle plus a 
 **XRT inside the engine** (a skeleton now exists in `atb_handoff.hip`), and the **row
 partition**. The handoff between them is a copy, bounded at 2%.
 
+## The C decoder is bit-exact, so all three layout transforms are done
+
+`tools/qwen27b/atb_decode_c.hip` is the last of them: the device's C, bfp16ebs8 in L1 tiles of
+(512, 128) with 2x2 super-blocks of 8x8 row-major sub-blocks, back into the engine's FP32 FFN
+rows. One thread per 8-element group; consecutive packed elements are 8 consecutive output columns
+of one row, so a group writes 8 contiguous floats.
+
+Its oracle is the vendored host's own verification path -- `bfp16ebs8ToFloat` followed by
+`layout_inverse_C_L1_2x2_8x8block`, in `tools/qwen27b/atb_c_oracle.cpp`. On a 4096 x 2048
+buffer with randomised mantissas:
+
+```
+C decode 4096x2048: elements=8388608 exact_mismatches=0 max_abs=0
+```
+
+**Zero on 8.4 M elements.** That is a stronger result than the encoders got, and for a good
+reason: the decoder is pure arithmetic with no rounding choice, so there is nothing to disagree
+about once the layout and the two's-complement handling are right. The encoders differ from their
+oracles only in which grid point they round to.
+
+So the layout layer is finished:
+
+| transform | validation |
+| --- | --- |
+| B encode (weights) | 0 exponent mismatches, all 7 FFN types |
+| A encode (activations) | 0 exponent mismatches |
+| **C decode** | **bit-exact, 0 of 8,388,608** |
+
+What is left for the split is now only the two things that cannot be validated in isolation:
+**XRT inside the engine** and the **row partition**.
+
