@@ -958,6 +958,233 @@ __global__ void AtbRepackKernel(const void* __restrict__ w,
     dst[1 + i] = static_cast<std::uint8_t>(static_cast<std::int8_t>(magnitude));
   }
 }
+// Slice form of AtbRepackKernel: packs only the n tiles [n_tile0, ...) into a
+// buffer whose own tile numbering starts at zero, which is exactly what the ATB
+// kernel expects when its N is the slice width. This is what lets the split
+// repack only the NPU's share of a weight tensor.
+__global__ void AtbRepackSliceKernel(const void* __restrict__ w,
+                                     std::size_t row_bytes, int type_id,
+                                     std::size_t l1_rows, std::size_t n_tile0,
+                                     std::size_t groups,
+                                     std::uint8_t* __restrict__ out) {
+  const std::size_t g =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (g >= groups) {
+    return;
+  }
+  const std::size_t tile = g / kAtbGroupsPerTile;
+  const std::size_t gt = g % kAtbGroupsPerTile;
+  const std::size_t l1c = tile / l1_rows;
+  const std::size_t l1r = tile % l1_rows;
+  const unsigned cib = static_cast<unsigned>(gt % 8);
+  const unsigned t1 = static_cast<unsigned>(gt / 8);
+  const unsigned bis = t1 % 2;
+  const unsigned t2 = t1 / 2;
+  const unsigned sbr = t2 % 8;
+  const unsigned sb = t2 / 8;
+  const unsigned sbc = 2 * sb;
+
+  const std::size_t n = (n_tile0 + l1c) * kAtbL1N + (sbc + bis) * 8 + cib;
+  const std::size_t k0 = l1r * kAtbL1K + sbr * 8;
+
+  const void* row = static_cast<const std::uint8_t*>(w) + n * row_bytes;
+  const core::GgmlType type = static_cast<core::GgmlType>(type_id);
+  QuantSub16 sub;
+  DecodeQuantSub16(type, row, k0 / 16, sub);
+  const unsigned within = static_cast<unsigned>(k0 % 16);
+  float value[8];
+  float amax = 0.0F;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    value[i] = sub.scale * static_cast<float>(sub.q[within + i]) - sub.offset;
+    amax = fmaxf(amax, fabsf(value[i]));
+  }
+  std::uint8_t* dst = out + g * 9;
+  if (amax == 0.0F) {
+    for (int i = 0; i < 9; ++i) {
+      dst[i] = 0;
+    }
+    return;
+  }
+  int exponent = 0;
+  (void)frexpf(amax, &exponent);
+  dst[0] = static_cast<std::uint8_t>(exponent + 126);
+  const float step = ldexpf(1.0F, exponent - 7);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int magnitude = static_cast<int>(floorf(value[i] / step + 0.5F));
+    dst[1 + i] = static_cast<std::uint8_t>(static_cast<std::int8_t>(magnitude));
+  }
+}
+
+// ATB A operand: FP16 activations [rows, k] into the bfp16 A L1 layout, the
+// same transform as tools/qwen27b/atb_encode_a.hip. L1 tiles of (128, 64) with
+// the k tile varying fastest, each shuffled into 2x1 vertically stacked 8x8
+// row-major super-blocks, then one shared exponent per 8 consecutive elements.
+// Groups of 8 are consecutive k within one row, so a group never straddles a
+// row and the shared exponent is the same set the NPU sees.
+constexpr unsigned kAtbAL1M = 128;
+constexpr unsigned kAtbAL1K = 64;
+constexpr unsigned kAtbAGroupsPerTile = (kAtbAL1M * kAtbAL1K) / 8;
+
+__global__ void AtbEncodeAKernel(const __half* __restrict__ a, int k,
+                                 std::size_t l1_cols, std::size_t groups,
+                                 std::uint8_t* __restrict__ out) {
+  const std::size_t g =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (g >= groups) {
+    return;
+  }
+  const std::size_t tile = g / kAtbAGroupsPerTile;
+  const std::size_t gt = g % kAtbAGroupsPerTile;
+  const std::size_t l1r = tile / l1_cols;
+  const std::size_t l1c = tile % l1_cols;
+  const unsigned rib = static_cast<unsigned>(gt % 8);
+  const unsigned t1 = static_cast<unsigned>(gt / 8);
+  const unsigned bis = t1 % 2;
+  const unsigned t2 = t1 / 2;
+  const unsigned sbc = t2 % 8;
+  const unsigned si = t2 / 8;
+
+  const unsigned r = (2 * si + bis) * 8 + rib;
+  const std::size_t row = l1r * kAtbAL1M + r;
+  const __half* src = a + row * static_cast<std::size_t>(k) + l1c * kAtbAL1K + sbc * 8;
+
+  float value[8];
+  float amax = 0.0F;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    value[i] = __half2float(src[i]);
+    amax = fmaxf(amax, fabsf(value[i]));
+  }
+  std::uint8_t* dst = out + g * 9;
+  if (amax == 0.0F) {
+    for (int i = 0; i < 9; ++i) {
+      dst[i] = 0;
+    }
+    return;
+  }
+  int exponent = 0;
+  (void)frexpf(amax, &exponent);
+  dst[0] = static_cast<std::uint8_t>(exponent + 126);
+  const float step = ldexpf(1.0F, exponent - 7);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int magnitude = static_cast<int>(floorf(value[i] / step + 0.5F));
+    dst[1 + i] = static_cast<std::uint8_t>(static_cast<std::int8_t>(magnitude));
+  }
+}
+
+// ATB C operand: bfp16ebs8 in L1 tiles of (512, 128) laid out row-major, each
+// tile 2x2 super-blocks of 8x8 row-major sub-blocks. Consecutive 8 packed
+// elements are 8 consecutive output columns of one row, so one thread per
+// 8-element group decodes 9 bytes and writes 8 outputs. n_offset and n_full
+// place a slice of the output width inside the engine's full FP32/FP16 row.
+constexpr unsigned kAtbCL1M = 512;
+constexpr unsigned kAtbCL1N = 128;
+constexpr unsigned kAtbCGroupsPerTile = (kAtbCL1M * kAtbCL1N) / 8;
+
+__device__ __forceinline__ float Bfp16DecodeByte(std::uint8_t byte,
+                                                 float multiplier) {
+  const bool negative = (byte & 0x80u) != 0;
+  if (negative) {
+    const float magnitude =
+        static_cast<float>(static_cast<std::uint8_t>(~(byte - 1)));
+    return -(magnitude * multiplier);
+  }
+  return static_cast<float>(byte) * multiplier;
+}
+
+__device__ __forceinline__ float Bfp16DecodeScale(std::uint8_t shared) {
+  const float multiplier = shared >= 127
+                               ? static_cast<float>(1u << (shared - 127))
+                               : 1.0F / static_cast<float>(1u << (127 - shared));
+  return multiplier / 64.0F;
+}
+
+// Where one packed 8-element group of C lands in the engine's full-width row.
+struct AtbCGroup {
+  std::size_t row;
+  std::size_t col0;
+};
+
+__device__ __forceinline__ AtbCGroup AtbCGroupIndex(std::size_t g,
+                                                    std::size_t l1_cols,
+                                                    std::size_t n_offset) {
+  const std::size_t tile = g / kAtbCGroupsPerTile;
+  const std::size_t gi = g % kAtbCGroupsPerTile;
+  const std::size_t l1r = tile / l1_cols;
+  const std::size_t l1c = tile % l1_cols;
+
+  const unsigned rib = static_cast<unsigned>(gi % 8);
+  const unsigned t1 = static_cast<unsigned>(gi / 8);
+  const unsigned block = t1 % 4;
+  const unsigned t2 = t1 / 4;
+  const unsigned sbc_half = t2 % 8;
+  const unsigned sbr_half = t2 / 8;
+  const unsigned br = block / 2;
+  const unsigned bc = block % 2;
+
+  AtbCGroup out;
+  out.row = l1r * kAtbCL1M + (2 * sbr_half + br) * 8 + rib;
+  out.col0 = n_offset + l1c * kAtbCL1N + (2 * sbc_half + bc) * 8;
+  return out;
+}
+
+enum class AtbDecodeOp { kWrite, kAdd };
+
+template <typename OutT, AtbDecodeOp Op>
+__global__ void AtbDecodeCKernel(const std::uint8_t* __restrict__ packed,
+                                 std::size_t l1_cols, std::size_t groups,
+                                 std::size_t n_full, std::size_t n_offset,
+                                 OutT* __restrict__ out) {
+  const std::size_t g =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (g >= groups) {
+    return;
+  }
+  const AtbCGroup at = AtbCGroupIndex(g, l1_cols, n_offset);
+  const std::uint8_t* src = packed + g * 9;
+  const float multiplier = Bfp16DecodeScale(src[0]);
+  OutT* dst = out + at.row * n_full + at.col0;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const float value = Bfp16DecodeByte(src[1 + i], multiplier);
+    if constexpr (Op == AtbDecodeOp::kAdd) {
+      dst[i] = static_cast<OutT>(static_cast<float>(dst[i]) + value);
+    } else {
+      dst[i] = static_cast<OutT>(value);
+    }
+  }
+}
+
+// Gate and up share a layout, so one thread can decode both and emit the FP16
+// SwiGLU the down projection consumes, instead of decoding two FP32 rows, then
+// running a separate activation pass over them.
+__global__ void AtbDecodeSwiGLUKernel(const std::uint8_t* __restrict__ gate,
+                                      const std::uint8_t* __restrict__ up,
+                                      std::size_t l1_cols, std::size_t groups,
+                                      std::size_t n_full, std::size_t n_offset,
+                                      __half* __restrict__ out) {
+  const std::size_t g =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (g >= groups) {
+    return;
+  }
+  const AtbCGroup at = AtbCGroupIndex(g, l1_cols, n_offset);
+  const std::uint8_t* gs = gate + g * 9;
+  const std::uint8_t* us = up + g * 9;
+  const float gm = Bfp16DecodeScale(gs[0]);
+  const float um = Bfp16DecodeScale(us[0]);
+  __half* dst = out + at.row * n_full + at.col0;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const float value = Bfp16DecodeByte(gs[1 + i], gm);
+    const float gate_value = value / (1.0F + expf(-value));
+    dst[i] = __float2half_rn(gate_value * Bfp16DecodeByte(us[1 + i], um));
+  }
+}
+
 }  // namespace
 void LaunchBatchedRMSNormFp16(const float* x, const float* residual,
                               const float* weight, float* sum_out, void* out,
@@ -1003,6 +1230,102 @@ void LaunchAtbRepackBfp16(const void* weights, core::GgmlType type,
       weights, row_bytes, static_cast<int>(type), k / kAtbL1K, groups,
       static_cast<std::uint8_t*>(out));
 }
+void LaunchAtbEncodeAFp16(const void* act_fp16, std::size_t rows,
+                          std::size_t k, void* out, hipStream_t stream) {
+  if (act_fp16 == nullptr || out == nullptr || k % kAtbAL1K != 0 ||
+      rows % kAtbAL1M != 0) {
+    return;
+  }
+  const std::size_t groups = rows * k / 8;
+  const std::size_t blocks = (groups + 255) / 256;
+  AtbEncodeAKernel<<<static_cast<unsigned int>(blocks), 256, 0, stream>>>(
+      static_cast<const __half*>(act_fp16), static_cast<int>(k), k / kAtbAL1K,
+      groups, static_cast<std::uint8_t*>(out));
+}
+
+void LaunchAtbRepackBfp16Slice(const void* weights, core::GgmlType type,
+                               std::size_t n_out, std::size_t k,
+                               std::size_t n_offset, std::size_t n_tiles,
+                               void* out, hipStream_t stream) {
+  if (weights == nullptr || out == nullptr || n_tiles == 0) {
+    return;
+  }
+  const std::size_t row_bytes = quant::QuantizedRowBytes(type, k);
+  if (row_bytes == 0 || k % kAtbL1K != 0 ||
+      n_offset + n_tiles * kAtbL1N > n_out) {
+    return;
+  }
+  const std::size_t groups = n_tiles * kAtbL1N * k / 8;
+  const std::size_t blocks = (groups + 255) / 256;
+  AtbRepackSliceKernel<<<static_cast<unsigned int>(blocks), 256, 0, stream>>>(
+      weights, row_bytes, static_cast<int>(type), k / kAtbL1K,
+      n_offset / kAtbL1N, groups, static_cast<std::uint8_t*>(out));
+}
+
+void LaunchAtbDecodeCFp32(const void* packed, std::size_t rows,
+                          std::size_t n_slice, std::size_t n_full,
+                          std::size_t n_offset, float* out,
+                          hipStream_t stream) {
+  if (packed == nullptr || out == nullptr || rows % kAtbCL1M != 0 ||
+      n_slice % kAtbCL1N != 0) {
+    return;
+  }
+  const std::size_t groups = rows * n_slice / 8;
+  const std::size_t blocks = (groups + 255) / 256;
+  AtbDecodeCKernel<float, AtbDecodeOp::kWrite>
+      <<<static_cast<unsigned int>(blocks), 256, 0, stream>>>(
+      static_cast<const std::uint8_t*>(packed), n_slice / kAtbCL1N, groups,
+      n_full, n_offset, out);
+}
+
+void LaunchAtbDecodeCFp16(const void* packed, std::size_t rows,
+                          std::size_t n_slice, std::size_t n_full,
+                          std::size_t n_offset, void* out,
+                          hipStream_t stream) {
+  if (packed == nullptr || out == nullptr || rows % kAtbCL1M != 0 ||
+      n_slice % kAtbCL1N != 0) {
+    return;
+  }
+  const std::size_t groups = rows * n_slice / 8;
+  const std::size_t blocks = (groups + 255) / 256;
+  AtbDecodeCKernel<__half, AtbDecodeOp::kWrite>
+      <<<static_cast<unsigned int>(blocks), 256, 0, stream>>>(
+      static_cast<const std::uint8_t*>(packed), n_slice / kAtbCL1N, groups,
+      n_full, n_offset, static_cast<__half*>(out));
+}
+
+void LaunchAtbDecodeCAccumulateFp32(const void* packed, std::size_t rows,
+                                    std::size_t n_slice, std::size_t n_full,
+                                    std::size_t n_offset, float* out,
+                                    hipStream_t stream) {
+  if (packed == nullptr || out == nullptr || rows % kAtbCL1M != 0 ||
+      n_slice % kAtbCL1N != 0) {
+    return;
+  }
+  const std::size_t groups = rows * n_slice / 8;
+  const std::size_t blocks = (groups + 255) / 256;
+  AtbDecodeCKernel<float, AtbDecodeOp::kAdd>
+      <<<static_cast<unsigned int>(blocks), 256, 0, stream>>>(
+          static_cast<const std::uint8_t*>(packed), n_slice / kAtbCL1N, groups,
+          n_full, n_offset, out);
+}
+
+void LaunchAtbDecodeSwiGLUFp16(const void* gate_packed, const void* up_packed,
+                               std::size_t rows, std::size_t n_slice,
+                               std::size_t n_full, std::size_t n_offset,
+                               void* out, hipStream_t stream) {
+  if (gate_packed == nullptr || up_packed == nullptr || out == nullptr ||
+      rows % kAtbCL1M != 0 || n_slice % kAtbCL1N != 0) {
+    return;
+  }
+  const std::size_t groups = rows * n_slice / 8;
+  const std::size_t blocks = (groups + 255) / 256;
+  AtbDecodeSwiGLUKernel<<<static_cast<unsigned int>(blocks), 256, 0, stream>>>(
+      static_cast<const std::uint8_t*>(gate_packed),
+      static_cast<const std::uint8_t*>(up_packed), n_slice / kAtbCL1N, groups,
+      n_full, n_offset, static_cast<__half*>(out));
+}
+
 template<HalfEpilogue Epilogue>
 void DirectGemm(gufo::core::GgmlType type, const void* w, const void* x,
                 float* y, std::size_t batch, std::size_t m, std::size_t k,

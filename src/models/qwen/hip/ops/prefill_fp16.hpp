@@ -30,6 +30,40 @@ void LaunchBfp16RoundTripFp16InPlace(void* buffer, std::size_t count, int bits,
 void LaunchAtbRepackBfp16(const void* weights, core::GgmlType type,
                           std::size_t n_out, std::size_t k, void* out,
                           hipStream_t stream);
+// ATB split support. The NPU consumes bfp16 A and B operands and emits bfp16 C
+// in L1 tiles; these are the GPU-side transforms, each verified against the
+// vendored host layout code. Rows and n_tiles must be multiples of the ATB L1
+// tiles (128 and 64 for A, 128 for B and C), which the callers guarantee by
+// construction.
+// A: FP16 activations [rows, k] into the ATB A operand, rows * k * 9 / 8 bytes.
+void LaunchAtbEncodeAFp16(const void* act_fp16, std::size_t rows,
+                          std::size_t k, void* out, hipStream_t stream);
+// B: only the n tiles covering [n_offset, n_offset + n_tiles * 128), numbered
+// from zero within the slice, which is what the ATB kernel's N refers to.
+void LaunchAtbRepackBfp16Slice(const void* weights, core::GgmlType type,
+                               std::size_t n_out, std::size_t k,
+                               std::size_t n_offset, std::size_t n_tiles,
+                               void* out, hipStream_t stream);
+// C: the packed slice back into rows of a full-width buffer.
+void LaunchAtbDecodeCFp32(const void* packed, std::size_t rows,
+                          std::size_t n_slice, std::size_t n_full,
+                          std::size_t n_offset, float* out,
+                          hipStream_t stream);
+void LaunchAtbDecodeCFp16(const void* packed, std::size_t rows,
+                          std::size_t n_slice, std::size_t n_full,
+                          std::size_t n_offset, void* out, hipStream_t stream);
+// C accumulated onto an existing FP32 row, for a projection whose residual the
+// GPU branch already wrote.
+void LaunchAtbDecodeCAccumulateFp32(const void* packed, std::size_t rows,
+                                    std::size_t n_slice, std::size_t n_full,
+                                    std::size_t n_offset, float* out,
+                                    hipStream_t stream);
+// Fused: gate and up packed slices in, FP16 SwiGLU out. Gate and up share a
+// layout, so this replaces two decodes plus a separate activation pass.
+void LaunchAtbDecodeSwiGLUFp16(const void* gate_packed, const void* up_packed,
+                               std::size_t rows, std::size_t n_slice,
+                               std::size_t n_full, std::size_t n_offset,
+                               void* out, hipStream_t stream);
 // Packed GGUF weights are scaled in FP32, rounded to FP16 inside the kernel,
 // then multiplied by FP16 activations with FP32 accumulation in K16 order.
 // Supports the Qwen27B Q4 shard's native quant formats and K divisible by 256.

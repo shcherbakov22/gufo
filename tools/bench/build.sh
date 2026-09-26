@@ -72,6 +72,7 @@ for t in "${targets[@]}"; do
   host_sources=()
   if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ||
         "$src" -ef tools/qwen27b/prefill_fp16_bench.hip ||
+        "$src" -ef tools/qwen27b/atb_slice_check.hip ||
         "$src" -ef tools/qwen27b/prefill_bk_bench.hip ]]; then
     host_sources+=(src/core/quant/ggml_dequant.cpp)
   fi
