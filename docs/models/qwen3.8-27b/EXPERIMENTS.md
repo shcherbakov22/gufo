@@ -544,11 +544,37 @@ its cost is per-element metadata arithmetic (four fp32 arrays staged as scales,
 offsets, activation scales and activation sums, plus the affine offset
 correction) and its epilogue, not the barrier structure.
 
-But the headroom is worth little, for two reasons:
+But the headroom is worth more than the first draft of this section claimed, and
+that draft's framing was wrong. It compared *instruction* ceilings -- 50.31
+against 48.35, +4% -- and concluded there was nothing to win. The whole finding of
+this investigation is that the **practical** ceiling is format-dependent: the fp16
+kernel reaches only 63% of its instruction ceiling precisely because the 64 KiB
+single-buffer rule forces the fenced commit and the two barriers. int8 uses
+20-30 KiB and is not subject to that rule, so the comparison that matters is
+fp16's 63% *practical* against whatever int8's practical ceiling turns out to be:
 
-1. **The int8 rate ceiling is only 4% above fp16's** (50.31 against 48.35). Even
-   brought to fp16's 63% efficiency, int8 lands at ~31.7 TFLOPS, about +4% on the
-   GEMM and nothing more. There is no rate to win here; the 2x lives in int4.
+| int8 efficiency | TFLOPS | against fp16's achieved 30.4 |
+| --- | ---: | ---: |
+| 63% (fp16's own) | 31.7 | +4% |
+| 75% | 37.7 | +24% |
+| 85% | 42.8 | +41% |
+
+At a measured quality cost of 3.4e-4 of cosine, that is a materially better
+prospect than int4's ~9% at 2.0e-2 -- **if** the int8 kernel can get there, which
+turns entirely on whether its 52% overhead is stalls or work.
+
+The evidence leans toward work, not stalls. The mitigations a smaller footprint
+buys are already in place: the int8 kernel reports 2+ blocks per CU and it
+prefetches into registers (`kPrefetch`, `r_b`, `r_q0`, `r_q1`). It has the
+spare capacity and it is still at 48%, so its overhead is probably the per-element
+arithmetic -- four fp32 metadata arrays and the affine offset correction -- and
+**halving the operand width does not shrink fp32 metadata.** That is exactly why
+the stage did not halve: the weight side costs 1 byte of code plus 8 bytes of
+scale and offset per 32 elements, so about 1.25 B/element against fp16's 2, not
+0.5. The LDS *instruction* count does halve (one `ds_read_b128` per fragment
+instead of two), which is a real saving, but the spare *capacity* is already spent
+on the second resident block.
+
 2. **The int8 path carries roughly 12% of non-GEMM overhead.** Model-level, the
    forced q8 path runs 390 t/s against 540 for fp16, about 28% slower, while the
    GEMM alone is only 26% slower -- the rest is the activation quantization passes
@@ -562,8 +588,12 @@ K loop sits at 100% of the MMA peak and 0.75 loads per MMA. A better ratio has
 nothing to recover; the bottleneck is the format-independent staging, barriers and
 epilogue, which is exactly what int8 cannot change.
 
-**So: optimizable in principle, not worth it in practice** -- a 4% rate ceiling
-against ~12% of path overhead, with the real lever elsewhere.
+**So: optimizable, and possibly worth more than int4** -- but which row of that
+table applies is not known, because the int8 kernel has never been phase-profiled.
+Its 48% is a fact; whether the missing 52% is a fence/drain that spare LDS can
+absorb, or metadata arithmetic that only a narrower scale format can shrink,
+decides between +4% and +40%. That measurement is the next step, and it is the
+same in-kernel clock instrumentation that closed out the fp16 kernel.
 
 
 ## Deferred: Q2_K native prefill (chunked-path eligibility)
