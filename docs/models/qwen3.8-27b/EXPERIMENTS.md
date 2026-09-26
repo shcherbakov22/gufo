@@ -3579,3 +3579,34 @@ NPU the faster engine and the split worth more rather than less.
 one at a time -- the extra 42 MB staging allocation, the `FillWeights` pattern, the
 `FillValues` + `LaunchFloatToFp16` warmup -- until the time jumps.
 
+## The bfp16 quality gate passes on real weights
+
+The one untested risk in the NPU path was bfp16's block exponent. The B operand is stored as
+8-element groups sharing one exponent with 8-bit magnitudes (the intrinsic carries the signs
+as a separate vector), so a group whose values span a wide dynamic range loses mantissa bits.
+The ATB harness initialises A and B to all ones, which exercises none of that.
+
+Measured on real weights -- the first 512 rows of `blk.0.ffn_gate.weight` (IQ3_XXS, 2,621,440
+weights) taken straight from the shipped shard, dequantised with the production host decoder
+and round-tripped through the bfp16 model (`tools/qwen27b/bfp16_quality.cpp`):
+
+| magnitude bits | RMS abs err | RMS / ||w|| | max rel |
+|---|---|---|---|
+| 7 | 6.36e-05 | **0.62%** | 11.1% |
+| 8 | 3.18e-05 | **0.31%** | 5.9% |
+
+The block exponent adds **0.3-0.6% RMS** to weights whose own quantisation is a ~3-bit
+codebook. In quadrature that is a rounding error on the existing error -- a 3% RMS quantiser
+plus 0.5% becomes 3.04% -- so the conversion is numerically close to free. The 8-bit reading is
+the relevant one, since the sign is carried separately; the 7-bit figure is the conservative
+bound if the signs turn out to share the magnitude field.
+
+Note the weight statistics: max|w| = 0.122, RMS|w| = 0.0103. These are small-magnitude
+weights, which is exactly the regime where a *shared* exponent is most demanding, so the test
+is not an easy one.
+
+All three preconditions for the NPU path now hold on measured evidence: the GEMM is correct at
+our geometry (32.4-32.9 TFLOPS, CPU-reference PASS), it runs concurrently with the iGPU at a
+1.3% cost to the latter, and the format conversion is numerically free. What remains is
+engineering -- the repack, the orchestration, and the row-split on the iGPU side.
+
