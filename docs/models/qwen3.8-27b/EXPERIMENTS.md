@@ -2333,3 +2333,41 @@ Interleaving cancels ordering bias *within* a run but not across runs, so only w
 comparisons are trustworthy at the few-percent level. Every ablation in this kernel
 (`Ablate` bits 1/2/4/8/16) and the grid swizzle (`GShift`) are kept as defaulted
 compile-time diagnostics so they can be re-run on the interleaved harness.
+
+
+### The harneess validated, and the K stage repriced
+
+The interleaved harness now runs the **same configuration twice**, as the first and last
+arm, so the residual bias is measurable rather than assumed. m=17408, k=5120, batch=2048,
+5 alternating rounds, median of the per-round means:
+
+| arm | median ms | min | max | TFLOPS | delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| bk4 control A | 8.775 | 8.671 | 8.801 | 41.60 | -- |
+| bk1 | 16.456 | 16.332 | 16.553 | 22.19 | **-87.5%** |
+| bk2 | 11.393 | 11.305 | 11.448 | 32.04 | **-29.8%** |
+| bk4 control B | 8.781 | 8.659 | 8.878 | 41.58 | **-0.1%** |
+
+**The two controls agree to 0.1% with overlapping ranges**, which is the null control this
+harness never had. Everything measured interleaved on it is trustworthy at the ~1% level;
+everything measured sequentially was not.
+
+Fitting `T = T_k + (320/BK)*c` to bk4 and bk2:
+
+* per-stage cost **c = 32.7 us** (the sequential fit said 26 us),
+* K-loop floor **T_k = 6.16 ms**.
+
+So a `BK=8` stage -- 40 stages instead of 80 -- would be **7.47 ms against 8.78 ms, about
++15%**, more than twice the +8.5% the old fit predicted. It remains impossible, and now the
+reason is a tight three-way argument rather than one measurement:
+
+| budget | limit | gives |
+| --- | --- | --- |
+| accumulator registers | 8 accumulators/thread at 1024 threads | `BM*BN <= 65536`, minimised at 256x256 |
+| LDS | `(BM+BN)*BK*32 <= 65536` at BM+BN = 512 | `BK <= 4` **exactly** |
+| consequence | -- | BK=8 needs 128 KiB, and B alone at BK=8 already fills the 64 KiB, leaving no room even for a 2-byte A placeholder |
+
+The tile re-test seals the first row independently: every non-square aspect at the same
+area is worse, and the mirror warp split (256x256 w4n8) is **-4.7%**. So the accumulator
+budget really does pin the tile at 256x256, LDS really does pin BK at 4, and the +15% that
+BK=8 would buy is behind a wall with no gap in it.
