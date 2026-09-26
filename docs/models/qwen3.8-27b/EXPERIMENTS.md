@@ -3218,12 +3218,33 @@ tightest control this work has had. The hypothesis that the SwiGLU epilogue expl
 gap is dead, and the paired kernel itself is fine at 40.6 TF on production geometry.
 
 **The remaining explanation is the weight format, and the shard says so.** Parsing the GGUF
-header of the shipped 3.84 bpw shard shows every `ffn_gate`, `ffn_up` and `ffn_down` in
-all layers is **IQ3_XXS** (with a few IQ2_XXS/IQ2_XS/IQ4_XS outliers) -- not Q4_K, which is
-what the first bench had assumed. Whole-shard element histogram: IQ3_S 8.27e9, IQ4_XS
-6.78e9, **IQ3_XXS 6.43e9**, Q4_K 2.95e9. IQ3_XXS is also the format with the most expensive
-decode in the ISA study (+26% loop instructions over Q4_K), which lines up with the 27.7%
-gap the profiler recorded.
+header of the shipped 3.84 bpw shard shows the FFN is **not** Q4_K, which is what the first
+bench had assumed.
+
+**Corrected:** this paragraph originally said every `ffn_gate`, `ffn_up` and `ffn_down` in
+all layers is **IQ3_XXS** "with a few IQ2_XXS/IQ2_XS/IQ4_XS outliers". That is wrong. A
+byte-weighted census of the FFN tensors alone -- 195 tensors, the shard has 65 blocks
+(blk.0..blk.64) and every one carries gate/up/down -- gives **seven** types, 17.380 G weights,
+7.05 GiB, 3.484 bpw effective:
+
+| type | FFN weights | FFN size | bpw |
+|---|---|---|---|
+| IQ3_S | 6.417 G | 2.57 GiB | 3.438 |
+| IQ3_XXS | 5.793 G | 2.07 GiB | 3.062 |
+| IQ4_XS | 3.654 G | 1.81 GiB | 4.250 |
+| Q3_K | 0.713 G | 0.29 GiB | 3.438 |
+| Q4_K | 0.446 G | 0.23 GiB | 4.500 |
+| IQ2_XXS | 0.267 G | 0.06 GiB | 2.062 |
+| IQ2_XS | 0.089 G | 0.02 GiB | 2.312 |
+| **total** | **17.380 G** | **7.05 GiB** | **3.484** |
+
+IQ3_XXS is 33.3% of FFN weights; IQ3_S is the largest single type at 36.9%. These percentages
+match the whole-shard figures already recorded for this shard earlier in this document (IQ3_S
+36.9%, IQ3_XXS 33.3%, IQ4_XS 21.0%) -- the two paragraphs disagreed and this one was wrong. The
+conclusion survives, because IQ3_XXS is the most expensive decode in the ISA study (+26% loop
+instructions over Q4_K) and is a third of the FFN, which lines up with the 27.7% gap the
+profiler recorded. But any repack or kernel-coverage claim has to cover all seven types, and
+the FFN is 65 x 3 tensors rather than 48 x 3.
 
 Compounding it, `TryLaunchBatchedDualQuantGEMMSwiGLUFp16` has **no IQ3_XXS case at all**,
 so the FFN never reaches the paired kernel; it falls back to two separate `kStore` launches
@@ -3957,22 +3978,22 @@ second increment is what makes the stride 9 bytes instead of 8. Omitting it leav
 one byte short per block, and the *first* block still matches, so the corruption is invisible
 until a multi-block comparison. The port reproduced the helper only after that was found.
 
-**What it costs in memory.** bfp16 is 9 bits per weight against IQ3_XXS's 3.0625, so repacking
-the FFN inflates it 2.94x:
+**What it costs in memory.** bfp16 is 9 bits per weight, against 3.484 bpw for the FFN as
+shipped (see the type census above), so a packed FFN is 2.58x larger:
 
-| | FFN weights | size |
+| | weights | size |
 |---|---|---|
-| FFN gate+up+down, 48 layers | 12.835 G | |
-| as IQ3_XXS (98 B / 256) | | 4.58 GiB |
-| as bfp16 (9 bits) | | **13.45 GiB** |
-| model plus fully packed FFN | | **25.63 GiB** |
+| FFN gate+up+down, 65 blocks x 3 | 17.380 G | 7.05 GiB |
+| the same as bfp16 (9 bits) | | **18.21 GiB** |
+| model plus fully packed FFN | | **23.34 GiB** |
 
-Packing *all* FFN weights therefore needs 13.45 GiB and, alongside the 12.18 GiB model,
-does not fit in the ~18 GiB available. But the operating point is not "all": at the measured
-split the NPU takes 44% of the FFN, so the packed set is ~5.9 GiB gross, and because a channel
-is served by either the NPU or the GPU the IQ3_XXS bytes it replaces are freed -- about
-2.0 GiB -- for a net of roughly **+3.9 GiB**, which fits. The ceiling is real but the plan is
-under it.
+Packing *all* FFN weights therefore needs 18.21 GiB and, alongside the 12.18 GiB model, does
+not fit in the ~18 GiB available. But the operating point is not "all": at the measured split
+the NPU takes 44% of the FFN, so the packed set is ~8.0 GiB gross, and because a channel is
+served by either the NPU or the GPU the 3.484-bpw bytes it replaces are freed -- about 3.1 GiB
+-- for a net of roughly **+4.9 GiB**, giving ~17.1 GiB total. That fits, with about a gigabyte
+of headroom. The ceiling is real and the plan is under it, but the headroom is thin enough that
+the split fraction is now a memory decision as well as a throughput one.
 
 **What it costs in time -- and why the first answer was wrong.** Timed on the real gate/up shape
 at a 2048-token batch, host-side, single-threaded:
