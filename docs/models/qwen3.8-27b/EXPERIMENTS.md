@@ -3382,6 +3382,29 @@ validated at one shape. Bringing it to our K=5120 means work on the open-source 
 most likely the B-tile DMA loop counts or the shuffle's K stride -- and a K-split does not
 dodge it, because K=1024 fails too.
 
+**The general-K alternative is correct-ish but an order of magnitude slower.** The stock
+symmetric mixed example (`whole_array_mixed`, the one the ATB README points newcomers to)
+does accept K=5120:
+
+| design | shape | throughput | check |
+|---|---|---|---|
+| whole_array_mixed, 64^3 tiles | 4096x5120x2048 | 3.89 TFLOPS | FAIL (38/1000) |
+| whole_array_mixed, 64^3 tiles | 2048x5120x4096 | 3.85 TFLOPS | FAIL (44/1000) |
+| ATB config3, 128x64x128 | 4096x5120x2048 | 31.5 TFLOPS | FAIL (888/1000) |
+| ATB config3, 128x64x128 | 4096x4096x17408 | 32.4 TFLOPS | PASS |
+
+Neither serves our K=5120 today: the fast design is correct only at K=4096, and the
+general-K design sits at 10% of the bfp16 peak. Unlike ATB's near-zero outputs, the
+`whole_array_mixed` failures are few (38-44 of 1000) and look like bf16 accumulation
+precision rather than broken plumbing.
+
+**Our output width hits a third, independent wall.** N=17408 does not even compile for
+`whole_array_mixed`: `'aie.dma_bd' op Stride 3 exceeds the [1:1048576] range`. That is the C
+write-back stride `m * n_aie_rows * N` against the 2^20 descriptor limit, so at m=64 the
+output width is capped at 4096 and N=17408 needs five launches (four of 4096 plus one of
+1024). N-splitting is algebraically free -- output columns are independent -- but it is five
+launches per FFN tensor instead of one.
+
 ### Where this leaves the split
 
 The NPU is a peer of the iGPU for the FFN GEMM, and the two land within 25% of each other:
