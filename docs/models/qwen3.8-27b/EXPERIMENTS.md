@@ -3382,6 +3382,43 @@ validated at one shape. Bringing it to our K=5120 means work on the open-source 
 most likely the B-tile DMA loop counts or the shuffle's K stride -- and a K-split does not
 dodge it, because K=1024 fails too.
 
+**The K dependence is a hardcoded constant, and the fix is five lines.**
+`config3/mm_bfp_mixed.cc` declares `constexpr int K_Problemsize = 4096;` and its own comment
+states the limitation plainly: *"the bf16 -> bfp16 flush happens once per output tile, after
+exactly (K_Problemsize / k) * DIV matmul calls; this kernel only supports K =
+K_Problemsize."* The flush fires at `(4096/64)*4 - 1 = 255` calls, so at K=5120 the design
+issues 320 and the kernel converts C a quarter of the way through the reduction. Nothing else
+was wrong: diffing the generated MLIR for K=4096 against K=5120 shows only memref sizes, BD
+lengths/offsets and loop bounds changing, all scaling correctly.
+
+Making the constant overridable and passing the design's K through fixes it exactly:
+
+```c
+#ifndef K_PROBLEMSIZE
+#define K_PROBLEMSIZE 4096
+#endif
+constexpr int K_Problemsize = K_PROBLEMSIZE;
+```
+
+```python
+kernel_flags = [f"-I{_AIE_KERNELS_INC}", f"-DK_PROBLEMSIZE={K}"]
+```
+
+| shape | before | after |
+|---|---|---|
+| 4096x5120x2048 | FAIL (888/1000) | **PASS, 31.4 TFLOPS** |
+| 2048x5120x17408 (gate/up) | FAIL (872/1000) | **PASS, 32.4 TFLOPS** |
+| 2048x17408x5120 (down) | FAIL (828/1000) | **PASS, 32.9 TFLOPS** |
+
+So the NPU runs our exact FFN gate/up GEMM correctly at 32.4 TFLOPS -- 83% of the 38.9
+TFLOPS bfp16 MAC peak and 80% of the iGPU's 40.6 TFLOPS on the same shape. The "general-K
+alternative" below is moot once this lands, but it is kept as the fallback measurement.
+
+Diagnostic note worth keeping: the harness initialises A and B to **all ones**, so C must
+equal K exactly and *any permutation of A or B is invisible*. That is why these failures read
+as near-zero output rather than misplaced data -- and it means the test cannot detect layout
+bugs at all. A non-uniform instrument would be strictly better.
+
 **The general-K alternative is correct-ish but an order of magnitude slower.** The stock
 symmetric mixed example (`whole_array_mixed`, the one the ATB README points newcomers to)
 does accept K=5120:
