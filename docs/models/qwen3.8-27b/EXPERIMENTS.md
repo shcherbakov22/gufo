@@ -3142,3 +3142,56 @@ is known not to track time here.
 
 **Falsifier: a cross-warp register exchange on gfx1151 that does not use LDS.** The table
 above is exhaustive over the instructions the assembler accepts.
+
+## The non-GEMM share of pp2048, profiled: 8%, and it is not waste
+
+With the fp16 GEMM closed, the last unprofiled area was the part of a prefill pass that is
+not GEMM. The earlier PMC-based budget put it at ~13%; a direct rocprofv3 profile says 8%,
+and it says what it consists of:
+
+```sh
+python3 tools/prof/prof.py run -o /tmp/prof13 --stages qwen -- \
+  ./build/release/gufo bench -m IQ4_XS-3.84bpw.gguf -p 2048 -n 0 -r 1
+python3 tools/prof/prof.py show /tmp/prof13/prof_results.db --passes 5
+```
+
+Two passes; pass 2 is the timed prefill (1882 dispatches, 7978 ms of the 8177 ms total).
+Whole-trace stage rollup:
+
+| stage | calls | total ms | % |
+| --- | ---: | ---: | ---: |
+| gemm: quant x fp16 prefill | 974 | 7316.70 | **89.5%** |
+| ssm: deltanet recurrence | 144 | 227.63 | **2.8%** |
+| gemm: k-quant prefill | 458 | 176.04 | 2.2% |
+| attention | 80 | 102.14 | 1.2% |
+| ssm: conv1d | 144 | 90.57 | 1.1% |
+| norm+fp16 | 256 | 77.91 | 1.0% |
+| ssm: post-norm gate | 144 | 57.16 | 0.7% |
+| attention: qk-norm+rope+kv | 48 | 42.35 | 0.5% |
+| unpack | 48 | 27.53 | 0.3% |
+| ssm: deltanet prologue | 288 | 22.62 | 0.3% |
+| everything else | -- | ~36 | ~0.4% |
+
+**GEMM totals 91.9% and non-GEMM 8.1%**, so the earlier 13% figure was high. GPU-busy is
+8177.56 ms against an 8231.09 ms span -- **idle 0.7%** -- so the pass is not launch or host
+bound and there is no overhead to win back there.
+
+The 8% breaks down by subsystem rather than by kernel:
+
+* **SSM / deltanet: 4.9%** (recurrence 2.8%, conv1d 1.1%, post-norm gate 0.7%, prologue
+  0.3%). The recurrence is sequential over the sequence, so it is latency-bound by
+  construction, and its launch geometry (`blocks=2x48x1 wg=256`, 96 CTAs on 20 CUs) is poor
+  but the split it would need is not obvious.
+* **Attention: 1.7%** (1.2% + 0.5% for qk-norm/rope/kv).
+* **Memory-bound elementwise: ~3%** across norm+fp16, conv1d, post-norm gate and the
+  qk-norm/rope/kv fusion. These are the only ones that look improvable on inspection --
+  `HalfNorm5120` runs 256 launches at 304 us each over 2048x5120 fp16, roughly 132 GB/s of
+  read plus write -- but together they are small.
+
+**Verdict: the non-GEMM area is not a target.** It is 8%, it is dominated by legitimate
+sequential SSM recurrence and attention work, and the plausibly-recoverable part is 1-3% of
+prefill. That is smaller than the 15-20% the GEMM itself is leaving, and the GEMM side is
+closed by instruction-set fact rather than by budget.
+
+**Falsifier: a non-GEMM stage above 3% whose kernel is not latency-bound by construction.**
+The deltanet recurrence and the attention kernel both are, and nothing else exceeds 1.1%.
