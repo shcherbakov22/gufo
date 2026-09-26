@@ -3359,6 +3359,29 @@ Config1 fails its correctness check because it **accumulates in bf16** across K=
 lossy by construction, not a harness fault. Config3's pure-bfp16 path passes the stochastic
 verification, so 30.6 TFLOPS is a verified GEMM result rather than a throughput-only number.
 
+**But it is shape-specific, and our K is not its shape.** Overriding `-M -K -N` produces
+incorrect results at every shape tried except the paper's. Holding M=4096 and N=2048 fixed
+and sweeping only K:
+
+| K | result |
+|---|---|
+| 1024 | FAIL (719/1000), 25.8 TFLOPS |
+| 4096 | **PASS**, 30.6 TFLOPS |
+| 5120 | FAIL (888/1000), 31.5 TFLOPS |
+| 8192 | FAIL (511/1000), 31.7 TFLOPS |
+
+At the two real FFN shapes (M=2048 K=5120 N=17408 and M=2048 K=17408 N=5120) it runs at 32.4
+and 32.7 TFLOPS but fails verification outright. Isolating the variable: **N=17408 is fine**
+-- M=4096 K=4096 **N=17408 PASSES at 32.4 TFLOPS** -- and M=2048 was never implicated.
+**Only K=4096 passes.** The test initialises A and B to all ones, so every C[i,j] must equal
+exactly K; the failing runs return near zero, which is a structural plumbing failure rather
+than accumulated rounding.
+
+So ATB proves the *capability* but is not a general GEMM library: it is a research artifact
+validated at one shape. Bringing it to our K=5120 means work on the open-source kernel --
+most likely the B-tile DMA loop counts or the shuffle's K stride -- and a K-split does not
+dodge it, because K=1024 fails too.
+
 ### Where this leaves the split
 
 The NPU is a peer of the iGPU for the FFN GEMM, and the two land within 25% of each other:
