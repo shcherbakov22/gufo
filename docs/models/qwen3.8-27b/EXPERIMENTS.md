@@ -1026,6 +1026,55 @@ the stage count and gives back exactly what it saves, or a 128x128 tile, measure
 structure -- 66% of the pure-MMA ceiling, and the ceiling is what its K loop
 already achieves.
 
+### The last structural idea is blocked by the ISA, verified
+
+Producer/consumer warp specialisation was the one remaining idea that attacks the
+actual constraint rather than a resource that is not full. The matrix pipe
+saturates at about four waves per SIMD (measured flat across the occupancy
+curve), so four of the eight could be repurposed to staging while the other four
+do nothing but MMAs against a double-buffered stage and never touch a full-block
+barrier. Issue is 86% idle, so the staging instructions would fit.
+
+It needs a way to barrier a *subset* of the workgroup. Assembled every candidate
+for gfx1151:
+
+| instruction | result |
+| --- | --- |
+| `s_barrier` | assembles |
+| `__builtin_amdgcn_wave_barrier()` | assembles (wave-level only) |
+| `s_barrier_signal <n>` | **instruction not supported on this GPU** |
+| `s_barrier_wait <n>` | not supported |
+| `s_barrier_signal -1`, `s_barrier_wait -1` | not supported |
+| `s_barrier_init` | not supported |
+| `s_barrier_signal_isfirst` | not supported |
+
+So gfx1151 exposes only the workgroup-wide barrier and the wave barrier. Named
+or partial barriers are CDNA (and gfx12), not this part. The idea is dead at the
+ISA level.
+
+That closes the structure question, and the chain is worth stating in one place
+because no single link is the whole answer:
+
+1. staging must be shared -- private per-wave staging needs about 384 KB of LDS
+   against the 64 KB available, because the reuse that makes the GEMM fast *is*
+   the sharing;
+2. sharing needs cross-wave synchronisation;
+3. the only cross-wave primitive is a full-workgroup barrier;
+4. so all 80 stage boundaries are full-block barriers and the matrix pipe drains
+   at each one;
+5. the drain can only be hidden by a second resident block, which needs 32 KiB of
+   LDS and half the accumulator registers;
+6. and the tile that fits that, 128x128, needs a third more LDS loads per MMA, so
+   it loses more than it hides -- measured at 10-57% worse with the gates lifted.
+
+**The binding constraint is the interaction of an ISA synchronisation primitive
+with LDS capacity -- not FLOPs.** That resolves the apparent paradox: the matrix
+pipe is at 70% utilisation, not 100%, and nothing is rate-limited. The machine
+has plenty of multiply throughput; what it lacks is a way to overlap the staging
+that feeds it. The fp16 instruction.s 48-52 TFLOPS is its own ceiling, and the
+same silicon does 105 TFLOPS on int4, which is the only door left.
+
+
 
 
 
