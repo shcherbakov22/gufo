@@ -4206,3 +4206,58 @@ What is *not* done: the two-engine functional test (NPU writes, GPU imports the 
 the bytes). That is the confirming measurement, and it belongs with the split wiring rather than
 before it -- the cost bound above is what the projection needs, and it holds in the worst case.
 
+## Runtime repacking: the packed model never has to exist
+
+The 4.9 GiB a packed NPU share costs is avoidable. `tools/qwen27b/atb_repack.hip` produces the
+bfp16 ATB B operand **on the GPU, per layer**, straight from the resident quantised tensor, into a
+staging buffer that is reused -- so the shipped 3.484 bpw weights stay the only copy. A
+double-buffered staging area is `2 x 43.8% x 3 x 100 MB` = **262 MB**, against 4.9 GiB.
+
+One thread per bfp16 group. A group is 8 consecutive reduction rows at one output column, which
+is exactly what the packer's shuffle makes contiguous, so each thread writes 9 contiguous bytes
+from 8 weights of one row -- and it gets the dequantisation from the engine's own
+`DecodeQuantSub16`, so all seven FFN types are covered without a per-type branch.
+
+**Layout is exact.** The exponent byte of each group encodes which 8 weights share it, so it is
+the layout-sensitive byte and only weakly value-sensitive. Across all seven tensors:
+
+| check | result |
+|---|---|
+| exponent bytes differing | **0 of 77,987,840** |
+| mantissa bytes differing | 13.08%, all by exactly one grid step |
+
+A layout error would move whole groups, so zero exponent mismatches is the layout proof.
+
+**The 13% mantissa disagreement is the kernel being more accurate, not less.** The host helper
+truncates the mantissa to 7 bits *before* it rounds (its `mantissa >> 17`, then add-half-then-
+shift), so its rounding never sees the bits below bit 17. The kernel rounds the exact FP32
+`scale*q - offset` onto the same grid. Same grid, so the accuracy is identical; the kernel's
+choice is the better one. The one alarming number in the first pass -- Q3_K with a max byte
+delta of 255 -- was +127 versus -128, adjacent points in two's complement.
+
+**Cost, after removing a 16x redundancy.** The first version called
+`QuantBlockElement` once per weight; that decodes a whole 16-element sub-block each time, so 8
+calls decoded 128 elements for the 8 that were wanted. Decoding each sub-block once:
+
+| | per tensor (89.1 M weights) |
+|---|---|
+| first cut | 2.31 - 3.53 ms |
+| sub-block decoded once | **0.91 - 1.20 ms** |
+| CPU packer, for scale | 388 ms |
+
+So the repack is ~350x the CPU path, and it is compute-bound on the dequant, not bandwidth-bound
+(100 MB written in 1.1 ms is 91 GB/s).
+
+**What it costs the projection.** Per layer the NPU's share needs `0.438 x 3.3 ms` = **1.45 ms**
+of repack on the GPU. The GPU's per-layer work becomes 19.5 + 1.45 = 21.0 ms against the NPU's
+19.5 ms, so the FFN speedup goes 1.78x -> **1.66x**, and the prefill projection
+`1/(0.33 + 0.67/1.66)` = **1.36x** rather than 1.42x.
+
+That is the trade the instruction buys: **4.6 GiB not held, for about 4% of the projected
+speedup.** Worth taking, and now a measured number rather than a preference.
+
+Not yet done: the engine wiring. `atb_repack` is a prototype that reads the tensor from a file
+and writes to stdout; the engine version reads the resident `layer.ffn_*.data` against its
+type and writes into the double buffer. That is also where the split lands, since both need the
+same per-layer hook.
+
