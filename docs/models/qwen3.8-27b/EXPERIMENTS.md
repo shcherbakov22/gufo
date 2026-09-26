@@ -3887,9 +3887,32 @@ an end-to-end question (perplexity with and without the conversion), not somethi
 from a rounding model. The throughput and concurrency case is unaffected: 32.4-32.9 TFLOPS,
 1.3% iGPU cost, 1.68x prefill.
 
-**A free factor of two is available.** The 7-bit/truncation combination is our choice, not the
-hardware's: the stored value is just an int8 magnitude times a shared exponent, so the host
-may round to nearest when it encodes. That would take the weight-side contribution from 1.23%
-to about 0.62% and the combined figure from 1.88% to about 1.2%, at no cost to throughput or
-memory. It is a change to our repack, not to the vendored example.
+**A free 1.6x is available, and now measured.** The 7-bit/truncation combination is our
+choice, not the hardware's: the stored value is just an int8 magnitude times a shared
+exponent, so the host may round to nearest when it encodes. Made switchable with one branch
+(`BFP16_ROUND_NEAREST` in `helper.h`, adding half an ulp before the shift) and re-measured on
+the same operands:
+
+| shape | contribution | truncate (shipped) | round-to-nearest |
+|---|---|---|---|
+| 2048 x 5120 x 17408 | weights | 1.23% | 0.77% |
+| | activations | 1.27% | 0.77% |
+| | **both** | 1.88% | **1.07%** |
+| 2048 x 17408 x 5120 | weights | 1.28% | 0.79% |
+| | activations | 1.33% | 0.80% |
+| | **both** | 2.26% | **1.12%** |
+
+The device stays exact under the improved encoding -- both shapes PASS against the
+quantisation-aware reference with round-to-nearest on -- and the all-ones stock pattern still
+passes, because the change is purely a host-side choice of which int8 to store.
+
+The gain is 1.6x rather than the 2x the uniform-error model predicts, because the truncation
+error is not independent of the per-element shared-exponent shift. It costs nothing in
+throughput or memory, so **round-to-nearest should be the default in the repack**; the ~2x
+figure that would have followed from the earlier 8-bit gate is not reachable.
+
+This also sets the bar for the next question. The remaining uncertainty is not the encoder but
+the *activations*: the numbers above use a standard normal A, and the true FFN input has
+outliers, which a shared exponent handles worse. Re-running with real activations is the next
+measurement, not another synthetic pattern.
 
