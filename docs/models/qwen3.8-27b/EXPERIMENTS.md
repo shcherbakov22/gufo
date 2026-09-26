@@ -2147,3 +2147,33 @@ not proven, and the change was reverted.
    by two so the compiler sees two constant-indexed bodies rather than one
    variable-indexed one -- which is also how the existing kernel gets its
    registers down to 136.
+
+
+### The hang, resolved from the journal
+
+Follow-up with `doas` (which is available; plain `dmesg` is not permitted here).
+`journalctl --list-boots` shows the long session as boot `-2`, ending
+2026-09-26 12:57:57, and its final entries identify the culprit exactly:
+
+```
+12:57:55 systemd[2927]: Stopping [systemd-run] .../runner.js -- bash -c
+  "cd /home/q/gufo && bash tools/bench/build.sh .../fp16_ablate.hip ...; /tmp/fp16_ablate"
+```
+
+That is the **`Stages=2` double-buffer bench**, still running when the machine was
+powered off. The same boot contains **no amdgpu error of any kind** -- no ring
+timeout, no GPU reset, no page fault, no VM fault, no OOM -- and the kernel
+command line carries `amdgpu.gttsize=24576` (24 GB), so memory was never the
+constraint.
+
+**So there was no hardware fault: the kernel never completed and never reported.**
+That is the signature of an infinite loop or a barrier deadlock inside my own
+variant, not a device problem -- which also means the GPU did not need the
+restart, the hung process did. The variant is reverted and the register/scratch
+profile above explains why it was never safe to launch in the first place.
+
+**Method rule adopted from this:** before any new kernel variant touches the GPU,
+(1) probe `sharedSizeBytes`, `localSizeBytes` and `numRegs` compile-only -- 192
+VGPRs at 1024 threads with 136 B/thread of scratch is a rejected profile -- and
+(2) run a tiny grid under a hard `timeout` with `doas dmesg` watched alongside
+before ever running at production size.
