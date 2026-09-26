@@ -3493,3 +3493,42 @@ elements, which is why the W4A16 PASS criterion is `err / (|A||B|)` rather than 
 relative error. It is float and can consume fp16-class activations directly, so it needs no
 int8 activation quantisation -- but the block exponent must be validated on real weights.
 
+## The FFN weight format costs 4%, so the 28% gap is in the non-FFN GEMMs
+
+The last standing explanation for the gap between the model-level effective 29.7 TF and the FFN
+kernel's 40.6 TF was the FFN's weight format. The shipped shard runs IQ3_XXS there, and the ISA
+study put IQ3_XXS at +26% loop instructions over Q4_K. The earlier batch-512 A/B showed only
++2.8%, but at low batch the shape is weight-bandwidth-bound, so decode cost hides. At
+production batch (`tools/qwen27b/fp16_format_ab.hip`, m=17408 k=5120, Q4_K vs IQ3_XXS, both
+`Complete=false`):
+
+| arm | batch 512 | batch 2048 |
+|---|---|---|
+| Q4_K store (mean of 2 controls) | 2.569 ms | 10.137 ms |
+| IQ3_XXS store (mean of 2 controls) | 2.624 ms | 10.561 ms |
+| **IQ3_XXS cost** | **+2.1%** | **+4.2%** |
+| Q4_K paired gate/up | 4.682 ms (38.98 TF) | 18.140 ms (40.25 TF) |
+
+The control spread is ~1%, so +4.2% is real but small. **The format hypothesis for the 28% gap
+is dead.**
+
+Two consequences follow.
+
+**1. The gap is in the non-FFN GEMMs.** The FFN is ~47% of the model's parameters (12.83e9 of
+27.32e9). If it runs at 40.6 TF and the model-level rate is 29.7 TF, then the attention and SSM
+projection GEMMs must be running at roughly **24 TF**. Bringing those to the FFN's rate would
+be worth **~1.37x on prefill** -- GPU-only, no new runtime, no quantisation risk, and larger
+than anything else outstanding. That is the next measurement.
+
+**2. A smaller cheap win: the FFN gate/up never uses the paired kernel.** The production shard's
+gate and up are both IQ3_XXS, and `TryLaunchBatchedDualQuantGEMMSwiGLUFp16` has no IQ3_XXS case,
+so it falls back to two separate `kStore` launches: 2 x 10.561 = 21.12 ms where the paired Q4_K
+kernel does both in 18.14 ms. Adding IQ3_XXS -- and the IQ3_XXS/IQ2_XXS mixes the shard actually
+contains -- to that dispatch list is a few percent on its own.
+
+**Caveat recorded as a warning, not a result.** The `iq3xxs no-epilogue` arm reads 9.619 ms
+against 10.561 ms with the epilogue, i.e. -9%, while for Q4_K the same ablation measured the
+epilogue at +0.13%. That arm is almost certainly dead code: with the store ablated the compiler
+can drop the IQ3_XXS decode entirely, which is the same DCE trap hit earlier in this work. No
+conclusion is drawn from it, and per-format ablation arms need their own ISA verification.
+
