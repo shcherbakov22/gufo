@@ -2002,3 +2002,45 @@ and it is a deep rewrite of every per-format decoder. Nothing cheaper is left:
 the epilogue's scalar 2-byte stores are forced by the accumulator fragment layout
 (each lane holds 8 values strided by `m`), so the direct-store path cannot be
 widened without the very transpose IQ3_S already pays for.
+
+
+### Why the plateau is hardware: the only wide MMA on gfx1151 is iu4
+
+The one lever with a 2x label that had never been checked is the WMMA K width.
+Every measurement in this document -- the 48.35 TFLOPS fp16 ceiling, the iu8
+ceiling, every tile sweep -- used `16x16x16`. LLVM declares a `16x16x32` f16
+shape, and a 32-wide K MMA is exactly what makes the iu4 ceiling 2.1x higher, so
+if f16 had one the fp16 path would double. It does not. Checked three ways:
+
+1. **Device limits** (`hipDeviceGetAttribute`, gfx1151): LDS 65536 B per CU and
+   65536 B per block, 196608 VGPRs per CU, 2048 threads per CU. A `BK=8` stage at
+   256x256 needs `(256+256)*8*32 = 131072` B, so **the earlier "BK=8 cannot
+   exist" claim is now measured rather than assumed** -- it is correct.
+2. **No clang builtin**: every spelling of `__builtin_amdgcn_wmma_f32_16x16x32_f16*`
+   fails to compile, while the 16x16x16 form is accepted.
+3. **The intrinsic is gfx12.5-only.** `int_amdgcn_wmma_f32_16x16x32_f16` is
+   declared inside `defset list<Intrinsic> AMDGPUWMMAIntrinsicsGFX1250` -- RDNA4.
+   gfx1151 is RDNA3.5. The assembler rejects the mnemonic accordingly.
+
+What the gfx11 intrinsic set actually offers:
+
+| shape | f16 | bf16 | iu8 | iu4 |
+| --- | --- | --- | --- | --- |
+| 16x16x16 | yes | yes | yes | yes |
+| 16x16x32 | **no (gfx12.5)** | no | **no** | **yes** |
+
+**So on this silicon the 32-wide MMA exists for int4 and nothing else.** That
+explains both plateaus at once: the fp16 kernel is at the *hardware* f16 ceiling
+-- its format-insensitivity, the failed staging levers, and the fact that no
+weight format moves it are all consequences, not mysteries -- and the 2.1x iu4
+ceiling is not a kernel property but the only wide MMA the chip has.
+
+The consequence is uncomfortable and worth stating plainly: **the only route to a
+large pp2048 gain on this part is widening how much of the model can use
+`iu4 16x16x32`.** Today that is 15.5% of FLOPs, because eligibility is
+`linear AND <= 4 bits` and the IQ families carry non-linear grid codebooks. Every
+IQ tensor is either already 4-bit (IQ4_XS) or narrower (IQ3_S, IQ3_XXS), so
+widening eligibility means **requantizing those weights onto a linear 4-bit grid**
+-- a quality decision, not a kernel one, and the same one the int4 quality work
+was gated on. The fp16 kernel is finished; the remaining question is not how to
+make it faster, but whether the model can afford a different weight format.
