@@ -3934,3 +3934,60 @@ So the headline is **1.8% RMS with the shipped encoder and 1.0% with round-to-ne
 real weights and real activations. The synthetic A was not hiding anything, which retroactively
 justifies the earlier synthetic probes as well.
 
+## The repack is validated -- and it, not the GEMM, is the expensive part
+
+**The offline packer.** `tools/qwen27b/atb_pack.cpp` turns a raw IQ3_XXS tensor into the
+bfp16 B operand in the ATB layout in one pass: dequantise -> transpose to row-major [K, N] ->
+(k_tile, n_tile) L1 tiles emitted column-major -> 1x2 super-blocks of 8x8 column-major
+sub-blocks -> bfp16, shared exponent per 8, round-to-nearest. It is a standalone port of
+`layout_transpose_L1_1x2_8x8block` and `floatToBfp16`, so the engine needs nothing from the
+mlir-aie tree at runtime.
+
+Validated two independent ways:
+
+1. **Byte identity.** The vendored host dumps the exact buffer it hands the device; the packer
+   reproduces it byte-for-byte for both FFN tensors (100,270,080 bytes each, `cmp` clean).
+2. **Device consumption.** The host can load a pre-packed B and skip its own shuffle and encode
+   (`ATB_BPACKED`); at both real shapes it then PASSes against the quantisation-aware
+   reference.
+
+One trap worth recording, because it is easy to miss: `floatToBfp16` advances its write cursor
+**twice** per block -- once per mantissa and once more after writing the exponent -- and that
+second increment is what makes the stride 9 bytes instead of 8. Omitting it leaves the stream
+one byte short per block, and the *first* block still matches, so the corruption is invisible
+until a multi-block comparison. The port reproduced the helper only after that was found.
+
+**What it costs in memory.** bfp16 is 9 bits per weight against IQ3_XXS's 3.0625, so repacking
+the FFN inflates it 2.94x:
+
+| | FFN weights | size |
+|---|---|---|
+| FFN gate+up+down, 48 layers | 12.835 G | |
+| as IQ3_XXS (98 B / 256) | | 4.58 GiB |
+| as bfp16 (9 bits) | | **13.45 GiB** |
+| model plus fully packed FFN | | **25.63 GiB** |
+
+The machine has 30 GiB total with about 18 GiB available, so **a full FFN repack does not fit.**
+Packing only the NPU's share -- 44% of the FFN at the measured split -- is about 5.9 GiB, which
+fits, but there is no room to also keep the IQ3_XXS copy of what was packed.
+
+**What it costs in time.** Timed on the real gate/up shape at a 2048-token batch, host-side,
+single-threaded:
+
+| operand | shuffle | encode | total | vs GEMM |
+|---|---|---|---|---|
+| A (activation, 2048 x 5120) | 9.3 ms | 42.3 ms | **51.6 ms** | **4.5x** |
+| B (weights, 5120 x 17408) | 77.0 ms | 326.1 ms | **403.1 ms** | 35x |
+| NPU GEMM | | | 11.45 ms | |
+
+B is static, so its 403 ms is a one-off repack cost -- about 400 ms per tensor, roughly a minute
+for all 48 layers' gate/up/down. **A is not.** 51.6 ms per call against 11.45 ms of compute
+means the naive host-side path loses by 4.5x regardless of what the NPU does. The activation
+encode has to be fused into the preceding GPU kernel -- the FFN RMSNorm for gate/up, the SwiGLU
+for down -- which reads and writes the same activation anyway. That is an engineering task, and
+it is now the critical path.
+
+So the NPU path's real cost is the operand preparation, not the 32 TFLOPS GEMM. A plan that
+treats the bfp16 conversion as free -- in memory or in time -- is wrong by the two numbers
+above.
+
