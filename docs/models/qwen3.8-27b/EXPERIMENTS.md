@@ -4603,3 +4603,68 @@ Two levers follow from that, neither taken yet:
 2. **The libhsa spin costs a full core in both paths.** It is not the split's fault and not the
    split's cost, but at 95 W a core is a few percent of the budget, and it is paid on every
    prefill the engine has ever run.
+
+## Queue-depth pacing was worth having on its own, and is now the default
+
+The baseline path never blocks per layer: its only stream synchronisations are at the end of a
+chunk. It therefore enqueues all 64 layers and then sits inside `libhsa-runtime64` on queue-full
+backpressure. Measured over a pp2048 benchmark: **17-19 s of user time**, most of a core for the
+whole run.
+
+Bounding how many layers may be in flight removes it. Interleaved against no pacing, three rounds:
+
+| depth | pp2048 (mean) | user time |
+| --- | ---: | ---: |
+| off | 380-395 | 17.5-18.8 s |
+| 1 | 400.9 | 1.5-2.5 s |
+| 2 | 402.3 | 2.6-3.1 s |
+| 3 | 404.5 | 3.1-3.2 s |
+| 6 | 401.9 | 3.6-4.9 s |
+
+Depth 3 was fastest and is not sensitive, so `kPrefillPaceDepth` in `prefill_chunk.cpp` is
+that value with no switch to set. The +2-3% is the cycles the spin was burning: on a 95 W-capped
+SoC those are power and heat the engines do not get. Note this also means every pp2048 figure
+recorded before it was measured with that core on fire.
+
+## The split's two effects, separated
+
+Interleaved in one session, the gate/up slice width against pp2048 and CPU:
+
+| n_gu | pp2048 (r2 / r3) | vs baseline | user CPU |
+| --- | --- | ---: | ---: |
+| 0 | 395.05 / 392.42 | -- | 17.2 s |
+| 1024 | 393.45 / 390.57 | ~0% | 2.4 s |
+| 4096 | 410.33 / 411.69 | +4% | 2.3 s |
+| 8192 | 435.17 / 434.58 | +10% | 2.1 s |
+
+The CPU collapse appears at n=1024, where the NPU does almost nothing: it is the pacing, not the
+NPU. The throughput gain tracks the NPU's share, which is the part the NPU is actually
+responsible for.
+
+## A misconfigured NPU degrades; it does not abort
+
+XRT needs the memlock limit raised -- the hard limit here is 8 MB and XRT maps 64 MB host-only
+BOs -- so the split needs `doas`. Without it `xrt::bo` throws, and the first version let that
+escape and aborted the process. `Init` now catches everything including the failures XRT raises
+from outside `std::exception`, and the engine falls back to the GPU path: unprivileged pp2048
+prints the XRT error and completes at 491.61 tok/s.
+
+## What is left to tune
+
+The split is a first working implementation, not a tuned one. In rough order of expected value:
+
+1. **Re-test the down offload.** It was rejected on a comparison that is now known to have been
+   thermally confounded. The plumbing exists (`AtbRole::kDown`, `npu_dn_*` xclbins,
+   `LaunchAtbAddHeadFp32`), and the question is genuinely open.
+2. **Token split.** Give each engine a token subset so its gate/up -> SwiGLU -> down chain is
+   independent: the NPU's gate/up then overlaps the GPU's down instead of blocking it, which is
+   the serialisation that caps the split. Needs an M < 2048 xclbin and a row-offset decode, and
+   the NPU needs the full weight tensors repacked.
+3. **One launch for gate and up.** Their B slices concatenate into a single N = 2 x n_slice GEMM,
+   halving submissions and waits. Worth doing on the CPU argument alone.
+4. **Tune (n_gu, n_dn) properly**, interleaved, never across sequences.
+5. **Move the B repack off the critical path.** It depends only on weights, so layer L+1's repack
+   can run while layer L's NPU slice executes. It is also slow: 1.53 ms/tensor is ~93 GB/s against
+   an iGPU that sustains ~200.
+6. **The A encoder's gather.** One thread per 8-element group, with consecutive threads reading
+   rows 10-35 KB apart.

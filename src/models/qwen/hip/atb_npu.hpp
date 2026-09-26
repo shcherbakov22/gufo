@@ -30,7 +30,7 @@ struct AtbSplitGeometry {
 // unless GUFO_ATB_XCLBIN and GUFO_ATB_INSTS name a matching pair and
 // GUFO_ATB_NSLICE agrees with the xclbin.
 class AtbNpuOffload {
- public:
+public:
   // Lazily created singleton per role; nullptr when the NPU path cannot be
   // used.
   static AtbNpuOffload* Get(AtbRole role);
@@ -60,7 +60,7 @@ class AtbNpuOffload {
   // Blocks until both slices have completed.
   bool Wait();
 
- private:
+private:
   AtbNpuOffload();
   bool Init(AtbRole role);
 

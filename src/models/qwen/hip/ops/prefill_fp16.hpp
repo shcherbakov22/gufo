@@ -36,8 +36,8 @@ void LaunchAtbRepackBfp16(const void* weights, core::GgmlType type,
 // tiles (128 and 64 for A, 128 for B and C), which the callers guarantee by
 // construction.
 // A: FP16 activations [rows, k] into the ATB A operand, rows * k * 9 / 8 bytes.
-void LaunchAtbEncodeAFp16(const void* act_fp16, std::size_t rows,
-                          std::size_t k, void* out, hipStream_t stream);
+void LaunchAtbEncodeAFp16(const void* act_fp16, std::size_t rows, std::size_t k,
+                          void* out, hipStream_t stream);
 // B: only the n tiles covering [n_offset, n_offset + n_tiles * 128), numbered
 // from zero within the slice, which is what the ATB kernel's N refers to.
 void LaunchAtbRepackBfp16Slice(const void* weights, core::GgmlType type,
@@ -47,8 +47,7 @@ void LaunchAtbRepackBfp16Slice(const void* weights, core::GgmlType type,
 // C: the packed slice back into rows of a full-width buffer.
 void LaunchAtbDecodeCFp32(const void* packed, std::size_t rows,
                           std::size_t n_slice, std::size_t n_full,
-                          std::size_t n_offset, float* out,
-                          hipStream_t stream);
+                          std::size_t n_offset, float* out, hipStream_t stream);
 void LaunchAtbDecodeCFp16(const void* packed, std::size_t rows,
                           std::size_t n_slice, std::size_t n_full,
                           std::size_t n_offset, void* out, hipStream_t stream);

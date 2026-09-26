@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
@@ -35,9 +36,47 @@ namespace {
 // time goes; without it the split runs unmeasured.
 [[nodiscard]] double AtbTraceNowMs() {
   using clock = std::chrono::steady_clock;
-  return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch())
+  return std::chrono::duration<double, std::milli>(
+             clock::now().time_since_epoch())
       .count();
 }
+
+// Waits for everything already queued on the stream without the runtime's
+// spin. hipStreamSynchronize blocks inside libhsa-runtime64 in a loop that
+// costs most of a core for the whole drain; on this SoC CPU power comes out of
+// the same budget as the GPU and the NPU, so that spin is paid for by the work
+// it is waiting on. Recording an event and querying it while sleeping gives the
+// same guarantee for a small fraction of the cycles.
+void WaitEventSleeping(hipEvent_t event) {
+  for (;;) {
+    const hipError_t state = hipEventQuery(event);
+    if (state == hipSuccess) {
+      return;
+    }
+    if (state != hipErrorNotReady) {
+      HIP_CHECK(state);
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+  }
+}
+
+void WaitStreamSleeping(hipStream_t stream) {
+  static hipEvent_t event = nullptr;
+  if (event == nullptr) {
+    HIP_CHECK(hipEventCreateWithFlags(&event, hipEventDisableTiming));
+  }
+  HIP_CHECK(hipEventRecord(event, stream));
+  WaitEventSleeping(event);
+}
+
+// How many layers of the chunk may be in flight at once. With nothing to wait
+// on, the engine enqueues all 64 layers and then blocks inside the HIP runtime
+// on queue-full backpressure: measured at 17-19 s of user time for a pp2048
+// benchmark, most of a core for the whole run. Bounding the depth removes that
+// spin and is worth 2-3% of pp2048 as well, because the cycles it was burning
+// are power and heat the engines do not get. Depths 1, 2, 3 and 6 were measured
+// interleaved against no pacing; 3 was the fastest and is not sensitive.
+constexpr std::size_t kPrefillPaceDepth = 3;
 
 [[nodiscard]] bool AtbTraceEnabled() {
   static const bool enabled = std::getenv("GUFO_ATB_TRACE") != nullptr;
@@ -288,10 +327,27 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
 
   double atb_prep_gu_ms = 0.0, atb_wait_gu_ms = 0.0;
   double atb_prep_dn_ms = 0.0, atb_wait_dn_ms = 0.0;
-  int atb_prep_gu_n = 0, atb_wait_gu_n = 0, atb_prep_dn_n = 0, atb_wait_dn_n = 0;
+  int atb_prep_gu_n = 0, atb_wait_gu_n = 0, atb_prep_dn_n = 0,
+      atb_wait_dn_n = 0;
+
+  constexpr std::size_t pace_depth = kPrefillPaceDepth;
+  std::vector<hipEvent_t> pace_events(pace_depth, nullptr);
+  for (auto& event : pace_events) {
+    HIP_CHECK(hipEventCreateWithFlags(&event, hipEventDisableTiming));
+  }
 
   // 3. Layer stack
   for (std::uint32_t l = 0; l < config.num_layers; ++l) {
+    if (pace_depth != 0) {
+      // The event recorded at the top of layer l-pace completes when every
+      // layer before it has been executed, so waiting on it here keeps at most
+      // pace_depth layers in flight without ever starving the device.
+      const std::size_t slot = l % pace_depth;
+      if (l >= pace_depth) {
+        WaitEventSleeping(pace_events[slot]);
+      }
+      HIP_CHECK(hipEventRecord(pace_events[slot], arena_.stream));
+    }
     const auto& layer = weights_.layers[l];
     const auto route_resolution = ResolveQwenLayerRouteWithReasons(
         policy_, QwenExecutionMode::kPrefill, layer.is_full_attention);
@@ -698,11 +754,11 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
     // else falls through to the GPU-only path unchanged.
     AtbNpuOffload* const atb =
         half_prefill ? AtbNpuOffload::Get(AtbRole::kGateUp) : nullptr;
-    const bool atb_split =
-        atb != nullptr && batch_size == atb->geometry().batch &&
-        hidden_size == atb->geometry().gu_k &&
-        intermediate_size == atb->geometry().gu_n_full &&
-        layer.ffn_gate.type == layer.ffn_up.type;
+    const bool atb_split = atb != nullptr &&
+                           batch_size == atb->geometry().batch &&
+                           hidden_size == atb->geometry().gu_k &&
+                           intermediate_size == atb->geometry().gu_n_full &&
+                           layer.ffn_gate.type == layer.ffn_up.type;
     bool atb_launched = false;
 
     {
@@ -725,7 +781,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                                   atb->up_weights(), arena_.stream);
         // The NPU has no stream to order against, so its operands have to be
         // complete before it is queued.
-        HIP_CHECK(hipStreamSynchronize(arena_.stream));
+        WaitStreamSleeping(arena_.stream);
         atb_launched = atb->Launch();
       }
       if (atb_split && AtbTraceEnabled()) {
@@ -760,10 +816,9 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         // dead on this path. LaunchAtbExpandHeadFp16 moves the head into
         // d_ffn_up's full-width rows once the NPU has been collected.
         const std::size_t n_gpu = atb->geometry().gu_n_gpu;
-        LaunchBatchedQuantGEMMFp16(layer.ffn_gate.type, layer.ffn_gate.data,
-                                   arena_.d_scratch_bf16, arena_.d_ffn_gate,
-                                   batch_size, n_gpu, hidden_size,
-                                   arena_.stream);
+        LaunchBatchedQuantGEMMFp16(
+            layer.ffn_gate.type, layer.ffn_gate.data, arena_.d_scratch_bf16,
+            arena_.d_ffn_gate, batch_size, n_gpu, hidden_size, arena_.stream);
         LaunchBatchedQuantGEMMSwiGLUFp16(
             layer.ffn_up.type, layer.ffn_up.data, arena_.d_scratch_bf16,
             arena_.d_ffn_gate, arena_.d_ffn_act, batch_size, n_gpu, hidden_size,
@@ -848,9 +903,9 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         // full-width FP16 activation.
         LaunchAtbExpandHeadFp16(arena_.d_ffn_act, arena_.d_ffn_up, batch_size,
                                 n_gpu, intermediate_size, arena_.stream);
-        LaunchAtbDecodeSwiGLUFp16(
-            atb->gate_output(), atb->up_output(), batch_size, atb->n_slice(),
-            intermediate_size, n_gpu, arena_.d_ffn_up, arena_.stream);
+        LaunchAtbDecodeSwiGLUFp16(atb->gate_output(), atb->up_output(),
+                                  batch_size, atb->n_slice(), intermediate_size,
+                                  n_gpu, arena_.d_ffn_up, arena_.stream);
       }
     }
 
@@ -860,22 +915,21 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
     // residual rows afterwards; the NPU accumulates the columns past it.
     AtbNpuOffload* const atb_dn =
         half_prefill ? AtbNpuOffload::Get(AtbRole::kDown) : nullptr;
-    const bool atb_dn_split =
-        atb_dn != nullptr && batch_size == atb_dn->geometry().batch &&
-        hidden_size == atb_dn->geometry().gu_n_full &&
-        intermediate_size == atb_dn->geometry().gu_k;
+    const bool atb_dn_split = atb_dn != nullptr &&
+                              batch_size == atb_dn->geometry().batch &&
+                              hidden_size == atb_dn->geometry().gu_n_full &&
+                              intermediate_size == atb_dn->geometry().gu_k;
     bool atb_dn_launched = false;
     const double atb_prep_dn_start =
         atb_dn_split && AtbTraceEnabled() ? AtbTraceNowMs() : 0.0;
     if (atb_dn_split) {
       LaunchAtbEncodeAFp16(ffn_down_input, batch_size, intermediate_size,
                            atb_dn->activations(), arena_.stream);
-      LaunchAtbRepackBfp16Slice(layer.ffn_down.data, layer.ffn_down.type,
-                                hidden_size, intermediate_size,
-                                atb_dn->geometry().gu_n_gpu,
-                                atb_dn->n_slice() / 128, atb_dn->gate_weights(),
-                                arena_.stream);
-      HIP_CHECK(hipStreamSynchronize(arena_.stream));
+      LaunchAtbRepackBfp16Slice(
+          layer.ffn_down.data, layer.ffn_down.type, hidden_size,
+          intermediate_size, atb_dn->geometry().gu_n_gpu,
+          atb_dn->n_slice() / 128, atb_dn->gate_weights(), arena_.stream);
+      WaitStreamSleeping(arena_.stream);
       atb_dn_launched = atb_dn->Launch();
     }
     if (atb_dn_split && AtbTraceEnabled()) {
@@ -889,10 +943,10 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         HIP_CHECK(hipMemsetAsync(arena_.d_ffn_out, 0,
                                  batch_size * n_gpu * sizeof(float),
                                  arena_.stream));
-        LaunchBatchedQuantGEMMResidualFp16(
-            layer.ffn_down.type, layer.ffn_down.data, ffn_down_input,
-            arena_.d_ffn_out, batch_size, n_gpu, intermediate_size,
-            arena_.stream);
+        LaunchBatchedQuantGEMMResidualFp16(layer.ffn_down.type,
+                                           layer.ffn_down.data, ffn_down_input,
+                                           arena_.d_ffn_out, batch_size, n_gpu,
+                                           intermediate_size, arena_.stream);
         LaunchAtbAddHeadFp32(arena_.d_ffn_out, arena_.d_hidden, batch_size,
                              n_gpu, hidden_size, arena_.stream);
         const double atb_wait_dn_start =
@@ -905,9 +959,9 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         if (!atb_dn_ok) {
           throw std::runtime_error("ATB NPU down slice did not complete");
         }
-        LaunchAtbDecodeCAccumulateFp32(
-            atb_dn->gate_output(), batch_size, atb_dn->n_slice(), hidden_size,
-            n_gpu, arena_.d_hidden, arena_.stream);
+        LaunchAtbDecodeCAccumulateFp32(atb_dn->gate_output(), batch_size,
+                                       atb_dn->n_slice(), hidden_size, n_gpu,
+                                       arena_.d_hidden, arena_.stream);
       } else {
         LaunchBatchedQuantGEMMResidualFp16(
             layer.ffn_down.type, layer.ffn_down.data, ffn_down_input,
@@ -955,6 +1009,9 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                  "dn prep %.3f ms x%d | dn wait %.3f ms x%d\n",
                  atb_prep_gu_ms, atb_prep_gu_n, atb_wait_gu_ms, atb_wait_gu_n,
                  atb_prep_dn_ms, atb_prep_dn_n, atb_wait_dn_ms, atb_wait_dn_n);
+  }
+  for (auto& event : pace_events) {
+    (void)hipEventDestroy(event);
   }
   last_hidden_offset_ = (batch_size - 1) * hidden_size;
 

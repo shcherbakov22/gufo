@@ -21,11 +21,10 @@
 #include <vector>
 
 #if defined(GUFO_ENABLE_NPU)
-#include <unistd.h>
-
 #include <hip/hip_runtime.h>
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
+#include <unistd.h>
 
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
@@ -48,10 +47,18 @@ struct AtbShape {
 };
 
 [[nodiscard]] const AtbShape& ShapeFor(AtbRole role) {
-  static const AtbShape gate_up{"GUFO_ATB_GU_XCLBIN", "GUFO_ATB_GU_INSTS",
-                                "GUFO_ATB_GU_NSLICE", "gate/up", 5120, 17408};
-  static const AtbShape down{"GUFO_ATB_DN_XCLBIN", "GUFO_ATB_DN_INSTS",
-                             "GUFO_ATB_DN_NSLICE", "down", 17408, 5120};
+  static const AtbShape gate_up{"GUFO_ATB_GU_XCLBIN",
+                                "GUFO_ATB_GU_INSTS",
+                                "GUFO_ATB_GU_NSLICE",
+                                "gate/up",
+                                5120,
+                                17408};
+  static const AtbShape down{"GUFO_ATB_DN_XCLBIN",
+                             "GUFO_ATB_DN_INSTS",
+                             "GUFO_ATB_DN_NSLICE",
+                             "down",
+                             17408,
+                             5120};
   return role == AtbRole::kGateUp ? gate_up : down;
 }
 
@@ -120,7 +127,8 @@ std::vector<std::uint32_t> ReadInstr(const char* path) {
     return instr;
   }
   const std::streamsize bytes = in.tellg();
-  if (bytes <= 0 || bytes % static_cast<std::streamsize>(sizeof(std::uint32_t))) {
+  if (bytes <= 0 ||
+      bytes % static_cast<std::streamsize>(sizeof(std::uint32_t))) {
     return instr;
   }
   in.seekg(0);
@@ -209,8 +217,9 @@ bool AtbNpuOffload::Init(AtbRole role) {
   }
   const std::size_t batch = EnvSize("GUFO_ATB_BATCH");
   if (batch == 0 || batch % 512 != 0) {
-    std::fprintf(stderr, "atb-npu: GUFO_ATB_BATCH must be a positive multiple "
-                         "of 512\n");
+    std::fprintf(stderr,
+                 "atb-npu: GUFO_ATB_BATCH must be a positive multiple "
+                 "of 512\n");
     return false;
   }
 
@@ -229,9 +238,9 @@ bool AtbNpuOffload::Init(AtbRole role) {
   const std::size_t b_bytes = n_slice * shape.k * 9 / 8;
   const std::size_t c_bytes = batch * n_slice * 9 / 8;
 
-  impl_ = new Impl();
-  Impl& p = *impl_;
   try {
+    impl_ = new Impl();
+    Impl& p = *impl_;
     p.xclbin = xrt::xclbin(std::string(xclbin_path));
     const auto kernels = p.xclbin.get_kernels();
     auto chosen = kernels.begin();
@@ -285,6 +294,12 @@ bool AtbNpuOffload::Init(AtbRole role) {
     }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "atb-npu: %s\n", e.what());
+    return false;
+  } catch (...) {
+    // XRT can also fail from pieces that are not std::exception. A
+    // misconfigured NPU has to degrade to the GPU path, never take the process
+    // down.
+    std::fprintf(stderr, "atb-npu: unknown failure during init\n");
     return false;
   }
 
@@ -359,15 +374,33 @@ AtbNpuOffload* AtbNpuOffload::Get(AtbRole role) {
 struct AtbNpuOffload::Impl {};
 AtbNpuOffload::AtbNpuOffload() = default;
 AtbNpuOffload::~AtbNpuOffload() = default;
-bool AtbNpuOffload::Init(AtbRole) { return false; }
-void* AtbNpuOffload::activations() const { return nullptr; }
-void* AtbNpuOffload::gate_weights() const { return nullptr; }
-void* AtbNpuOffload::up_weights() const { return nullptr; }
-void* AtbNpuOffload::gate_output() const { return nullptr; }
-void* AtbNpuOffload::up_output() const { return nullptr; }
-bool AtbNpuOffload::Launch() { return false; }
-bool AtbNpuOffload::Wait() { return false; }
-AtbNpuOffload* AtbNpuOffload::Get(AtbRole) { return nullptr; }
+bool AtbNpuOffload::Init(AtbRole) {
+  return false;
+}
+void* AtbNpuOffload::activations() const {
+  return nullptr;
+}
+void* AtbNpuOffload::gate_weights() const {
+  return nullptr;
+}
+void* AtbNpuOffload::up_weights() const {
+  return nullptr;
+}
+void* AtbNpuOffload::gate_output() const {
+  return nullptr;
+}
+void* AtbNpuOffload::up_output() const {
+  return nullptr;
+}
+bool AtbNpuOffload::Launch() {
+  return false;
+}
+bool AtbNpuOffload::Wait() {
+  return false;
+}
+AtbNpuOffload* AtbNpuOffload::Get(AtbRole) {
+  return nullptr;
+}
 
 #endif
 }  // namespace gufo::hip
