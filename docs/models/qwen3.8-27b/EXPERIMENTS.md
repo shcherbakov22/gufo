@@ -245,6 +245,58 @@ So the next question is not "is int4 activations lossless" -- it clearly is not
 -- but whether eligibility-scoped quantization plus finer granularity gets the
 loss back to the int8 level, where the step from fp16 was only 3.4e-4.
 
+### The end-to-end metric is chaotic at int4 precision
+
+Chasing a discrepancy between two builds of the instrument turned up something
+more important than the number. The two builds differed *only* in how the
+per-block scale is rounded:
+
+| build | cosine | top1 match |
+| --- | ---: | --- |
+| `scale = d * (127/7)` | 0.96105802 | yes |
+| `scale = (d * 127) / 7` | 0.92354196 | **no** |
+
+Each result reproduces to every printed digit across three runs. The maximum
+relative difference between those two scale computations is **1.2e-7** -- about
+two ULP, measured over the full exponent range. So a two-ULP change in one stored
+scale moves the logit cosine by 0.037 and **flips the top-1 token**, an
+amplification of roughly 3e5.
+
+Before concluding it was the scale, the alternative explanations were eliminated:
+the code formula does not matter (computing the code as `q * 7/127` or as the
+reconstructed quotient `(q*d)/((d*127)/7)` gives bit-identical results from one
+binary), the instrument is deterministic, and the source diff contains nothing
+else. Whether the residual cause is that last ULP or a codegen difference in the
+same kernel, the conclusion is the same: **two semantically equivalent builds of
+the same grid disagree by 0.037 of cosine.**
+
+That makes the end-to-end cosine the wrong instrument for this decision, for
+three reasons:
+
+* at int4 precision the output is **chaotic** in the perturbation, so "how much
+  quality does 4-bit activation lose" has no stable answer at this granularity;
+* `--validate-prefill`'s cosine is a *self-consistency* metric -- sequential
+  against batched within one build -- so at this sensitivity it samples a chaotic
+  distribution rather than measuring quality;
+* by contrast the same instrument is stable at int8: fp16 -> int8 costs 3.4e-4,
+  and the int8 builds are bit-identical across both (0.99965954 each time).
+
+Clipping the scale does not rescue it, and is non-monotonic: alpha=3 gives
+0.75796336 and alpha=5 gives 0.94447929, both with top1 broken. The activation
+outliers are load-bearing and cannot be clipped away.
+
+**So the int4 go/no-go needs different instruments:**
+
+1. a **per-GEMM** error metric -- activation quantization error against that
+   GEMM's output, which is stable because it does not amplify through 64 layers.
+   The oracle suite already measures per-format error this way, so the harness
+   exists; and
+2. a real held-out **quality** metric (perplexity or KL on text), not
+   sequential-vs-batched self-consistency.
+
+Both of those are prerequisites for judging the mixed design, which remains
+unmeasured and would perturb far less than the global W4A4 measured here.
+
 
 ## Deferred: Q2_K native prefill (chunked-path eligibility)
 

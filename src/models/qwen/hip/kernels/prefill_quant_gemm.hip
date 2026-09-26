@@ -1,4 +1,5 @@
 #if defined(ENGINE_ENABLE_HIP)
+#include <cmath>
 #include <cstdlib>
 
 #include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
@@ -944,15 +945,27 @@ namespace {
 // grouping and the int32 accumulator, so the existing int8 WMMA then computes
 // exactly the integers an int4 WMMA would -- the quality seen here is the real
 // int4 quality. Enabled only by GUFO_INT4_ACT.
-bool Int4ActivationSimulationEnabled() {
-  static const bool enabled = std::getenv("GUFO_INT4_ACT") != nullptr;
-  return enabled;
+// Returns 0 when disabled, -1 for the plain grid, or a positive clip factor.
+// The clip factor caps the quantization level at alpha * block RMS instead of
+// the block maximum, which is the test for whether the loss measured with the
+// plain grid is driven by activation outliers rather than by four bits itself.
+float Int4ActivationClipAlpha() {
+  static const float alpha = [] {
+    if (std::getenv("GUFO_INT4_ACT") == nullptr) {
+      return 0.0F;
+    }
+    const char* c = std::getenv("GUFO_INT4_CLIP_ALPHA");
+    return c == nullptr ? -1.0F : std::strtof(c, nullptr);
+  }();
+  return alpha;
 }
+
 
 template<bool StoreActivationSum>
 __global__ void RequantizeActivationInt4Kernel(void* __restrict__ y,
                                               std::size_t batch,
-                                              std::size_t num_blocks) {
+                                              std::size_t num_blocks,
+                                              float clip_alpha) {
   const std::size_t tiles = (batch + kQ8ActTileTokens - 1) / kQ8ActTileTokens;
   const std::size_t idx = (blockIdx.x * blockDim.x) + threadIdx.x;
   if (idx >= tiles * num_blocks * kQ8ActTileTokens) {
@@ -971,13 +984,28 @@ __global__ void RequantizeActivationInt4Kernel(void* __restrict__ y,
   if (d == 0.0F) {
     return;
   }
-  constexpr float kRatio = 7.0F / 127.0F;
+  float a[32];
+  float sumsq = 0.0F;
+#pragma unroll
+  for (int i = 0; i < 32; ++i) {
+    const std::int8_t* p = tile + ((i >> 4) * 256) + (tl * 16) + (i & 15);
+    a[i] = static_cast<float>(*p) * d;
+    sumsq += a[i] * a[i];
+  }
+  float level = d * 127.0F;
+  if (clip_alpha > 0.0F) {
+    const float clipped = clip_alpha * sqrtf(sumsq * (1.0F / 32.0F));
+    if (clipped > 0.0F && clipped < level) {
+      level = clipped;
+    }
+  }
+  const float d4 = level / 7.0F;
   int lo = 0;
   int hi = 0;
 #pragma unroll
   for (int i = 0; i < 32; ++i) {
     std::int8_t* p = tile + ((i >> 4) * 256) + (tl * 16) + (i & 15);
-    int v = static_cast<int>(__float2int_rn(static_cast<float>(*p) * kRatio));
+    int v = static_cast<int>(__float2int_rn(a[i] / d4));
     v = v > 7 ? 7 : (v < -7 ? -7 : v);
     *p = static_cast<std::int8_t>(v);
     if (i < 16) {
@@ -986,7 +1014,6 @@ __global__ void RequantizeActivationInt4Kernel(void* __restrict__ y,
       hi += v;
     }
   }
-  const float d4 = d * (127.0F / 7.0F);
   *d_slot = d4;
   if constexpr (StoreActivationSum) {
     float* sums = Q8ActSumSidecar(y, batch, num_blocks * 32);
@@ -1000,7 +1027,8 @@ __global__ void RequantizeActivationInt4Kernel(void* __restrict__ y,
 template<bool StoreActivationSum>
 void LaunchRequantizeActivationInt4(void* q8_1_out, std::size_t batch,
                                     std::size_t k, hipStream_t stream) {
-  if (!Int4ActivationSimulationEnabled() || batch == 0 || k < 32) {
+  const float clip_alpha = Int4ActivationClipAlpha();
+  if (clip_alpha == 0.0F || batch == 0 || k < 32) {
     return;
   }
   const std::size_t num_blocks = k / 32;
@@ -1008,7 +1036,7 @@ void LaunchRequantizeActivationInt4(void* q8_1_out, std::size_t batch,
   const std::size_t units = tiles * num_blocks * kQ8ActTileTokens;
   RequantizeActivationInt4Kernel<StoreActivationSum>
       <<<static_cast<unsigned int>((units + 255) / 256), 256, 0, stream>>>(
-          q8_1_out, batch, num_blocks);
+          q8_1_out, batch, num_blocks, clip_alpha);
 }
 
 template<bool StoreActivationSum>
