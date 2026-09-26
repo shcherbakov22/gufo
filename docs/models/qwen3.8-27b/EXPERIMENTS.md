@@ -2932,3 +2932,40 @@ activation grid whose true-token cost is large enough that the current evaluatio
 clear it.** The next step is a larger held-out evaluation -- the same instrument over many
 more tokens -- before any kernel work, because the two metrics currently point opposite
 ways and 27 rows is not enough to break the tie.
+
+### The larger evaluation: the 27-row NLL result does not replicate
+
+The instrument was extended rather than replaced. `qwen27b_target_test` now grows its context
+window with the fixture, takes a corpus file (`GUFO_QWEN27B_QUALITY_CORPUS`, with
+`..._PROMPT` and `..._ROWS`), and can dump and compare captures
+(`--dump <path>` / `--compare <a> <b>`) so two runs of the *same* model under different
+environment can be differenced -- necessary because the config knobs are process-global.
+The run below uses a 1024-token prompt, which is past the fp16/int8 prefill switch, and 512
+teacher-forced continuation rows: **513 logit rows over the full vocabulary**, against 27
+before. Shard: requant294-Q4K, 91.2% int4-eligible.
+
+| comparison | rows | mean KL | top-1 | mean NLL delta |
+| --- | ---: | ---: | ---: | ---: |
+| determinism (`base` vs `base2`) | 513 | **0** | **513/513** | 0 |
+| int8 step (`base` vs `int8`) | 513 | 0.000135 | 509/513 | +0.00134 |
+| **int4 step (`int8` vs `int4`)** | 513 | **0.003916** | **498/513** | **-0.00110** |
+
+Three things follow.
+
+1. **The instrument is exactly deterministic**, not merely reproducible: two full runs give
+   KL 0 and 513/513 top-1. Any nonzero KL here is the change, not the measurement.
+2. **The int4 activation grid costs 29x the int8 step.** int8 activations cost 0.000135 mean
+   KL and 4 top-1 flips in 513; four-bit activations cost 0.003916 and 15 flips, 2.9% of
+   rows. Both are reproducible, so the ordering is real.
+3. **The teacher-forced NLL cost does not replicate.** On the 27 handwritten fixtures the
+   int4 step appeared to add ~0.04 nats; over 513 rows of real text it is **-0.0011**, i.e.
+   no cost and marginally the other way. The earlier NLL figure was a small-sample artifact
+   of the 24 labels behind it. This is the second time in this document that a 27-row
+   conclusion failed to survive a larger sample.
+
+So the decision is now posed on a solid number, and the two metrics no longer conflict:
+four-bit activations perturb the output distribution measurably -- 0.0039 mean KL, about a
+quarter of the gap between the shipped 3.84 bpw shard and UD-Q4_K_S -- while leaving the
+true-token likelihood, which is what perplexity measures, unchanged. For a 2x on 91% of
+prefill FLOPs, that is a materially better position than the 27-row sample suggested, and
+it is the first int4 number in this document that rests on a sample large enough to use.

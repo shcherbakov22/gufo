@@ -1,8 +1,10 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -506,14 +508,24 @@ void CheckWideCache(Executor& reference) {
 
 enum class CheckMode { kAll, kPrefill, kConcurrency };
 
+bool AppendCorpusCase(Executor& executor, std::vector<Case>& cases);
+std::size_t QualityEnv(const char* name, std::size_t fallback);
+
 std::vector<Case> Capture(const char* path, bool check_replay,
                           CheckMode mode = CheckMode::kAll) {
   std::string error;
   auto owner = gufo::core::GgufReader::OpenFile(path, &error);
   Expect(owner != nullptr, error);
+  // The 27-row fixtures fit the default 128-token window; a corpus run needs
+  // prompt + rows, so the window grows with them.
+  const std::size_t context =
+      std::getenv("GUFO_QWEN27B_QUALITY_CORPUS") == nullptr
+          ? 128
+          : QualityEnv("GUFO_QWEN27B_QUALITY_PROMPT", 1024) +
+                QualityEnv("GUFO_QWEN27B_QUALITY_ROWS", 256) + 64;
   auto executor = Executor::CreateFromGguf(
       std::shared_ptr<const gufo::core::GgufReader>(std::move(owner)), &error,
-      128);
+      context);
   Expect(executor != nullptr, error);
   Expect(executor->GetConfig().hidden_size == 5120 &&
              executor->GetConfig().vocab_size == 248320,
@@ -531,6 +543,8 @@ std::vector<Case> Capture(const char* path, bool check_replay,
     executor->SetPromptHiddenCapture(true, target_layers);
   }
   std::vector<Case> cases;
+  if (AppendCorpusCase(*executor, cases))
+    return cases;
   for (const auto* text : kTexts) {
     // The middle case crosses the 16-row replay ring after three tokens.
     Case row{.tokens = executor->GetTokenizer().Encode(text),
@@ -695,11 +709,108 @@ void CompareReference(const std::vector<Case>& candidate,
             << " mean_kl=" << total_kl / rows << " mean_tv=" << total_tv / rows
             << " mean_nll_delta=" << total_nll_delta / labels << '\n';
 }
+std::size_t QualityEnv(const char* name, std::size_t fallback) {
+  const char* value = std::getenv(name);
+  return value == nullptr ? fallback
+                          : static_cast<std::size_t>(std::stoull(value));
+}
+
+// The 27-row fixture set is too small to adjudicate a 4-bit activation grid,
+// and its prompts never reach the fp16 prefill path. This builds one long
+// teacher-forced case from a corpus file so the same deterministic instrument
+// can be run over thousands of rows with prompts past the 1024-token switch.
+bool AppendCorpusCase(Executor& executor, std::vector<Case>& cases) {
+  const char* corpus = std::getenv("GUFO_QWEN27B_QUALITY_CORPUS");
+  if (corpus == nullptr)
+    return false;
+  std::ifstream in(corpus, std::ios::binary);
+  Expect(in.good(), "quality corpus is not readable");
+  in.seekg(0, std::ios::end);
+  std::string text(static_cast<std::size_t>(in.tellg()), '\0');
+  in.seekg(0);
+  in.read(text.data(), static_cast<std::streamsize>(text.size()));
+  const std::size_t prompt = QualityEnv("GUFO_QWEN27B_QUALITY_PROMPT", 1024);
+  const std::size_t rows = QualityEnv("GUFO_QWEN27B_QUALITY_ROWS", 256);
+  Case row{.tokens = executor.GetTokenizer().Encode(text),
+           .logits = {},
+           .prompt_size = prompt};
+  Expect(row.tokens.size() >= prompt + rows,
+         "quality corpus is shorter than prompt + rows");
+  row.tokens.resize(prompt + rows);
+  executor.Reset();
+  (void)executor.ForwardPromptBatch(std::span(row.tokens).first(prompt));
+  row.logits.push_back(Logits(executor));
+  for (std::size_t pos = prompt; pos < row.tokens.size(); ++pos) {
+    (void)executor.ForwardToken(row.tokens[pos], pos);
+    row.logits.push_back(Logits(executor));
+  }
+  cases.push_back(std::move(row));
+  return true;
+}
+
+void SaveCases(const std::vector<Case>& cases, const char* path) {
+  std::ofstream out(path, std::ios::binary);
+  Expect(out.good(), "cannot open dump for writing");
+  const auto put64 = [&](std::uint64_t v) {
+    out.write(reinterpret_cast<const char*>(&v), sizeof(v));
+  };
+  put64(cases.size());
+  for (const auto& c : cases) {
+    put64(c.prompt_size);
+    put64(c.tokens.size());
+    put64(c.logits.size());
+    for (const auto token : c.tokens)
+      put64(static_cast<std::uint64_t>(token));
+    for (const auto& row : c.logits) {
+      put64(row.size());
+      out.write(reinterpret_cast<const char*>(row.data()),
+                static_cast<std::streamsize>(row.size() * sizeof(float)));
+    }
+  }
+  Expect(out.good(), "dump write failed");
+}
+
+std::vector<Case> LoadCases(const char* path) {
+  std::ifstream in(path, std::ios::binary);
+  Expect(in.good(), "cannot open dump for reading");
+  const auto get64 = [&]() {
+    std::uint64_t v = 0;
+    in.read(reinterpret_cast<char*>(&v), sizeof(v));
+    Expect(in.good(), "dump read failed");
+    return v;
+  };
+  std::vector<Case> cases(get64());
+  for (auto& c : cases) {
+    c.prompt_size = get64();
+    const std::size_t tokens = get64(), logits = get64();
+    c.tokens.resize(tokens);
+    for (auto& token : c.tokens)
+      token = static_cast<Token>(get64());
+    c.logits.resize(logits);
+    for (auto& row : c.logits) {
+      row.resize(get64());
+      in.read(reinterpret_cast<char*>(row.data()),
+              static_cast<std::streamsize>(row.size() * sizeof(float)));
+      Expect(in.good(), "dump read failed");
+    }
+  }
+  return cases;
+}
+
 }  // namespace
 
 int main(int argc, const char* const* argv) {
   try {
+    if (argc >= 4 && std::string_view(argv[1]) == "--compare") {
+      CompareReference(LoadCases(argv[2]), LoadCases(argv[3]));
+      return 0;
+    }
     const char* model = argc > 1 ? argv[1] : std::getenv("GUFO_QWEN27B_MODEL");
+    if (argc >= 4 && std::string_view(argv[2]) == "--dump") {
+      SaveCases(Capture(model, false), argv[3]);
+      std::cout << "dumped " << argv[3] << "\n";
+      return 0;
+    }
     if (model == nullptr) {
       std::cout << "Set GUFO_QWEN27B_MODEL for the Qwen27B target check.\n";
       return 77;
