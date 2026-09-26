@@ -4344,3 +4344,47 @@ regression is being handled separately.
 needs XRT inside the engine, the NPU launch per layer, the dma-buf import of its output, and the
 row partition. That is the piece that would turn 1.34x into a measurement.
 
+## The dma-buf handoff does not work -- and an unchecked import hangs the GPU
+
+I built the handoff probe and it took the machine down. Recording both halves.
+
+**The crash.** `tools/qwen27b/atb_handoff.hip` runs the ATB kernel on the NPU, exports its
+output BO with `xrt::bo::export_buffer()` and imports it into HIP. The first version did not
+check a single return code, so when the import failed it launched a GPU kernel on a null mapped
+pointer. `dmesg`:
+
+```
+amdxdna_iommu_init: Enabled force_iova mode.
+amd_iommu_report_page_fault: 1579 callbacks suppressed
+amdgpu: ring gfx_0.0.0 timeout, signaled seq=6924296, emitted seq=6924299
+amdgpu: GPU reset begin! ... GPU reset(1) succeeded!
+```
+
+IOMMU page faults, then a ring timeout, then a GPU reset. The lesson is not subtle and it is now
+enforced in the code: **every call is checked before anything is launched**, and
+`ATB_HANDOFF_SKIP_GPU=1` stops after the import and map so the API path can be probed without
+running any kernel at all.
+
+**The finding.** With the checks in place, the same run in probe mode:
+
+```
+NPU run complete
+export -> fd 4
+import -> out of memory (2)
+HANDOFF ABORT at import
+ring timeouts after: 0
+```
+
+`hipImportExternalMemory` on an `amdxdna`-exported dma-buf returns **`hipErrorOutOfMemory`**.
+So the zero-copy handoff does not work as assumed earlier; the XRT BO is not importable into the
+GPU's address space on this stack.
+
+**This does not block the split.** The bound computed earlier still stands: the NPU's share of the
+FFN output is 40 MB per layer against ~19.5 ms of NPU compute, so it needs 2.05 GB/s, and a
+system-RAM copy at ~100 GB/s costs about **0.4 ms, 2%**. The handoff is a copy rather than a
+mapping, and the projection absorbs it.
+
+Still untested, and not on the critical path: whether a `/dev/dma_heap/system` dma-buf imported
+by *both* drivers would give zero-copy, or whether HIP can export its own allocation for XRT to
+import in the other direction. Either would recover the 2%; neither is needed to proceed.
+
