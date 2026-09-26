@@ -3195,3 +3195,153 @@ closed by instruction-set fact rather than by budget.
 
 **Falsifier: a non-GEMM stage above 3% whose kernel is not latency-bound by construction.**
 The deltanet recurrence and the attention kernel both are, and nothing else exceeds 1.1%.
+
+## The gate/up epilogue is free, and the FFN is IQ3_XXS rather than Q4_K
+
+Two measurements closed the last open explanation for a ~28% gap between the model-level
+GEMM rate and the plain-store bench. Both results were negative, which is why they matter.
+
+**The epilogue costs nothing.** One ablation bit (`Ablate & 8` disables the store in every
+epilogue branch) is the only difference between the arms, at real FFN geometry --
+m=17408, k=5120, batch=2048, paired `kGateUp`:
+
+| arm | median | TFLOPS |
+|---|---|---|
+| gate/up full | 17.995 ms | 40.57 |
+| gate/up no-epilogue | 17.972 ms | 40.63 |
+| store full | 9.184 ms | 39.75 |
+| store no-epilogue | 9.129 ms | 39.99 |
+| gate/up full (control B) | 17.988 ms | 40.59 |
+
+The epilogue is **+0.13%**, 0.023 ms of 18 ms, against a **0.04%** control residual -- the
+tightest control this work has had. The hypothesis that the SwiGLU epilogue explained the
+gap is dead, and the paired kernel itself is fine at 40.6 TF on production geometry.
+
+**The remaining explanation is the weight format, and the shard says so.** Parsing the GGUF
+header of the shipped 3.84 bpw shard shows every `ffn_gate`, `ffn_up` and `ffn_down` in
+all layers is **IQ3_XXS** (with a few IQ2_XXS/IQ2_XS/IQ4_XS outliers) -- not Q4_K, which is
+what the first bench had assumed. Whole-shard element histogram: IQ3_S 8.27e9, IQ4_XS
+6.78e9, **IQ3_XXS 6.43e9**, Q4_K 2.95e9. IQ3_XXS is also the format with the most expensive
+decode in the ISA study (+26% loop instructions over Q4_K), which lines up with the 27.7%
+gap the profiler recorded.
+
+Compounding it, `TryLaunchBatchedDualQuantGEMMSwiGLUFp16` has **no IQ3_XXS case at all**,
+so the FFN never reaches the paired kernel; it falls back to two separate `kStore` launches
+with `Complete=false`.
+
+A first format A/B at batch 512 (m=17408, k=5120) gave Q4_K 2.495 ms vs IQ3_XXS 2.565 ms,
+only **+2.8%** rather than the +26% the instruction counts predict. At low batch the shape is
+weight-bandwidth-bound, so decode cost hides behind the 50 MB weight stream.
+
+**Falsifier: the same A/B at batch 2048, which was not completed.** Near +25% means the gap
+is the IQ3_XXS decode and the lever is that decoder; near +3% means the gap is elsewhere and
+the format hypothesis is dead too.
+
+## The NPU is real: 57 TOPS of MAC issue, and every GEMM captures 15% of it
+
+The question was whether prefill can be split across the XDNA2 NPU and the iGPU. The
+short answer is that the NPU's *hardware* is a peer of the iGPU, that the open stack
+reaches ~15% of it for every datatype, and that the 15% is **not** the operand feed.
+
+### Getting the NPU to run at all
+
+The device was enumerating but every XRT command died on
+`mmap(len=64 MiB, offset=4 GiB) -> EAGAIN`. That is the NPU BAR, and the cause is
+`RLIMIT_MEMLOCK`, which is 8 MiB soft *and* hard here against a 64 MiB mapping. The
+persistent fix is `/etc/security/limits.d/xrt.conf` with `@render soft/hard memlock
+unlimited` plus re-login; running under root with `ulimit -l unlimited` is enough for a
+benchmark. It is not a driver or firmware bug, and `force_iova=1` does not help.
+
+Toolchain: mlir-aie **v1.4.3** plus Peano, both prebuilt and both matching this box --
+the wheel is `cp314` and the system Python is 3.14.7. `utils/env_install.sh` hard-requires
+python3.12 and must be bypassed with a manual venv. The ONNX/VitisAI path is structurally
+dead on Linux (the `voe` package does not exist for Linux x86_64; AMD's Ryzen AI release
+is Windows-only), so pyxrt or IRON are the only routes.
+
+### The first pass measured a kernel and called it a ceiling
+
+The stock whole-array GEMM and the TileFuse W4A16 kernel, at real FFN geometry:
+
+| workload | shape | time | throughput | check |
+|---|---|---|---|---|
+| W4A16 int4 wts, in-core dequant | 17408x5120x2048 | 57.97 ms | **6.30 TOPS** | PASS |
+| W4A16 calibration | 2048^3 | -- | 5.93 TOPS | PASS |
+| i8 whole-array, 64^3 inner tile | 2048^3 | -- | 8.74 TOPS | PASS |
+| bf16 via bfp16 | 2048^3 | -- | 5.81 TFLOPS | PASS |
+
+Taken at face value that is 6x slower than the iGPU and yields a ~1.14x split. **That
+reading was wrong**: it is a *kernel* number, exactly the error already corrected once on
+the GPU side when the fp16 WMMA ceiling had to be measured separately from the kernel.
+
+### The MAC-array roofline
+
+Register-resident operands, no DMA, `mac_8x8_8x8` issued back-to-back with independent
+accumulators (`tools/qwen27b/npu_peak_mac.py`):
+
+| datapath | per-tile | 32 tiles | note |
+|---|---|---|---|
+| int8 `mac_8x8_8x8` | 1.78 TOPS | **56.9 TOPS** | 1.07 MAC/cycle at ~1.62 GHz |
+| bfp16 (`bf16` -> bfp16 + `mac_8x8_8x8T_conf`) | 1.21 | **38.9 TOPS** | conversion is inside the loop, so a lower bound |
+| native bf16 (`2x mac_4x8_8x8_bf16`) | 0.089 | 2.8 TOPS | 14x slower; avoid this path |
+
+1.07 int8 MACs/cycle/tile is the architectural 1-per-cycle issue rate, so 32 tiles at
+~1.62 GHz gives ~57 TOPS -- matching AMD's 50 TOPS figure rather than exceeding it. The
+mlir-aie maintainer confirms the model on issue #2735: "the hardware can execute r*s*t
+MACs in a single cycle ... since r, s, t are intrinsic tile sizes."
+
+Two practical traps: **native bf16 is 14x slower than routing bf16 through bfp16**, and
+the bf16 kernel needs **4224 bytes of stack** against the 1024-byte default, so it will not
+build without `Worker(stack_size=8192)`.
+
+### The finding: the capture is datatype-independent
+
+| GEMM | achieved | its datatype's peak | capture |
+|---|---|---|---|
+| i8 whole-array | 8.74 TOPS | 56.9 | **15.4%** |
+| bf16 via bfp16 | 5.81 TFLOPS | 38.9 | **14.9%** |
+| W4A16 (bfp16 datapath) | 5.93 TOPS | 38.9 | **15.2%** |
+
+Three datatypes, three kernels, the same ~15%. A datatype-independent plateau is a
+dataflow signature, not a silicon limit. Note also that **NPU bfp16 (38.9 TOPS) is at
+parity with iGPU fp16 (40.6 TF measured in the FFN kernel)**, so the two engines are
+peers and the Amdahl ceiling on prefill is 1.84x rather than 1.14x.
+
+### The 15% is not the operand feed
+
+The obvious suspect was L1 operand bandwidth, since a GEMM must load operands per MAC.
+Measuring the int8 MAC rate at 0, 1 and 2 vector L1 loads per MAC
+(`tools/qwen27b/npu_peak_feed.py`):
+
+| L1 loads per MAC | per-tile | 32 tiles | % of peak |
+|---|---|---|---|
+| 1 | 1.617 | **51.75** | **91%** |
+| 2 | 1.118 | 35.76 | 63% |
+
+**One L1 vector load per MAC is essentially free.** The whole-array GEMM performs exactly
+one operand load per MAC, so its operand feed is not what caps it at 15%. That eliminates
+the intuitive explanation and moves the target to the two things this probe deliberately
+excludes: the **C-accumulator round-trip to L1** (the stock kernel loads and stores its
+four accumulators every k-chunk, 8 extra memory ops per 4 MMULs) and the per-call
+preamble/postamble and ObjectFIFO lock traffic.
+
+### Where this leaves the split
+
+The prize is real and the blocker is precise. If the ~15% can be lifted even to 50% of the
+bfp16 peak, the split gives ~1.4x on prefill; at full bfp16 rate it hits the 1.84x Amdahl
+bound (pp2048 ~870-980 tok/s against 544 today). What remains unproven is whether that is
+reachable on this toolchain -- the proprietary chess compiler also only reached 9 TOPS on
+the TileFuse dataflow, which is ~23% of the bfp16 peak, so the gap is not purely Peano.
+
+**Falsifier: a GEMM that keeps C in registers across the K reduction and beats 20 TOPS.**
+Below that the split stays marginal against the iGPU's own unclaimed 20-27% of headroom;
+above 30 TOPS it becomes the largest available lever on prefill. The intermediate step is
+to trace a whole-array GEMM to separate compute cycles from stall, which the stock
+`whole_array.py` does not support and would need rebuilding with trace enabled.
+
+**Caveat on the bfp16 path.** bfp16 is block floating point with a shared exponent per 8
+elements, which is why the W4A16 PASS criterion is `err / (|A||B|)` rather than plain
+relative error. It is float with f32 accumulation and can consume fp16-class activations
+directly, so it needs no int8 activation quantisation and no re-quantisation of the
+weights into a new 8-bit domain -- but the block exponent is a real numerical property
+that must be validated rather than assumed.
+
