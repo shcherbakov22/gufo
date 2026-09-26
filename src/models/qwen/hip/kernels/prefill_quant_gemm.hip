@@ -1057,6 +1057,19 @@ void LaunchZeroQ8ActTail(void* q8_1_out, std::size_t batch, std::size_t k,
 
 }  // namespace
 
+void LaunchRequantizeActivationInt4InPlace(void* q8_1_out, std::size_t batch,
+                                           std::size_t k, hipStream_t stream) {
+  if (batch == 0 || k < 32) {
+    return;
+  }
+  const std::size_t num_blocks = k / 32;
+  const std::size_t tiles = (batch + kQ8ActTileTokens - 1) / kQ8ActTileTokens;
+  const std::size_t units = tiles * num_blocks * kQ8ActTileTokens;
+  RequantizeActivationInt4Kernel<true>
+      <<<static_cast<unsigned int>((units + 255) / 256), 256, 0, stream>>>(
+          q8_1_out, batch, num_blocks, -1.0F);
+}
+
 void LaunchQuantizeActivationQ8_1(const void* bf16_x, void* q8_1_out,
                                   std::size_t batch, std::size_t k,
                                   hipStream_t stream) {

@@ -350,6 +350,60 @@ on the ~104 int4-eligible projections, for a 2x MMA rate on them.** Whether the
 model tolerates that is a genuine quality question that the sequential-vs-batched
 cosine cannot answer -- it needs a held-out metric (perplexity or KL).
 
+### The mixed design, measured
+
+The design the whole exercise pointed at -- per-tensor, not per-model, activation
+precision -- is implemented behind `GUFO_INT4_MIXED`. `gemm_weight` takes a
+private copy of the Q8_1 activation, pushes that copy onto the int4 grid, and
+hands it to the GEMM **only** when the weight type is int4-eligible
+(Q4_0/Q4_1/Q4_K/Q3_K/Q2_K). Every other consumer keeps the unmodified int8
+buffer, so the coarse grid never reaches a projection that did not opt in.
+
+ByteShape 3.84 bpw, `-p 2048 -n 1 --validate-prefill 2048`, all on the q8_1 path
+so the only difference between the last three rows is the activation grid:
+
+| configuration | cosine | top1 match | max abs diff |
+| --- | ---: | --- | ---: |
+| fp16 activations (production path) | 0.99999923 | yes | 0.0111 |
+| int8 q8_1 (the comparison baseline) | 0.99965954 | yes | 0.2703 |
+| **mixed int4, eligible GEMMs only** | **0.97941464** | **yes** | 2.0899 |
+| global int4, every GEMM | 0.92354196 | **no** | 3.2464 |
+
+Reading:
+
+* the mixed design is decisively better than global -- top-1 is preserved, and it
+  takes about half the cosine damage (0.020 against 0.076);
+* but against the step it replaces it is large: int8 costs 3.4e-4 relative to
+  fp16, and mixed int4 costs a further 2.0e-2 on top of int8, roughly **60x the
+  int8 step**;
+* the per-GEMM result above predicted the direction (+51% error on ~104
+  projections) but not that magnitude, which is a reminder that the model-level
+  cosine is not a linear function of per-GEMM error.
+
+**The caveat that must travel with this number:** the metric is
+sequential-vs-batched *self-consistency*, not quality, and at the global int4
+level it was measured above to be chaotic -- a 2-ULP change moved it by 0.037 and
+flipped top-1. The mixed figure reproduces within this build, but whether 0.9794
+is a stable characterisation or a draw from a chaotic distribution is **not**
+established. `top1_match` is the only field in that table which survived the
+earlier sensitivity test, and it is intact here.
+
+State of the decision:
+
+1. **weight repack: lossless** -- provable by capacity, nothing left to measure;
+2. **activation: the cost** -- 0.110 per-GEMM against the weight side's own
+   0.097, i.e. +51% on the eligible projections, and 2.0e-2 of model-level
+   self-consistency;
+3. **mixed beats global**, and keeps top-1;
+4. **missing: a held-out quality metric.** Without one, "is 2.0e-2 acceptable"
+   has no answer, and the int4 kernel work should not start on the strength of a
+   self-consistency number.
+
+Recommended next step: build the held-out metric *before* the kernel. If
+perplexity or KL moves by less than the run-to-run spread of two fp16 seeds, the
+int4 path is worth implementing; if it moves materially, the 2.2x is not
+available at four activation bits and the direction closes.
+
 
 ## Deferred: Q2_K native prefill (chunked-path eligibility)
 

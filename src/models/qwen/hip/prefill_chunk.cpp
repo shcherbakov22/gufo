@@ -21,6 +21,47 @@ namespace {
   return type == core::GgmlType::kQ8_0 || detail::IsNativeWmmaQuant(type);
 }
 
+// Formats whose codes fit signed int4 exactly, so the weight side of the int4
+// MMA is a lossless repack and only the activation precision changes.
+[[nodiscard]] constexpr bool IsInt4Eligible(core::GgmlType type) noexcept {
+  return type == core::GgmlType::kQ4_0 || type == core::GgmlType::kQ4_1 ||
+         type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ3_K ||
+         type == core::GgmlType::kQ2_K;
+}
+
+bool Int4MixedEnabled() {
+  static const bool enabled = std::getenv("GUFO_INT4_MIXED") != nullptr;
+  return enabled;
+}
+
+// Private copy of the Q8_1 activation pushed onto the int4 grid, so only the
+// GEMMs whose weight type is int4-eligible see the coarser grid. The caller's
+// buffer is left untouched for every other consumer.
+const void* Int4MixedActivation(const void* q8_act, std::size_t batch,
+                                std::size_t k, hipStream_t stream) {
+  static void* buffer = nullptr;
+  static std::size_t capacity = 0;
+  const std::size_t bytes = QuantizedActivationBytes(batch, k);
+  if (bytes > capacity) {
+    if (buffer != nullptr) {
+      HIP_CHECK(hipDeviceSynchronize());
+      (void)hipFree(buffer);
+      buffer = nullptr;
+      capacity = 0;
+    }
+    void* fresh = nullptr;
+    if (hipMalloc(&fresh, bytes) != hipSuccess) {
+      return nullptr;
+    }
+    buffer = fresh;
+    capacity = bytes;
+  }
+  HIP_CHECK(
+      hipMemcpyAsync(buffer, q8_act, bytes, hipMemcpyDeviceToDevice, stream));
+  LaunchRequantizeActivationInt4InPlace(buffer, batch, k, stream);
+  return buffer;
+}
+
 // Diagnostic: dump one activation buffer so the quantization error of a 4-bit
 // activation grid can be evaluated offline against real data. Enabled by
 // GUFO_DUMP_ACTIVATION=<path>; writes the first buffer it sees, then stops.
@@ -186,8 +227,16 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
           // whole weight matrix to a BF16 scratch buffer and then runs a BF16
           // hipBLASLt GEMM -- paying the dequant AND giving up the 2x matrix
           // -core throughput of the int8 path.
-          if (q8_act != nullptr) {
-            LaunchBatchedQuantGEMMPreQuantized(w.type, w.data, q8_act, output,
+          const void* act = q8_act;
+          if (act != nullptr && Int4MixedEnabled() && IsInt4Eligible(w.type)) {
+            const void* mixed =
+                Int4MixedActivation(act, batch_size, k, arena_.stream);
+            if (mixed != nullptr) {
+              act = mixed;
+            }
+          }
+          if (act != nullptr) {
+            LaunchBatchedQuantGEMMPreQuantized(w.type, w.data, act, output,
                                                batch_size, m, k, arena_.stream);
           } else {
             LaunchBatchedQuantGEMM(w.type, w.data, bf16_input, output,

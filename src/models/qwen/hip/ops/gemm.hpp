@@ -210,6 +210,15 @@ void LaunchQuantizeActivationQ8_1(const void* bf16_x, void* q8_1_out,
                                   std::size_t batch, std::size_t k,
                                   hipStream_t stream = nullptr);
 
+/// Pushes an already-quantized Q8_1 activation tile in place onto the signed
+/// int4 grid: scale *= 127/7, codes rounded and clamped to +/-7, sum sidecar
+/// rebuilt. int4 is a subset of int8, so the int8 WMMA then computes exactly
+/// the integers an int4 WMMA would. Used by the mixed int4 experiment, which
+/// re-quantizes a private copy so only the GEMMs that opted in see the grid.
+void LaunchRequantizeActivationInt4InPlace(void* q8_1_out, std::size_t batch,
+                                           std::size_t k,
+                                           hipStream_t stream = nullptr);
+
 /// Quantizes FP32 activation tensor X[B, K] to block_q8_1 activation blocks
 /// True when the fused SSM post-norm/gate + Q8_1 quantize kernel can take this
 /// head shape.
