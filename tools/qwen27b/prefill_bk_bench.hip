@@ -171,26 +171,41 @@ const TypeCase kTypes[] = {
 template<gufo::core::GgmlType Type, int BM, int BN, int WM, int WN,
          bool Complete, int BK = 4>
 void LaunchTile(const void* w, const short* x, float* y, std::size_t batch,
-                std::size_t m, std::size_t k, hipStream_t stream) {
+                std::size_t m, std::size_t k, hipStream_t stream,
+                unsigned dyn_smem = 0) {
   const dim3 grid(static_cast<unsigned>((batch + BN - 1) / BN),
                   static_cast<unsigned>((m + BM - 1) / BM));
   gufo::hip::HalfPrefillGemmKernel<BM, BN, WM, WN, Type,
                                    gufo::hip::HalfEpilogue::kStore, Complete,
                                    Type, BK>
-      <<<grid, WM * WN * 32, 0, stream>>>(w, x, y, batch, m, k, nullptr);
+      <<<grid, WM * WN * 32, dyn_smem, stream>>>(w, x, y, batch, m, k, nullptr);
+}
+
+template<gufo::core::GgmlType Type, int BM, int BN, int WM, int WN, int BK>
+void ReportBlocks(const char* tag, unsigned dyn) {
+  using KFn = void (*)(const void*, const short*, float*, int, int, int,
+                       const float*, const void*);
+  KFn fn = gufo::hip::HalfPrefillGemmKernel<BM, BN, WM, WN, Type,
+                                            gufo::hip::HalfEpilogue::kStore,
+                                            false, Type, BK>;
+  int n = 0;
+  hipOccupancyMaxActiveBlocksPerMultiprocessor(&n, fn, WM * WN * 32, dyn);
+  std::printf("blocks/CU %-22s thr=%-5d dyn=%-6u -> %d\n", tag, WM * WN * 32,
+              dyn, n);
 }
 
 const char* TileName(int variant) {
   switch (variant) {
     case 0: return "256x256 w8n4 bk4 BASE";
-    case 1: return "128x256 w4n4 bk2 2blk";
-    case 2: return "128x256 w4n4 bk4";
-    case 3: return "128x256 w4n8 bk2";
-    case 4: return "256x256 w8n4 bk2";
+    case 1: return "128x128 w4n2 bk4 2blk";
+    case 2: return "128x128 w4n2 bk4 FORCE1";
+    case 3: return "128x128 w4n4 bk4 2blk r1";
+    case 4: return "128x128 w4n4 bk4 FORCE1";
+    case 5: return "128x128 w2n4 bk4 2blk";
     default: return "?";
   }
 }
-constexpr int kTileVariants = 5;
+constexpr int kTileVariants = 6;
 
 template<gufo::core::GgmlType Type>
 void LaunchTileVariant(const void* w, const short* x, float* y,
@@ -198,10 +213,11 @@ void LaunchTileVariant(const void* w, const short* x, float* y,
                        int variant, hipStream_t stream) {
   switch (variant) {
     case 0: LaunchTile<Type, 256, 256, 8, 4, false, 4>(w, x, y, batch, m, k, stream); break;
-    case 1: LaunchTile<Type, 128, 256, 4, 4, false, 2>(w, x, y, batch, m, k, stream); break;
-    case 2: LaunchTile<Type, 128, 256, 4, 4, false, 4>(w, x, y, batch, m, k, stream); break;
-    case 3: LaunchTile<Type, 128, 256, 4, 8, false, 2>(w, x, y, batch, m, k, stream); break;
-    case 4: LaunchTile<Type, 256, 256, 8, 4, false, 2>(w, x, y, batch, m, k, stream); break;
+    case 1: LaunchTile<Type, 128, 128, 4, 2, false, 4>(w, x, y, batch, m, k, stream, 0); break;
+    case 2: LaunchTile<Type, 128, 128, 4, 2, false, 4>(w, x, y, batch, m, k, stream, 32768); break;
+    case 3: LaunchTile<Type, 128, 128, 4, 4, false, 4>(w, x, y, batch, m, k, stream, 0); break;
+    case 4: LaunchTile<Type, 128, 128, 4, 4, false, 4>(w, x, y, batch, m, k, stream, 32768); break;
+    case 5: LaunchTile<Type, 128, 128, 2, 4, false, 4>(w, x, y, batch, m, k, stream, 0); break;
     default: break;
   }
 }
@@ -210,6 +226,15 @@ template<gufo::core::GgmlType Type>
 void RunTiles(std::size_t m, std::size_t k, std::size_t batch,
               unsigned iterations, int pattern) {
   using namespace gufo::hip;
+  if (Type == GgmlType::kQ4_K) {
+    ReportBlocks<Type, 256, 256, 8, 4, 4>("256x256 w8n4 bk4", 0);
+    ReportBlocks<Type, 128, 128, 4, 2, 4>("128x128 w4n2 bk4", 0);
+    ReportBlocks<Type, 128, 128, 4, 2, 4>("128x128 w4n2 bk4", 32768);
+    ReportBlocks<Type, 128, 128, 4, 4, 4>("128x128 w4n4 bk4", 0);
+    ReportBlocks<Type, 128, 128, 4, 4, 4>("128x128 w4n4 bk4", 32768);
+    ReportBlocks<Type, 128, 256, 4, 4, 4>("128x256 w4n4 bk4", 0);
+    ReportBlocks<Type, 256, 256, 8, 4, 2>("256x256 w8n4 bk2", 0);
+  }
   const std::size_t block_bytes =
       gufo::quant::QuantizedRowBytes(Type, gufo::quant::QuantizedBlockElements(Type));
   const std::size_t weight_bytes = gufo::quant::QuantizedRowBytes(Type, k) * m;

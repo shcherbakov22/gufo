@@ -1135,6 +1135,79 @@ fast: it is that **BK is the parameter LDS capacity buys, and the kernel is
 already spending all 64 KiB on the largest BK that fits.** The residual overhead
 is rent on that ceiling.
 
+### The second resident block, tested properly: it is worth about one percent
+
+Step 5 above -- "the drain can only be hidden by a second resident block" --
+implicitly assumed there *is* a drain to hide. That had never been tested with a
+fair pair, because every two-block configuration found so far also paid either
+the stage-count penalty (`BK=2`) or the fragment-ratio penalty (128x128 at 512
+threads). Two configurations pay neither, and neither had been tried:
+
+| | tile | threads | BK | loads/MMA | blocks/CU |
+| --- | --- | --- | --- | --- | --- |
+| baseline | 256x256 w8n4 | 1024 | 4 | 0.75 | 1 |
+| A | 128x128 w4n2 | 256 | 4 | **0.75** | **2** |
+| B | 128x128 w4n4 | 512 | 4 | 1.00 | **2** |
+
+Both keep `BK=4` (80 stages), so nothing else changes. To get a control that
+differs *only* in block residency, each was also run with 32 KiB of unused
+dynamic shared memory passed to the launch, which pushes `32768 + 32768` to the
+64 KiB cap and leaves room for exactly one block. The runtime's own occupancy
+model confirms the control does what it claims:
+
+```
+blocks/CU 256x256 w8n4 bk4   thr=1024  dyn=0      -> 1
+blocks/CU 128x128 w4n2 bk4   thr=256   dyn=0      -> 2
+blocks/CU 128x128 w4n2 bk4   thr=256   dyn=32768  -> 1
+blocks/CU 128x128 w4n4 bk4   thr=512   dyn=0      -> 2
+blocks/CU 128x128 w4n4 bk4   thr=512   dyn=32768  -> 1
+blocks/CU 128x256 w4n4 bk4   thr=512   dyn=0      -> 1
+```
+
+Q4_K, M=17408 K=5120 batch=2048, median of three passes:
+
+| tile | 2 blocks/CU | 1 block/CU | value of the second block |
+| --- | --- | --- | --- |
+| 128x128 w4n2 (0.75 loads/MMA) | 12.88 ms | 13.03 ms | **1.2%** |
+| 128x128 w4n4 (1.00 loads/MMA) | 15.25 ms | 15.17 ms | **-0.5%** |
+| 256x256 w8n4 (baseline) | -- | 12.14 ms | -- |
+
+The noise floor between two instantiations of the identical baseline is about
+1.3% (measured separately), so a genuinely coscheduled second block buys
+**nothing beyond the noise floor**. It is resident -- the occupancy model and the
+LDS arithmetic both say so, and the timing moves when it is taken away -- but it
+does not recover the 30%.
+
+That is a real result, because it rules out the whole class of explanation the
+structure argument rested on. If a fifth of the block's cycles were matrix-pipe
+idle while it staged, decoded, waited at a barrier or wrote its epilogue, a
+second block would be filling them and the speedup would be large. It is 1.2%.
+**There is no idle pipe to fill**, so the 30% is not latency, not a drain, and
+not something a second block, a persistent CTA or a partial barrier could have
+recovered. The phases are disjoint in *program order within a block*, but the
+matrix pipe is still retiring the MMAs issued before the barrier while the waves
+are in the next staging region -- which is why the phase percentages do not sum
+to a description of pipe occupancy.
+
+The instruction mix says the same thing from the other side. The Q4_K 256x256
+kStore kernel's K-loop body is 193 instructions carrying 32 WMMAs, and the
+weight decode is already *inside* it -- 50 of those instructions are the
+`v_bfe`/`v_cvt`/`v_fma_mix` nibble unpacking, interleaved with the MMAs by the
+scheduler. The whole function contains 48 `ds_load_b128` and 4 `ds_store_b128`
+in total. Per stage a SIMD issues 8 waves x 193 = 1544 instructions against
+about 8000 cycles of matrix-pipe time, so roughly 80% of issue slots are spare:
+the non-MMA instructions in the loop are free, and they are already overlapped.
+
+**What that leaves is work removal, not re-overlap.** The only two sizeable
+non-MMA blocks are the fp32 output store (about 7% of the block in the kStore
+variant this was profiled on) and the quant decode (7.3%). The first is likely
+already absent from the production path, which runs the fused SwiGLU/GateUp
+epilogue and writes quantized activations rather than fp32 -- so the "66% of the
+instruction ceiling" figure is pessimistic for production and should be
+re-measured on the fused epilogue rather than estimated from kStore. The second
+is the int4 decision: nothing else in the block is removable without changing
+the numerics.
+
 
 
 
