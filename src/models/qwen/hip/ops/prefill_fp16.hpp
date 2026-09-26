@@ -23,6 +23,13 @@ void LaunchBatchedRMSNormFp16(const float* input, const float* residual,
 // untouched.
 void LaunchBfp16RoundTripFp16InPlace(void* buffer, std::size_t count, int bits,
                                      hipStream_t stream);
+// Runtime repack of one quantised weight tensor [n_out, k] into the ATB bfp16 B
+// operand, written to out. Removes the need to hold a packed copy of the model:
+// the staging buffer is reused per layer. Needs k divisible by 64 and n_out by
+// 128, and out to hold n_out * k * 9 / 8 bytes.
+void LaunchAtbRepackBfp16(const void* weights, core::GgmlType type,
+                          std::size_t n_out, std::size_t k, void* out,
+                          hipStream_t stream);
 // Packed GGUF weights are scaled in FP32, rounded to FP16 inside the kernel,
 // then multiplied by FP16 activations with FP32 accumulation in K16 order.
 // Supports the Qwen27B Q4 shard's native quant formats and K divisible by 256.

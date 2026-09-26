@@ -4312,3 +4312,35 @@ that is several percent of uncertainty on every figure. The 543.93 reference is 
 reproducible on a loaded desktop, and the 8-core row shows the sensitivity is not linear at the
 top end either.
 
+## The repack hook, measured in situ
+
+`GUFO_ATB_PACK=1` now repacks the layer's gate, up and down tensors into a 200 MB reusable
+staging buffer inside `prefill_chunk.cpp`, at the FFN site, using the same kernel the tool
+validated. Nothing consumes the output yet -- the split is the consumer -- so what it measures is
+the cost the split will pay.
+
+Kernel trace of a full prefill (rocprofv3 `--kernel-trace`):
+
+| kernel | calls | total | per call |
+| --- | ---: | ---: | ---: |
+| `AtbRepackKernel` | 384 | 587.85 ms | **1.53 ms** |
+
+384 calls is 65 layers x 3 tensors x 2 forwards (warmup + timed). So the in-situ cost is
+**1.53 ms per tensor** against the standalone tool's 0.91-1.20 ms -- the gap is launch overhead
+and the real geometry.
+
+Per layer that is 3 x 1.53 = **4.59 ms** for the whole FFN; the NPU's 43.8% share is
+**2.01 ms**. The GPU's per-layer work becomes 19.5 + 2.01 = 21.5 ms against the NPU's 19.5 ms, so
+the FFN speedup goes 1.78x -> **1.62x** and the prefill projection
+`1/(0.33 + 0.67/1.62)` = **1.34x** -- against 1.36x from the tool-level estimate.
+
+**Caveat that applies to every number taken in this session**: the box runs with `iommu=pt`,
+which was enabled for the NPU and costs about 10% of prefill (543.93 -> ~492 tok/s). The split's
+relative costs -- the repack, the A encode, the balance point -- should carry over, but these
+absolute pp2048 values are not comparable with the 543.93 reference, and a kernel fix for the
+regression is being handled separately.
+
+**Still to come**: the wiring. The repack writes bytes into a buffer nobody reads; the split
+needs XRT inside the engine, the NPU launch per layer, the dma-buf import of its output, and the
+row partition. That is the piece that would turn 1.34x into a measurement.
+

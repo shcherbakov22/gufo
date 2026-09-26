@@ -623,6 +623,32 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                                         batch_size * hidden_size,
                                         std::atoi(bits), arena_.stream);
       }
+      // Runtime repack of this layer's FFN weights into the ATB bfp16 B
+      // operand, so no packed copy of the model has to be resident. The staging
+      // buffer is allocated once and reused. Nothing consumes it yet, so this
+      // measures the per-layer cost the split will pay; it is the full-tensor
+      // form, and the split needs only its share of each tensor.
+      if (std::getenv("GUFO_ATB_PACK") != nullptr) {
+        static void* pack_buf = nullptr;
+        const std::size_t gate_packed =
+            static_cast<std::size_t>(intermediate_size) * hidden_size * 9 / 8;
+        const std::size_t down_packed =
+            static_cast<std::size_t>(hidden_size) * intermediate_size * 9 / 8;
+        const std::size_t need = std::max(gate_packed, down_packed);
+        if (pack_buf == nullptr) {
+          HIP_CHECK(hipMalloc(&pack_buf, 2 * need));
+        }
+        auto* base = static_cast<unsigned char*>(pack_buf);
+        LaunchAtbRepackBfp16(layer.ffn_gate.data, layer.ffn_gate.type,
+                             intermediate_size, hidden_size, base,
+                             arena_.stream);
+        LaunchAtbRepackBfp16(layer.ffn_up.data, layer.ffn_up.type,
+                             intermediate_size, hidden_size, base + need,
+                             arena_.stream);
+        LaunchAtbRepackBfp16(layer.ffn_down.data, layer.ffn_down.type,
+                             hidden_size, intermediate_size, base,
+                             arena_.stream);
+      }
     } else if (ffn_feeds_q8_only) {
       // The post-attention residual add folds into the norm: one pass reads the
       // hidden state and the attention output, writes the updated hidden state

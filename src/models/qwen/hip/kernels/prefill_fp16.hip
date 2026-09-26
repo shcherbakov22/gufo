@@ -889,6 +889,75 @@ __global__ void Bfp16RoundTripFp16Kernel(__half* data, std::size_t count,
     data[base + i] = __float2half(rintf(value[i] / step) * step);
   }
 }
+
+// config3's ATB L1 tile: 64 reduction rows by 128 output columns, emitted
+// column-major, each tile shuffled into 1x2 super-blocks of 8x8 column-major
+// sub-blocks. Numbers from the vendored layout header.
+constexpr unsigned kAtbL1K = 64;
+constexpr unsigned kAtbL1N = 128;
+constexpr unsigned kAtbGroupsPerTile = (kAtbL1K * kAtbL1N) / 8;
+
+// Runtime repack of one quantised weight tensor into the ATB bfp16 B operand.
+// One thread per bfp16 group: 8 consecutive reduction rows at one output
+// column, which the shuffle makes contiguous, so each thread writes 9
+// contiguous bytes read from 8 weights of one row. This is what removes the
+// need to hold a packed copy of the model -- the staging buffer is reused.
+__global__ void AtbRepackKernel(const void* __restrict__ w,
+                                std::size_t row_bytes, int type_id,
+                                std::size_t l1_rows, std::size_t groups,
+                                std::uint8_t* __restrict__ out) {
+  const std::size_t g =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (g >= groups) {
+    return;
+  }
+  const std::size_t tile = g / kAtbGroupsPerTile;
+  const std::size_t gt = g % kAtbGroupsPerTile;
+  const std::size_t l1c = tile / l1_rows;
+  const std::size_t l1r = tile % l1_rows;
+  const unsigned cib = static_cast<unsigned>(gt % 8);
+  const unsigned t1 = static_cast<unsigned>(gt / 8);
+  const unsigned bis = t1 % 2;
+  const unsigned t2 = t1 / 2;
+  const unsigned sbr = t2 % 8;
+  const unsigned sb = t2 / 8;
+  const unsigned sbc = 2 * sb;
+
+  const std::size_t n = l1c * kAtbL1N + (sbc + bis) * 8 + cib;
+  const std::size_t k0 = l1r * kAtbL1K + sbr * 8;
+
+  const void* row = static_cast<const std::uint8_t*>(w) + n * row_bytes;
+  const core::GgmlType type = static_cast<core::GgmlType>(type_id);
+  // k0 is a multiple of 8, so a group is one half of one 16-element sub-block
+  // and never straddles two. Decoding per element instead repeats this 8x,
+  // which cost 2.8x on the first version.
+  QuantSub16 sub;
+  DecodeQuantSub16(type, row, k0 / 16, sub);
+  const unsigned within = static_cast<unsigned>(k0 % 16);
+  float value[8];
+  float amax = 0.0F;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    value[i] = sub.scale * static_cast<float>(sub.q[within + i]) - sub.offset;
+    amax = fmaxf(amax, fabsf(value[i]));
+  }
+  std::uint8_t* dst = out + g * 9;
+  if (amax == 0.0F) {
+    for (int i = 0; i < 9; ++i) {
+      dst[i] = 0;
+    }
+    return;
+  }
+  int exponent = 0;
+  (void)frexpf(amax, &exponent);
+  dst[0] = static_cast<std::uint8_t>(exponent + 126);
+  const float step = ldexpf(1.0F, exponent - 7);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int magnitude = static_cast<int>(floorf(value[i] / step + 0.5F));
+    dst[1 + i] = static_cast<std::uint8_t>(static_cast<std::int8_t>(magnitude));
+  }
+}
 }  // namespace
 void LaunchBatchedRMSNormFp16(const float* x, const float* residual,
                               const float* weight, float* sum_out, void* out,
@@ -916,6 +985,23 @@ void LaunchBfp16RoundTripFp16InPlace(void* buffer, std::size_t count, int bits,
   Bfp16RoundTripFp16Kernel<<<static_cast<unsigned int>((groups + 255) / 256),
                              256, 0, stream>>>(static_cast<__half*>(buffer),
                                                groups * 8, bits);
+}
+
+void LaunchAtbRepackBfp16(const void* weights, core::GgmlType type,
+                          std::size_t n_out, std::size_t k, void* out,
+                          hipStream_t stream) {
+  if (weights == nullptr || out == nullptr) {
+    return;
+  }
+  const std::size_t row_bytes = quant::QuantizedRowBytes(type, k);
+  if (row_bytes == 0 || k % kAtbL1K != 0 || n_out % kAtbL1N != 0) {
+    return;
+  }
+  const std::size_t groups = (n_out * k) / 8;
+  const std::size_t blocks = (groups + 255) / 256;
+  AtbRepackKernel<<<static_cast<unsigned int>(blocks), 256, 0, stream>>>(
+      weights, row_bytes, static_cast<int>(type), k / kAtbL1K, groups,
+      static_cast<std::uint8_t*>(out));
 }
 template<HalfEpilogue Epilogue>
 void DirectGemm(gufo::core::GgmlType type, const void* w, const void* x,
