@@ -893,6 +893,37 @@ accumulator, a per-read data dependency, or reading through an
 `s_waitcnt`-separated sequence. Until then, treat any single reading as a
 sanity check and require a repeat before believing a number.
 
+### Persistent CTAs: bit-exact, and 4% slower
+
+Implemented the persistent schedule -- 20 blocks, one per CU, each striding
+over the 544 logical tiles with the existing group swizzle re-derived from the
+item index. The output fingerprint is identical to the launched-grid baseline,
+so the restructuring is correct. Clean interleaved A/B, no instrumentation, four
+runs each:
+
+| | ms per GEMM | TFLOPS |
+| --- | --- | --- |
+| baseline, 544 blocks | 9.90 / 9.99 / 9.93 / 10.01 | 36.5-36.9 |
+| persistent, 20 blocks | 10.36 / 10.38 / 10.34 / 10.37 | 35.2 |
+
+**4% slower, consistently.** So the ~14% residual is not launch and drain that a
+persistent schedule can remove. The workgroup scheduler evidently overlaps block
+transitions already, and dynamic issue beats static assignment: persistence pins
+the ragged tail (8 CTAs take 28 items while 12 take 27) into the critical path,
+where the scheduler would otherwise fill it. Reverted; the macro-guarded
+scaffolding is gone from the tree.
+
+That was the last idea with a measured mechanism behind it, and it failed. What
+remains is the decomposition: K loop 70.4% and at the MMA peak, `commit` 7.3%,
+barriers 6.5%, `fetch` 2.9%, epilogue and init 12.9%, and a residual that is
+neither launch nor tail. Overlapping the block-level 30% needs two blocks per
+CU, which needs 32 KiB of LDS each; the only routes there are BK=2, which doubles
+the stage count and gives back exactly what it saves, or a 128x128 tile, measured
+15-40% worse. So the fp16 prefill kernel is at its practical limit for this
+structure -- 66% of the pure-MMA ceiling, and the ceiling is what its K loop
+already achieves.
+
+
 
 
 
