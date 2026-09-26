@@ -2177,3 +2177,48 @@ profile above explains why it was never safe to launch in the first place.
 VGPRs at 1024 threads with 136 B/thread of scratch is a rejected profile -- and
 (2) run a tiny grid under a hard `timeout` with `doas dmesg` watched alongside
 before ever running at production size.
+
+
+### The double buffer, done properly: bit-exact, spill-free, and 10% slower
+
+Second attempt, fixing the register problem two ways: the buffer index is now
+**compile-time** (two literal-indexed K bodies via `k_loop.template operator()<0|1>()`
+so the LDS slot is a constant), and the merged mapping puts A on threads
+`[0, BM*kStep)` and B on the rest so both keep full thread occupancy instead of
+half idling.
+
+Compile-only resource gate, run before the kernel went near the GPU:
+
+| variant | static LDS | scratch | VGPRs |
+| --- | ---: | ---: | ---: |
+| `Stages=1` | 65536 | **0** | 136 |
+| `Stages=2` | 65536 | **0** | **155** |
+
+Zero scratch and 155 VGPRs against a 192 ceiling, so it is launchable -- and it
+launches: **bit-identical output at two shapes** (0 of 4,194,304 and 0 of
+35,651,584 elements differ) with no new dmesg event.
+
+And it is slower:
+
+| shape | `Stages=1` | `Stages=2` | delta |
+| --- | ---: | ---: | ---: |
+| m=4096 k=2560 batch=1024 | 0.6047 ms / 35.51 TF | 0.6314 ms / 34.01 TF | -4.4% |
+| m=17408 k=5120 batch=2048 | 8.8800 ms / 41.11 TF | 9.7789 ms / 37.33 TF | **-10.1%** |
+
+**The mechanism is the LDS capacity, from the other direction.** A double buffer
+needs two *full-size* stages; at 256x256 that is 128 KiB against the 64 KiB the part
+has. So each buffer can only be **half** a stage: the stage count doubles from 80 to
+160, and because the single buffer needed two barriers per stage while each half
+buffer needs one, the **barrier count is unchanged at 160**. The barrier saving is
+exactly zero, and the per-call fixed cost of fetch and commit doubles. The overlap
+does not pay for the extra boundaries.
+
+This is the same verdict the earlier attempt reached, but now with a bit-exact,
+spill-free implementation and the reason identified. **The commit's 1.15 ms cannot
+be overlapped at this tile size**: hiding it needs a second buffer of the same stage
+size, the LDS budget is exactly consumed by the first, and shrinking the stage to fit
+two costs more in boundaries than the overlap returns.
+
+One measurement note: `Stages=1` reads **41.11 TFLOPS** here against 39.5 in the
+ablation session, so there is roughly 4% of session-to-session variance in this
+harness. Effects below that are not resolvable without a null control.
