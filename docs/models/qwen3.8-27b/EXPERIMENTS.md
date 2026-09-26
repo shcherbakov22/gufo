@@ -596,15 +596,15 @@ decides between +4% and +40%.
 
 ### Answered: the int8 overhead is instruction issue, not LDS
 
-> **Superseded, and left in place as a warning.** Every instruction count in this
-> section is for `WKQuantA8BlockedWmmaGEMMKernel<128,128,2,4,2,32>` -- the **wave32**
-> control -- not for the wave64 kernel that ships for large-batch prefill. The
-> shipping body runs 9.92 instructions per MMA (31% of issue) and is **stall**-bound,
-> so the two conclusions drawn here (issue-bound, route closed) were aimed at an
-> instantiation production does not use on the shapes that matter. They were reached
-> by measuring a real kernel correctly and then attributing the result to the wrong
-> one. See `int8, closed: the loss is the format, and the production tile is the
-> optimum` at the end of this document.
+> **Superseded twice over, and left in place as a warning.** Every instruction
+> count in this section is for `WKQuantA8BlockedWmmaGEMMKernel<128,128,2,4,2,32>`,
+> which is **never dispatched** by this model -- as is the wave64 variant a later
+> revision substituted for it. The live instantiation is
+> `<128,64,4,8,1,Type,32>`, reached only for chunks below 1024 tokens. The two
+> conclusions drawn here (issue-bound, route closed) were reached by measuring a
+> real kernel correctly and then attributing the result to the wrong one. See
+> `int8: the tuning target was dead code, and the A/B harness had no noise floor`
+> at the end of this document.
 
 The in-kernel clock instrumentation that worked for fp16 **does not work here**.
 Repeated runs of the same binary produced K-loop shares of 57%, 76%, 354% and
@@ -1771,144 +1771,81 @@ cycles at 128 B/cycle. If the window is store-bandwidth-bound, the decode's shar
 of it is small enough that perfect hoisting would have been worth a few percent
 at best -- which is what the head placement measured, as a loss.
 
-## int8, closed: the loss is the format, and the production tile is the optimum
 
-The wave64 launcher `TryLaunchQuantPrefillWave64` dispatches
-`WKQuantA8BlockedWmmaGEMMKernel<128, 128, 2, square ? 2 : 4, square ? 2 : 1, Type, 64>`
-for the large-batch prefill shapes. The question was whether it could be brought
-nearer its 50.31 TFLOPS instruction ceiling. It cannot, and the residual is not a
-scheduling artifact.
+## int8: the tuning target was dead code, and the A/B harness had no noise floor
 
-**Correction to `Answered: the int8 overhead is instruction issue, not LDS`.**
-The earlier verdict that this kernel is
-issue-bound was derived from `WKQuantA8BlockedWmmaGEMMKernel<128,128,2,4,2,32>` at
-26.91 instructions per MMA -- the **wave32** control. That instantiation is only
-reached when the wave64 predicate (`batch >= 96 && m >= 1024 && k >= 1024 &&
-k % 256 == 0`) fails. For the pp2048 shapes that dominate prefill the shipping
-kernel is wave64, and it executes far fewer instructions per MMA:
+This section retracts the int8 findings above it, including the section it
+replaces. Three separate things turned out to be false.
 
-| template (K-loop body, first to last WMMA) | MMAs | instructions | instr/MMA | fp32 ops | fp32/MMA | ds_ loads | s_waitcnt |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **128x128 bk2 w4n1 (production)** | 64 | 635 | **9.92** | 465 | **7.27** | 50 | 49 |
-| 128x128 bk1 w4n1 | 32 | 269 | 8.41 | 195 | 6.09 | 18 | 21 |
-| 128x128 bk2 w2n2 | 64 | 593 | 9.27 | 439 | 6.86 | 43 | 45 |
-| 128x128 bk4 w4n1 | 128 | 1331 | 10.40 | 981 | 7.66 | 114 | 98 |
-| 128x64 bk2 w4n1 | 32 | 402 | 12.56 | 241 | 7.53 | 28 | 18 |
-| 64x128 bk2 w4n1 | 32 | 441 | 13.78 | 240 | 7.50 | 48 | 38 |
-| 128x256 bk2 w4n1 | 128 | 1288 | 10.06 | 960 | 7.50 | 98 | 93 |
-| 256x128 bk2 w2n2 | 128 | 1696 | 13.25 | 1009 | 7.88 | 54 | 88 |
+### 1. The model does not run the wave64 kernel
 
-The span runs from the first to the last WMMA of the unrolled body, so it
-undercounts loads issued ahead of the first MMA; it is a consistent lower bound
-across rows, and the fp16 comparison (193 instructions / 32 WMMA = 6.03) uses the
-same method.
+`UseQwen27bFp16Prefill` (prefill_chunk.cpp:102) returns false -- electing the
+q8/int8 route -- only when `batch < 1024`. A bench chunk of 2048 tokens therefore
+takes the **fp16** path. Tracing the chunk sizes for `gufo bench -p 2048 -n 1 -r 1`:
 
-An `iu8` MMA occupies about 32.5 SIMD-cycles at the measured ceiling. The
-production wave64 body issues 9.92 instructions in that window -- **31% of the
-issue budget** -- while the kernel sits at 48% of its ceiling. It is therefore
-**stall-bound, not issue-bound**, and the spare issue capacity that that section
-hoped to exploit is already there and already going unused. `fp32/MMA` is
-invariant across every geometry at 6.1-7.9: it is the per-32-block int32 to fp32
-rescale (`v_cvt_f32_i32` into `v_mul_f32` into `v_fma_f32`, per accumulator
-element), and no tile shape or staging depth removes it.
+| chunk_size | ForwardPromptChunk calls | GEMM path |
+| ---: | ---: | --- |
+| 2048 | 2 | `HalfPrefillGemmKernel<256,256,8,4,...>` (fp16) |
+| 32 | 1 | `WKQuantA8BlockedWmmaGEMMKernel<128,64,4,8,1,...>` |
+| 16 | 1 | same |
 
-### Occupancy is not the missing half either
+Tracing `LaunchBatchedQuantGEMMPreQuantized` across the whole run gives 496 calls
+at `batch=32` and 496 at `batch=16`, and **not one call at batch >= 96**.
+rocprofv3 agrees: 916 int8 GEMM dispatches, **all** `<128,64,4,8,1,Type,32>`.
 
-| config | registers | LDS | blocks/CU |
-| --- | ---: | ---: | ---: |
-| 128x128 bk2 w4n1 (production) | 189 | 20608 | 3 |
-| 128x128 bk1 w4n1 | 173 | 10304 | **4** |
-| 128x128 bk2 w2n2 | 243 | 20608 | 3 |
-| 128x128 bk4 w4n1 | 221 | 41216 | **1** |
-| 128x64 bk2 w4n1 | 143 | 15488 | 4 |
-| 128x256 bk2 w4n1 | 256 | 30848 | 2 |
-| 256x128 bk2 w2n2 | 256 | 30848 | 2 |
+| instantiation | dispatches | reachable |
+| --- | ---: | --- |
+| `<128,64,4,8,1,Type,32>` (regime 3, 9 <= batch < 96) | **916** | yes, always |
+| `<128,128,2,4,2,Type,32>` (regime 2, batch >= 96) | 0 | no |
+| `<128,128,2,4,1,Type,64>` (TryLaunchQuantPrefillWave64) | 0 | no |
 
-The production tile needs 20.6 KiB of the 64 KiB LDS, so -- unlike fp16 -- the
-staging-capacity rule that forces the single buffer and two barriers per stage
-does not apply here. Capacity was never the constraint.
+The whole wave64 investigation -- the ISA tables, the eight-geometry tile sweep,
+the occupancy comparison and the "production tile" conclusion -- describes a
+kernel this model never dispatches. `pp2048` is an **fp16** measurement. The int8
+GEMM serves only chunks below 1024 tokens, and in this bench only 32 and 16.
 
-### The tile space, swept at six token counts
+Occupancy of the instantiations that exist (Q4_K, measured via
+hipOccupancyMaxActiveBlocksPerMultiprocessor):
 
-Q4_K, N=17408, K=5120, `mismatch=0` on every row, TFLOPS:
+| instantiation | registers | LDS | blocks/CU | wave |
+| --- | ---: | ---: | ---: | ---: |
+| `<128,64,4,8,1>` (live) | 186 | 30720 | 2 | 32 |
+| `<128,128,2,4,2>` (dead) | 205 | 20480 | 3 | 32 |
+| `<128,32,4,4,2>` | 185 | 25600 | 2 | 32 |
+| `<128,16,4,8,1>` | 160 | 23040 | 2 | 32 |
 
-| M | bk2 w4n1 (production) | bk2 w2n2 | bk4 w4n1 |
-| ---: | ---: | ---: | ---: |
-| 96 | 16.50 | 17.59 | 17.56 |
-| 128 | 20.93 | 21.84 | 22.04 |
-| 256 | 22.96 | 22.38 | 23.11 |
-| 384 | 22.98 | 23.46 | 23.40 |
-| 512 | 22.69 | 24.14 | 24.59 |
-| 768 | 23.74 | 24.41 | 24.68 |
-| **mean** | **21.63** | **22.30** | **22.56** |
+### 2. The A/B harness had no measured noise floor
 
-`bk4` beats production at all six points (+4.3% mean) and `w2n2` at five of six
-(+3.1% mean). Isolated, that looks like a free win. It is not.
+Two byte-identical copies of one binary, same harness, same alternating order,
+same prompt:
 
-### All three candidates lose end-to-end
+| round | first arm | second arm |
+| ---: | ---: | ---: |
+| 1 | 503.51 | 524.51 |
+| 2 | 528.99 | 511.18 |
+| 3 | 523.79 | 480.34 |
+| **mean** | **518.8** | **505.3 (-2.6%)** |
 
-ByteShape 3.84 bpw, `pp2048 -n 1 -r 5`, paired binaries alternating in one
-session, three rounds each:
+The null effect is -2.6% on the mean with per-round swings reaching -8%. Two of
+the three int8 A/Bs were **no-ops** -- the unforced `bk4` and `bk1` runs never
+dispatch the edited kernel, so their true effect was exactly zero and the
+measured -5.9% and -11.2% are that noise. The `w2n2` run was made under
+`GUFO_FORCE_Q8_PREFILL=1`, which does force the int8 route at batch 2048 and so
+does dispatch wave64, but -5.8% sits at the edge of, not outside, this envelope.
+**All three are retracted.**
 
-| candidate | microbench | model rounds (t/s) | mean | vs production |
-| --- | ---: | --- | ---: | ---: |
-| production | -- | 514.14 / 528.28 / 495.07 | **512.5** | -- |
-| bk4 w4n1 | **+4.3%** | 502.25 / 480.01 / 464.44 | 482.2 | **-5.9%** |
-| production (re-baselined) | -- | 529.07 / 532.77 / 525.18 | **529.0** | -- |
-| bk1 w4n1 | -3.8% | 485.81 / 462.00 / 460.77 | 469.5 | **-11.2%** |
-| production (`GUFO_FORCE_Q8_PREFILL=1`) | -- | 426.40 / 417.82 / 421.55 | **421.9** | -- |
-| bk2 w2n2 | +3.1% | 416.59 / 398.74 / 376.64 | 397.3 | **-5.8%** |
+Standing rule from here: a model-level A/B carries a null control (or an
+already-established envelope) *and* a confirmation that the edited kernel is
+actually dispatched on the measured path. The large effects recorded elsewhere in
+this document -- fp16 double buffering at +62%/+296%, the 209-spill decode hoist
+at +398% -- are far outside this floor and stand.
 
-Every arm was numerically exact (`mismatch=0` in the bench), so these are timing
-results, not correctness accidents.
+### 3. What this actually means
 
-The two microbench winners are the two that *add* register pressure or LDS
-(243 and 221 registers against 189; 41.2 KiB against 20.6), and both cost about
-6% of model throughput. The occupancy-maximising direction is worse still: `bk1`
-reaches 4 blocks per CU and loses 11.2%, and it is the one candidate the
-microbench also called a loss. Production therefore wins on both axes at once --
-deeper staging, shallower staging and the alternating warp split all lose. It is
-a local optimum of the measured space, not an unexamined default.
-
-The one caveat on this table: the `w2n2` arm was run under
-`GUFO_FORCE_Q8_PREFILL=1`, which is why its baseline is about 422 rather than
-about 512. The pairing within that arm is still valid (same environment,
-alternating binaries), and its -5.8% is consistent with the cleanly-paired `bk4`
--5.9%.
-
-### Why: the format costs more than the wider MMA buys
-
-Both benches at the identical shape (N=17408, K=5120), `mismatch=0`:
-
-| M | fp16 256x256 w8n4 | fp16 128x128 w4n2 | int8 production | int8 w2n2 | int8 bk4 |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 | **26.99** | 26.02 | 21.52 | 22.21 | 22.88 |
-| 512 | **28.17** | 26.77 | 22.69 | 24.14 | 24.59 |
-
-**The fp16 kernel is 15-25% faster than the int8 kernel at the same shape**, and
-neither is near its ceiling (fp16 58% of 48.35, int8 49% of 50.31). int8 has the
-higher instruction ceiling and still loses, because fp16 accumulates directly in
-fp32 and pays none of the 7.3 fp32 operations per MMA that the blocked int8
-format requires. Halving the operand width does not shrink a per-block scale.
-
-So int8 is a **bandwidth** choice (about 1.25 B/element staged against fp16's 2),
-not a compute choice, and as a compute kernel it has no headroom left to
-recover. The int8 line is closed on measurement: eight tile geometries, three
-token-count sweeps, an ILP schedule, an `iglp_opt` hint and three end-to-end
-A/Bs, with the production configuration winning all of them.
-
-**Method note, and the reason this section exists.** An isolated fixed-shape int8
-microbenchmark mispredicted the model for two of the three candidates, and in
-both cases by roughly twice the microbench margin and in the opposite direction.
-The bench runs one shape at high iteration count and so rewards per-wave ILP; the
-model runs each shape once and is decided by occupancy and tail effects. **Int8
-tile changes must be judged end-to-end.** Treat any int8 microbench delta below
-about 10% as carrying no information about model throughput.
-
-
-
-
-
-
-
-
+* **The q8/int8 prefill route is not on the pp2048 critical path.** Optimising it
+  cannot move `pp2048`; the fp16 kernel owns that number for this model.
+* The int8 route serves `batch < 1024`: verification, speculative drafting and
+  short prompts. That is where its value is, and where it must be measured.
+* `<128,64,4,8,1,Type,32>` (2 blocks/CU, 30 KiB LDS) has never been tuned. With
+  `kBN = 64`, a 32-token batch fills half the token tile before anything else is
+  considered.
