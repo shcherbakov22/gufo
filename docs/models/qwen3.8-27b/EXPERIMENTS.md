@@ -923,6 +923,39 @@ The only piece with visible headroom is that output rate: 143 MB in ~1.33 ms is
 108 GB/s where the box can do roughly double. A coalescing change could plausibly
 recover a few percent. Everything else is pinned.
 
+### The 128x128 comparison was unfair; the fair one agrees
+
+I flagged that the tile sweep compared a fully tuned 256x256 against 128x128
+variants denied every optimisation gated on the big tile: the iglp scheduling
+hint (worth 4-6% on the grid types by direct measurement), the cached Q5/IQ block
+headers, the row-group width override, and `Complete`. Lifted those gates for any
+tile at least 128 wide and re-ran both tiles from the *same* weight and activation
+buffers, interleaved, six repetitions each. The standard deviations were
+0.04-0.06 ms, about 0.5%, so these are real differences and not box noise:
+
+| type | 256x256 ms | 128x128 ms | 128 vs 256 |
+| --- | ---: | ---: | ---: |
+| Q4_K | 9.876 +/- 0.061 | 13.387 +/- 0.049 | +35.5% |
+| Q6_K | 10.219 +/- 0.061 | 16.052 +/- 0.054 | +57.1% |
+| IQ4_XS | 10.151 +/- 0.054 | 11.551 +/- 0.061 | +13.8% |
+| IQ3_XXS | 11.045 +/- 0.041 | 12.150 +/- 0.045 | +10.0% |
+
+So occupancy really is a dead end, and now the error bars are an order of
+magnitude smaller than the effect. The reason is in the fragment arithmetic,
+which had not been articulated before: LDS loads per MMA is
+(WRS+WTS)/(WRS*WTS). At 256x256 with 1024 threads, WRS=2 and WTS=4, so 8 MMAs
+cost 6 loads, or 0.75 loads per MMA. At 128x128 with 512 threads, WRS=WTS=2, so
+4 MMAs cost 4 loads, or 1.0. The small tile needs a third more LDS traffic per
+MMA *and* has four times as many blocks each running the same 80 stages, so its
+per-stage overhead is quadrupled per unit of work. Two blocks per CU cannot pay
+for either.
+
+Side finding: the 128x128 Q6_K variant produces the wrong answer -- the entire
+output mismatches -- while 256x256 agrees with the validated production path.
+`DirectGemm` never selects 128x128, so it has never mattered, but it is a latent
+bug in the small-tile Q6_K path. Recorded, not fixed.
+
+
 
 ### Persistent CTAs: bit-exact, and 4% slower
 
