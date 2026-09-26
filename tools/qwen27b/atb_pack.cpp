@@ -151,14 +151,21 @@ int main(int argc, char** argv) {
 
   const std::size_t row_bytes = (k / qt->block) * qt->block_bytes;
   std::vector<std::uint8_t> raw(row_bytes * n_out);
-  std::FILE* fp = std::fopen(raw_path, "rb");
-  if (!fp) {
-    std::perror("open");
-    return 1;
+  if (std::strcmp(raw_path, "-") == 0) {
+    // Read raw blocks from stdin so a driver can pack straight out of a
+    // memory-mapped GGUF without staging a file per tensor.
+    if (std::fread(raw.data(), 1, raw.size(), stdin) != raw.size())
+      return 1;
+  } else {
+    std::FILE* fp = std::fopen(raw_path, "rb");
+    if (!fp) {
+      std::perror("open");
+      return 1;
+    }
+    if (std::fread(raw.data(), 1, raw.size(), fp) != raw.size())
+      return 1;
+    std::fclose(fp);
   }
-  if (std::fread(raw.data(), 1, raw.size(), fp) != raw.size())
-    return 1;
-  std::fclose(fp);
 
   std::vector<float> w(n_out * k);
   for (std::size_t r = 0; r < n_out; ++r)

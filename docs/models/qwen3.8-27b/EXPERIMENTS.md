@@ -4077,3 +4077,36 @@ byte-for-byte on real data for every type and both operand roles. What is *not* 
 of this running inside the engine -- the packer and the A path are tools, and the wiring is the
 remaining engineering.
 
+## The one-off repack is a minute, and the per-call packing fits in the GPU's shadow
+
+The batch driver (`tools/qwen27b/atb_pack_gguf.py`) repacks every FFN tensor in the shard,
+reading the raw blocks straight out of the memory map and driving `atb_pack` in parallel:
+
+```
+packing 195 FFN tensors with 6 jobs (out=discard)
+packed 17.380 G weights -> 18.21 GiB at 9 bits/weight in 57.6 s wall (0.30 G weights/s)
+```
+
+Under a minute at load, and each written tensor is exactly 100,270,080 bytes -- the same size the
+byte-identity checks produced. **Memory, not time, is the binding constraint on the repack.**
+
+The per-call A packing has two shapes, because gate and up share one activation while down
+consumes the SwiGLU output:
+
+| A operand | 8 threads | 16 threads | 32 threads |
+|---|---|---|---|
+| gate/up (2048 x 5120) | 8.73 ms | 5.53 ms | 4.46 ms |
+| down (2048 x 17408) | 24.12 ms | 15.75 ms | 12.26 ms |
+
+The down operand here is the real FFN activation tiled along K to 17408 elements; the packing
+cost is per-element and tiling preserves the distribution. Per layer that is about **21.3 ms of
+CPU at 16 threads**. The GPU's own prefill at the measured 543.93 tok/s does a 2048-token prompt
+in 3.77 s, or **59 ms per layer**, and during GPU-bound prefill the CPU is otherwise idle. Since
+21.3 < 59, the activation packing can be hidden under the GPU's work instead of serialised
+against the NPU's. That is the difference between a ~59% overhead on the NPU's 1.02 s of FFN
+compute and none.
+
+So the operand side of the NPU path is settled: exact, a minute to build once, a few GiB net, and
+fast enough to overlap. The open items are the two that cannot be settled with tools -- the
+engine wiring, and an end-to-end quality measurement of the 1.0% RMS conversion.
+
