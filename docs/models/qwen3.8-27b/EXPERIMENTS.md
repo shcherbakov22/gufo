@@ -2371,3 +2371,77 @@ The tile re-test seals the first row independently: every non-square aspect at t
 area is worse, and the mirror warp split (256x256 w4n8) is **-4.7%**. So the accumulator
 budget really does pin the tile at 256x256, LDS really does pin BK at 4, and the +15% that
 BK=8 would buy is behind a wall with no gap in it.
+
+## The fetch cost is not the fetch: three ablations that measured the compiler
+
+The decomposition above (commit 1.03 ms, fetch 0.94 ms, barriers 0.62 ms) was built
+from ablation bits that **skipped** the fetch loop. That is not a neutral edit. With
+`raw`/`rb` left undefined, `DecodeRaw` and the `s_a`/`s_b` stores become undefined
+behaviour, and LLVM is entitled to fold them away. It did: at `Ablate=4` the loop body
+dropped from 218 to 113 instructions, and at `Ablate=32` the shared-memory footprint
+itself fell from 65536 to 32768 bytes because `s_b` went dead. **Those arms were not
+measuring the fetch; they were deleting the decoder and half the LDS tile.**
+
+The bits now route into the existing zero-fill `else` branch instead of skipping the
+loop, so `raw`/`rb` are defined and every dependent store survives. Each arm is then
+checked in the ISA before it is believed:
+
+| ablation | VGPRs | LDS | loop body | global | lds ops | wmma | waitcnt |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 control | 136 | 65536 | 218 | 9 | 52 | 32 | 21 |
+| 32 no B (activation) fetch | 130 | 65536 | 211 | 7 | 52 | 32 | 19 |
+| 64 no A (weight) fetch | 150 | 65536 | 116 | 4 | 52 | 32 | 16 |
+| 96 neither | 116 | 65536 | 108 | 2 | 52 | 32 | 17 |
+
+Interleaved run, m=17408, k=5120, batch=2048, 5 alternating rounds, median:
+
+| arm | median ms | TFLOPS | delta |
+| --- | ---: | ---: | ---: |
+| control A | 9.215 | 39.62 | -- |
+| no B fetch (32) | 9.226 | 39.57 | **-0.1%** |
+| no A fetch (64) | 8.705 | 41.94 | **+5.5%** |
+| no fetch (96) | 8.119 | 44.96 | **+11.9%** |
+| control B | 9.266 | 39.40 | -0.5% |
+
+Three results, each with its own falsifier:
+
+1. **The activation fetch costs nothing.** Bit 32 is clean -- LDS, lds ops and wmma are
+   all unchanged, only 7 of 218 instructions leave -- and it buys -0.1%. An independent
+   probe agrees: `Ablate=128` keeps the identical instruction count and per-lane address
+   pattern but pins the k window so the loads re-read 128 bytes, and it buys +0.6%. So
+   the 8.2-8.6% previously attributed to the activation loads was the deleted
+   `s_b`/decoder work, not the loads. **Falsifier: an arm that removes exactly the
+   activation loads while preserving every dependent instruction, showing a cost.**
+2. **The weight path is the cost, and it is the decode as much as the load.** Bit 64
+   removes 102 instructions, most of them the Q4_K decoder the constant `raw` lets the
+   compiler fold, so the honest claim is 5.5% for load *plus* decode, not for the load.
+   **Falsifier: a weight-fetch arm that zero-fills the loaded bytes but keeps the decode
+   input opaque to the compiler.**
+3. **Interleaving the fetch into the K loop is refuted at the compiler, not the
+   hardware.** Moving the `fetch` call between the K sub-stages produces
+   instruction-for-instruction identical code (218/218, same VGPRs, same mix), so it
+   measured +0.1%. The scheduler already places those loads; there was nothing to
+   interleave. **Falsifier: an interleaved arm whose ISA differs from the control's.**
+
+### Why the remaining cost is stall structure, not work
+
+The per-stage loop body is 218 warp instructions: 48 `ds_load_b128` feeding 32
+`v_wmma_f32_16x16x16_f16`, 90 VALU of Q4_K decode, 4 `ds_store_b128`, 9 global, 21
+`s_waitcnt`, 2 `s_barrier`. With 32 warps per CTA, one CTA per CU and four schedulers,
+that is `8 x 218 = 1744` issue cycles per scheduler per stage against a ~10075-cycle
+stage -- **issue is only ~17% occupied**. Independently, 256 WMMA per SIMD per stage at
+~32 matrix-pipe cycles each is ~8192 cycles, or **~81% of the matrix pipe**. The kernel
+is matrix-pipe-bound and the staging is not paying for itself in instructions: it costs
+because the per-stage `s_barrier` plus 21 `s_waitcnt` re-synchronise every warp every
+stage, so when one warp stalls on staging no other warp has matrix work to cover it.
+
+That closes the two cheap structural escapes as well, and for the same reason as BK=8:
+two CTAs per CU would let one CTA's MMAs fill the other's staging, but it needs LDS
+<= 32 KiB per CTA, and the only tiles that fit (256x256 at BK=2, or 128x128 at BK=4)
+were already measured at -29.8% and -76.8%. Named/partial barriers would remove the
+second barrier per stage, but `s_barrier_signal`/`s_barrier_wait` do not exist on
+gfx1151.
+
+What is left is a producer/consumer split -- warp specialisation -- so that the warps
+that fetch and decode are never the warps holding live matrix work. That is a rewrite of
+the kernel's warp mapping, not a parameter, and it is the next thing to try.

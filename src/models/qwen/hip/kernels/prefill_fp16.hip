@@ -402,7 +402,7 @@ __launch_bounds__(WM * WN * 32) __global__
 #pragma unroll
     for (int p = 0; p < PFA; ++p) {
       const int idx = p * kThreads + tid, kk = ks0 + idx % BK;
-      if (idx < BM * BK && (Complete || kk < ksteps)) {
+      if ((Ablate & 64) == 0 && idx < BM * BK && (Complete || kk < ksteps)) {
         if (Mixed && (idx / BK) % 32 >= 16)
           fetch_up(p, kk);
         else if constexpr (CacheQ5Header &&
@@ -454,8 +454,12 @@ __launch_bounds__(WM * WN * 32) __global__
 #pragma unroll
     for (int p = 0; p < PFB; ++p) {
       const int idx = p * kThreads + tid, kk = ks0 + idx % BK;
-      if (idx < BN * BK && (Complete || kk < ksteps)) {
-        const short* src = x_row[p] + static_cast<std::size_t>(kk) * 16;
+      // Ablations 32/64 route into the zero-fill else branch instead of
+      // skipping the loop: skipping leaves raw/rb undefined and lets the
+      // compiler fold the dependent decode and delete s_b, which measures
+      // something other than the fetch.
+      if ((Ablate & 32) == 0 && idx < BN * BK && (Complete || kk < ksteps)) {
+        const short* src = (Ablate & 128) != 0 ? x_row[p] + static_cast<std::size_t>(kk & 3) * 16 : x_row[p] + static_cast<std::size_t>(kk) * 16;
         rb[p][0] = *reinterpret_cast<const uint4*>(src);
         rb[p][1] = *reinterpret_cast<const uint4*>(src + 8);
       } else {
@@ -539,7 +543,7 @@ __launch_bounds__(WM * WN * 32) __global__
     if constexpr ((Ablate & 1) == 0) __syncthreads();
     PC_END(pc_barrier);
     PC_START();
-    if constexpr ((Ablate & 4) == 0) {
+    if constexpr ((Ablate & 4) == 0 && (Ablate & 256) == 0) {
       if (ks0 + BK < ksteps)
         fetch(ks0 + BK);
     }
@@ -563,6 +567,9 @@ __launch_bounds__(WM * WN * 32) __global__
           else
             acc[i][j] = WmmaHalf(b, a[i], acc[i][j]);
         }
+      }
+      if constexpr ((Ablate & 4) == 0 && (Ablate & 256) != 0) {
+        if (ks == BK / 2 - 1 && ks0 + BK < ksteps) fetch(ks0 + BK);
       }
     }
     if constexpr ((Ablate & 16) != 0 ||
