@@ -49,19 +49,22 @@ __global__ void __launch_bounds__(1024) PureKernel(
     __syncthreads();
 #pragma unroll
     for (int ks = 0; ks < PBK; ++ks) {
+      // Mode 5 reuses one sub-stage's fragments for all four, cutting the LDS
+      // request count 4x to test whether requests or bytes set the feed cost.
+      const int lks = (Mode == 5) ? 0 : ks;
       gufo::hip::v16bf a[WRS];
 #pragma unroll
       for (int i = 0; i < WRS; ++i)
         a[i] = Mode == 3
                    ? ca
                    : gufo::hip::LoadSwizzled(
-                         &s_a[ks][wr * WRS + i][sl ^ (ks & 3)][0]);
+                         &s_a[lks][wr * WRS + i][sl ^ (lks & 3)][0]);
 #pragma unroll
       for (int j = 0; j < WTS; ++j) {
         const gufo::hip::v16bf b =
             Mode == 3 ? cb
                       : gufo::hip::LoadSwizzled(
-                            &s_b[ks][wt * WTS + j][sl ^ (ks & 3)][0]);
+                            &s_b[lks][wt * WTS + j][sl ^ (lks & 3)][0]);
 #pragma unroll
         for (int i = 0; i < WRS; ++i)
           acc[i][j] = gufo::hip::WmmaHalf(b, a[i], acc[i][j]);
@@ -111,9 +114,9 @@ void LaunchPure(const void* w, const short* x, float* y, int batch, int m,
   PureKernel<Mode, MWA, MWB><<<grid, MWA * MWB * 32>>>(w, x, y, batch, m, k);
 }
 
-constexpr int kArms = 6;
-const char* kNames[kArms] = {"ctrl A", "32w 8x4 LDS", "16w 4x4 LDS",
-                             "16w 4x4 no LDS", "32w 8x4 no LDS", "ctrl B"};
+constexpr int kArms = 5;
+const char* kNames[kArms] = {"ctrl A", "LDS 48 req/warp",
+                             "LDS 12 req/warp", "no LDS feed", "ctrl B"};
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -132,7 +135,7 @@ int main(int argc, char** argv) {
   hipMemset(w, 0, rb * m);
   hipMemset(x, 0, (std::size_t)batch * k * 2);
   hipMemset(y, 0, yN * 4);
-  LaunchPure<0, 4, 4>(w, (const short*)x, (float*)y, batch, m, k);
+  LaunchPure<5, 8, 4>(w, (const short*)x, (float*)y, batch, m, k);
   hipError_t e = hipDeviceSynchronize();
   if (e != hipSuccess) {
     std::printf("launch failed: %s\n", hipGetErrorString(e));
@@ -151,10 +154,9 @@ int main(int argc, char** argv) {
         switch (a) {
           case 0: LaunchProd(w, (const short*)x, (float*)y, batch, m, k); break;
           case 1: LaunchPure<0, 8, 4>(w, (const short*)x, (float*)y, batch, m, k); break;
-          case 2: LaunchPure<0, 4, 4>(w, (const short*)x, (float*)y, batch, m, k); break;
-          case 3: LaunchPure<3, 4, 4>(w, (const short*)x, (float*)y, batch, m, k); break;
-          case 4: LaunchPure<3, 8, 4>(w, (const short*)x, (float*)y, batch, m, k); break;
-          case 5: LaunchProd(w, (const short*)x, (float*)y, batch, m, k); break;
+          case 2: LaunchPure<5, 8, 4>(w, (const short*)x, (float*)y, batch, m, k); break;
+          case 3: LaunchPure<3, 8, 4>(w, (const short*)x, (float*)y, batch, m, k); break;
+          case 4: LaunchProd(w, (const short*)x, (float*)y, batch, m, k); break;
         }
         hipDeviceSynchronize();
         const auto s1 = std::chrono::steady_clock::now();

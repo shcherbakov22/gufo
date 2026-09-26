@@ -2691,6 +2691,35 @@ document has recorded.
 **Falsifier: applying the 4x4 warp split to the production kernel and beating it by more
 than the ~2% control spread.**
 
+### Retraction: the \"LDS feed costs 15%\" attribution is a schedule artifact
+
+The LDS-vs-no-LDS difference was read as the cost of the fragment loads. It is not. Cutting
+the fragment requests by four, ISA-verified, makes the kernel *slower*:
+
+| arm | VGPRs | loop body | `ds_load` | `v_wmma` | `s_waitcnt` | median ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| LDS feed, shipped order | 116 | 103 | 48 | 32 | 16 | 8.543 |
+| LDS feed, requests cut 4x | 120 | 52 | 12 | 32 | 1 | **9.182** |
+| no LDS feed (fragments in registers) | 114 | 39 | 0 | 32 | 0 | 7.331 |
+| production control A / B | -- | -- | -- | -- | -- | 8.995 / 8.799 |
+
+Removing 75% of the loads costs 7%. Removing all of them buys 18%. The response is not
+monotonic in the number of loads, so the 15-18% previously attributed to the LDS feed is
+the distance between two *schedules*, not the price of the loads. That attribution is
+withdrawn, along with the traffic model built on it.
+
+This also explains the shape of the whole fp16 search. Every lever tried this session --
+fetch interleaving, staggered decode, decode inside the K loop, `iglp_opt`, fragment
+prefetch, request reduction, and the 4x4 warp split -- came out neutral or negative, and
+the ISA showed in three of those cases that the scheduler had reproduced or re-sunk the
+original schedule. The inner loop is 103 instructions for 32 MMAs; at that size the
+compiler's scheduling choices dominate any change to what the loop computes.
+
+**Falsifier: an ISA-verified arm whose instruction count and time move together** -- for
+example a probe where halving the loads approximately halves their cost. Until one exists,
+any attribution of the fp16 gap to a specific loop resource is unsupported, including the
+ones this document records above it.
+
 ### The 4x4 warp split does not transport to the real kernel
 
 The probe's +2.9% was measured on the pure loop. Applied to the production kernel -- same
