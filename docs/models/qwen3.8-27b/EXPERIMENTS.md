@@ -194,6 +194,57 @@ orthogonal to the Q2_K chunked-path work: sub-4-bit linear formats become
 *eligible* for the int4 path, but their per-16 affine minimum still needs the
 per-half activation sum, so that fix is not avoided by moving to int4.
 
+### The int4 activation grid: measured, and the naive version is too lossy
+
+The int4 MMA needs int4 for both operands, so the weight repack being lossless
+buys nothing about the activation side. Measured before writing any int4 kernel,
+with two environment-gated diagnostics:
+
+* `GUFO_FORCE_Q8_PREFILL` drives the q8_1 activation path on artifacts that would
+  otherwise take the fp16 path, so both baselines are reachable from one binary;
+* `GUFO_INT4_ACT` pushes the already-quantized q8_1 codes onto the int4 grid in
+  place (`scale *= 127/7`, codes `round(q*7/127)` clamped to +/-7, sum sidecar
+  rebuilt) at the one call site every activation producer shares.
+
+This is not a proxy. int4 is a subset of int8, and `iu8` and `iu4` share the
+K=16 grouping and the int32 accumulator, so storing int4 values in the int8
+operand makes the existing int8 WMMA compute *exactly* the integers an int4 WMMA
+would. It answers the quality question with no int4 MMA in the build.
+
+ByteShape 3.84 bpw, `-p 2048 -n 1 --validate-prefill 2048`:
+
+| activations | cosine | max abs diff | rmse |
+| --- | ---: | ---: | ---: |
+| fp16 (the production path) | 0.99999923 | 0.0111 | 0.00239 |
+| q8_1 int8 | 0.99965954 | 0.2703 | 0.0513 |
+| int4 grid, per-32 symmetric | **0.96105802** | **2.7537** | **0.5274** |
+
+fp16 -> int8 costs 3.4e-4 of cosine. int8 -> int4 costs **3.9e-2**, two orders of
+magnitude more, with ten times the rmse. `top1_match` still holds at 2048
+tokens, but a 0.961 logit cosine at 10x the error is the regime where the output
+distribution is being reshaped rather than perturbed. **The 2x is not free and
+the naive grid does not pay for it.**
+
+Three caveats, because they bound what this does and does not say:
+
+1. **This is W4A4 globally.** The instrument rewrites the shared q8_1 buffer, and
+   every consumer reads that buffer, so the grid applies to every projection --
+   not just the ~104 int4-eligible ones. The mixed design would be strictly
+   better than this number, so 0.961 is a floor on quality for it and 0.99966 the
+   ceiling. Isolating the mixed case needs per-GEMM activation quantization.
+2. **per-32 symmetric, one scale per block.** This is the configuration the
+   outlier argument predicts will fail: activations are heavy-tailed, so a block
+   containing an outlier spends its scale on that element and leaves the other 31
+   with a couple of effective bits. Finer granularity (per-16) or a rotation
+   folded into the adjacent weights is the standard mitigation, and neither is
+   measured here.
+3. **No int4 performance number is implied.** There is no int4 MMA in this build;
+   what runs is the int8 path plus an extra re-quantization pass.
+
+So the next question is not "is int4 activations lossless" -- it clearly is not
+-- but whether eligibility-scoped quantization plus finer granularity gets the
+loss back to the int8 level, where the step from fp16 was only 3.4e-4.
+
 
 ## Deferred: Q2_K native prefill (chunked-path eligibility)
 

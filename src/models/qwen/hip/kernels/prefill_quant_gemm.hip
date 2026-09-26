@@ -1,4 +1,6 @@
 #if defined(ENGINE_ENABLE_HIP)
+#include <cstdlib>
+
 #include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
 
 namespace gufo::hip {
@@ -936,9 +938,84 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
 
 namespace {
 
+// Diagnostic for the int4 investigation. Emulates 4-bit activations by pushing
+// the already-quantized q8_1 codes onto the int4 grid in place. Storing int4
+// values in an int8 operand loses nothing, and iu8 and iu4 share the K=16
+// grouping and the int32 accumulator, so the existing int8 WMMA then computes
+// exactly the integers an int4 WMMA would -- the quality seen here is the real
+// int4 quality. Enabled only by GUFO_INT4_ACT.
+bool Int4ActivationSimulationEnabled() {
+  static const bool enabled = std::getenv("GUFO_INT4_ACT") != nullptr;
+  return enabled;
+}
+
+template<bool StoreActivationSum>
+__global__ void RequantizeActivationInt4Kernel(void* __restrict__ y,
+                                              std::size_t batch,
+                                              std::size_t num_blocks) {
+  const std::size_t tiles = (batch + kQ8ActTileTokens - 1) / kQ8ActTileTokens;
+  const std::size_t idx = (blockIdx.x * blockDim.x) + threadIdx.x;
+  if (idx >= tiles * num_blocks * kQ8ActTileTokens) {
+    return;
+  }
+  const std::size_t tl = idx % kQ8ActTileTokens;
+  const std::size_t kb = (idx / kQ8ActTileTokens) % num_blocks;
+  const std::size_t tt = idx / (kQ8ActTileTokens * num_blocks);
+  if ((tt * kQ8ActTileTokens) + tl >= batch) {
+    return;
+  }
+  std::int8_t* tile = Q8ActTile(y, num_blocks, tt, kb);
+  float* d_slot = reinterpret_cast<float*>(tile + kQ8ActScaleOffset +
+                                           (tl * sizeof(float)));
+  const float d = *d_slot;
+  if (d == 0.0F) {
+    return;
+  }
+  constexpr float kRatio = 7.0F / 127.0F;
+  int lo = 0;
+  int hi = 0;
+#pragma unroll
+  for (int i = 0; i < 32; ++i) {
+    std::int8_t* p = tile + ((i >> 4) * 256) + (tl * 16) + (i & 15);
+    int v = static_cast<int>(__float2int_rn(static_cast<float>(*p) * kRatio));
+    v = v > 7 ? 7 : (v < -7 ? -7 : v);
+    *p = static_cast<std::int8_t>(v);
+    if (i < 16) {
+      lo += v;
+    } else {
+      hi += v;
+    }
+  }
+  const float d4 = d * (127.0F / 7.0F);
+  *d_slot = d4;
+  if constexpr (StoreActivationSum) {
+    float* sums = Q8ActSumSidecar(y, batch, num_blocks * 32);
+    float* slot = sums + (((((tt * num_blocks) + kb) * kQ8ActTileTokens) + tl) *
+                          kQ8ActSumHalves);
+    slot[0] = d4 * static_cast<float>(lo + hi);
+    slot[1] = d4 * static_cast<float>(lo);
+  }
+}
+
+template<bool StoreActivationSum>
+void LaunchRequantizeActivationInt4(void* q8_1_out, std::size_t batch,
+                                    std::size_t k, hipStream_t stream) {
+  if (!Int4ActivationSimulationEnabled() || batch == 0 || k < 32) {
+    return;
+  }
+  const std::size_t num_blocks = k / 32;
+  const std::size_t tiles = (batch + kQ8ActTileTokens - 1) / kQ8ActTileTokens;
+  const std::size_t units = tiles * num_blocks * kQ8ActTileTokens;
+  RequantizeActivationInt4Kernel<StoreActivationSum>
+      <<<static_cast<unsigned int>((units + 255) / 256), 256, 0, stream>>>(
+          q8_1_out, batch, num_blocks);
+}
+
 template<bool StoreActivationSum>
 void LaunchZeroQ8ActTail(void* q8_1_out, std::size_t batch, std::size_t k,
                          hipStream_t stream) {
+  LaunchRequantizeActivationInt4<StoreActivationSum>(q8_1_out, batch, k,
+                                                     stream);
   const std::size_t tail = batch % kQ8ActTileTokens;
   if (tail == 0) {
     return;

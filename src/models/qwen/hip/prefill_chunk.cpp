@@ -21,6 +21,12 @@ namespace {
 
 bool UseQwen27bFp16Prefill(const models::QwenModelWeights& weights,
                            std::size_t batch) {
+  // Diagnostic override: drive the q8_1 activation path on artifacts that would
+  // otherwise take the fp16 path, so the int4 activation grid can be measured
+  // against both baselines from a single binary.
+  if (std::getenv("GUFO_FORCE_Q8_PREFILL") != nullptr) {
+    return false;
+  }
   const auto& config = weights.config;
   // Large Qwen27B low-bit prefill is qualified independently from the Q8
   // target and from the small-batch decode/verification kernels.
