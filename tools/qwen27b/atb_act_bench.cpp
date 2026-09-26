@@ -13,7 +13,7 @@
 // runtime path needs this per prefill call, so its cost is what decides whether
 // the NPU FFN path can be fed from the host at all.
 //
-//   atb_act_bench <act_fp16> <M> <K> [m_tile] [k_tile]
+//   atb_act_bench <act_fp16> <M> <K> [m_tile] [k_tile] [out_packed_A]
 
 namespace {
 
@@ -175,6 +175,17 @@ int main(int argc, char** argv) {
         x.join();
     });
     std::printf("%8u %14.2f %14.2f %14.2f\n", nt, sh, en, sh + en);
+  }
+  if (argc > 6) {
+    std::FILE* fp = std::fopen(argv[6], "wb");
+    if (!fp) {
+      std::perror("open out");
+      return 1;
+    }
+    std::fwrite(packed.data(), 1, packed.size(), fp);
+    std::fclose(fp);
+    std::fprintf(stderr, "wrote %zu packed A bytes to %s\n", packed.size(),
+                 argv[6]);
   }
   return 0;
 }

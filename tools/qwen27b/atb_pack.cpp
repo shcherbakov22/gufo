@@ -7,12 +7,13 @@
 #include <vector>
 
 #include "src/core/quant/ggml_dequant.hpp"
+#include "tools/qwen27b/atb_quant_types.hpp"
 
-// Offline repack of an IQ3_XXS FFN weight tensor into the ATB bfp16 B operand.
+// Offline repack of a quantised FFN weight tensor into the ATB bfp16 B operand.
 //
-//   atb_pack <w_raw> <W_rows> <W_cols> [k_tile] [n_tile] > out.bin
+//   atb_pack <w_raw> <type_id> <W_rows> <W_cols> [k_tile] [n_tile] > out.bin
 //
-// W_raw is W as raw IQ3_XXS blocks, row-major [W_rows, W_cols].  The GEMM
+// W_raw is W as raw quantisation blocks, row-major [W_rows, W_cols].  The GEMM
 // consumes B as row-major [K, N] with B[k][n] = W[n][k], tiled into (k_tile,
 // n_tile) L1 tiles emitted column-major, each tile shuffled into 1x2
 // super-blocks of 8x8 column-major sub-blocks, then encoded to bfp16 with a
@@ -57,11 +58,9 @@ std::vector<float> ShuffleB(const std::vector<float>& in, int rows, int cols,
   const int l1_rows = rows / l1_k;
   const int l1_cols = cols / l1_n;
   std::size_t oi = 0;
-  for (int l1c = 0; l1c < l1_cols; l1c++) {
-    for (int l1r = 0; l1r < l1_rows; l1r++) {
+  for (int l1c = 0; l1c < l1_cols; l1c++)
+    for (int l1r = 0; l1r < l1_rows; l1r++)
       Shuffle1x2(in.data(), l1_k, l1_n, l1r * l1_k, l1c * l1_n, cols, out, oi);
-    }
-  }
   return out;
 }
 
@@ -79,8 +78,7 @@ std::vector<std::uint8_t> Bfp16Encode(const std::vector<float>& a,
     for (std::size_t i = start; i < end; i++) {
       std::uint32_t x;
       std::memcpy(&x, &a[i], 4);
-      const std::uint32_t e = (x >> 23) & 0xFFu;
-      max_exp = std::max(max_exp, e);
+      max_exp = std::max(max_exp, (x >> 23) & 0xFFu);
     }
     for (std::size_t i = start; i < end; i++) {
       std::uint32_t x;
@@ -123,26 +121,35 @@ std::vector<std::uint8_t> Bfp16Encode(const std::vector<float>& a,
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 4 || argc > 6) {
+  if (argc < 5 || argc > 7) {
     std::fprintf(
         stderr,
-        "usage: %s <w_raw> <W_rows> <W_cols> [k_tile] [n_tile] > out.bin\n",
+        "usage: %s <w_raw> <type_id> <W_rows> <W_cols> [k_tile] [n_tile] > "
+        "out.bin\n",
         argv[0]);
     return 2;
   }
   const char* raw_path = argv[1];
-  const std::size_t n_out = std::strtoull(argv[2], nullptr, 10);  // W_rows = N
-  const std::size_t k = std::strtoull(argv[3], nullptr, 10);      // W_cols = K
-  const int l1_k = argc > 4 ? std::atoi(argv[4]) : 64;
-  const int l1_n = argc > 5 ? std::atoi(argv[5]) : 128;
-  if (k % 256 != 0 || k % (std::size_t)l1_k != 0 ||
+  const int type_id = std::atoi(argv[2]);
+  const std::size_t n_out = std::strtoull(argv[3], nullptr, 10);  // W_rows = N
+  const std::size_t k = std::strtoull(argv[4], nullptr, 10);      // W_cols = K
+  const int l1_k = argc > 5 ? std::atoi(argv[5]) : 64;
+  const int l1_n = argc > 6 ? std::atoi(argv[6]) : 128;
+
+  const atb_pack::QuantType* qt = atb_pack::LookupType(type_id);
+  if (qt == nullptr) {
+    std::fprintf(stderr, "unsupported type id %d\n", type_id);
+    return 1;
+  }
+  if (k % qt->block != 0 || k % (std::size_t)l1_k != 0 ||
       n_out % (std::size_t)l1_n != 0) {
     std::fprintf(stderr,
-                 "K must be a multiple of 256 and of k_tile; N of n_tile\n");
+                 "K must be a multiple of %zu and of k_tile; N of n_tile\n",
+                 qt->block);
     return 1;
   }
 
-  const std::size_t row_bytes = (k / 256) * 98;
+  const std::size_t row_bytes = (k / qt->block) * qt->block_bytes;
   std::vector<std::uint8_t> raw(row_bytes * n_out);
   std::FILE* fp = std::fopen(raw_path, "rb");
   if (!fp) {
@@ -155,8 +162,7 @@ int main(int argc, char** argv) {
 
   std::vector<float> w(n_out * k);
   for (std::size_t r = 0; r < n_out; ++r)
-    gufo::quant::DequantizeIQ3_XXS(raw.data() + r * row_bytes, w.data() + r * k,
-                                   k);
+    qt->dequant(raw.data() + r * row_bytes, w.data() + r * k, k);
 
   // B row-major [K, N] = W^T.
   std::vector<float> b(k * n_out);
@@ -170,7 +176,7 @@ int main(int argc, char** argv) {
     return 1;
   std::fprintf(
       stderr,
-      "packed %zu x %zu (B %zu x %zu) -> %zu bytes, k_tile=%d n_tile=%d\n",
-      n_out, k, k, n_out, packed.size(), l1_k, l1_n);
+      "packed %s %zu x %zu (B %zu x %zu) -> %zu bytes, k_tile=%d n_tile=%d\n",
+      qt->name, n_out, k, k, n_out, packed.size(), l1_k, l1_n);
   return 0;
 }

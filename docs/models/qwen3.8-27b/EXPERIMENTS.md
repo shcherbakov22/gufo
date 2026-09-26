@@ -4029,3 +4029,51 @@ once at load.
 using the other 31 cores, not from the design; the correction is one measurement. The operand
 preparation is affordable on both axes, and the NPU path's cost remains the 32 TFLOPS GEMM.
 
+## The repack covers every FFN type, and both operands are exact ports
+
+The packer above was written for IQ3_XXS. The shipped FFN is not IQ3_XXS -- it is seven types
+(see the census earlier) -- so the packer was extended to all of them and the block geometry was
+checked against the shard before being trusted. For each type, the GGUF header's own span
+between consecutive tensors must equal `elements / block * block_bytes`:
+
+| type | block | block bytes | header span matches |
+|---|---|---|---|
+| Q3_K | 256 | 110 | yes (`blk.0.attn_gate.weight`) |
+| Q4_K | 256 | 144 | yes |
+| IQ2_XXS | 256 | 66 | yes (`blk.3.ffn_gate.weight`) |
+| IQ2_XS | 256 | 74 | yes (`blk.14.ffn_gate.weight`) |
+| IQ3_XXS | 256 | 98 | yes (`blk.0.ffn_down.weight`) |
+| IQ3_S | 256 | 110 | yes |
+| IQ4_XS | 256 | 136 | yes |
+
+Every dequantiser needed was already in `ggml_dequant.hpp`; the work was the dispatch table
+(`tools/qwen27b/atb_quant_types.hpp`) and the validation.
+
+**Byte identity, one real tensor per type.** Packing each and comparing with the bytes the
+vendored host hands the device:
+
+| type | tensor | K | N | result |
+|---|---|---|---|---|
+| IQ3_XXS | blk.0.ffn_gate.weight | 5120 | 17408 | identical |
+| IQ3_S | blk.20.ffn_gate.weight | 5120 | 17408 | identical |
+| IQ4_XS | blk.4.ffn_gate.weight | 5120 | 17408 | identical |
+| Q3_K | blk.54.ffn_gate.weight | 5120 | 17408 | identical |
+| Q4_K | blk.51.ffn_down.weight | 17408 | 5120 | identical |
+| IQ2_XXS | blk.3.ffn_gate.weight | 5120 | 17408 | identical |
+| IQ2_XS | blk.14.ffn_gate.weight | 5120 | 17408 | identical |
+
+100270080 bytes each, `cmp` clean. The Q4_K case is an `ffn_down`, so the down shape is covered
+as well as gate/up.
+
+**The A operand too.** B is repacked offline, but A is produced per prefill call, so the same
+proof is needed for the runtime path. `atb_act_bench.cpp` now also writes its packed output and
+the host dumps `AVecBfpShuffled` (`ATB_DUMPA`); on the real FFN activation at the gate/up shape
+the two are **byte-identical** (11,796,480 bytes).
+
+So both operand producers are exact ports of the vendored layout and encoder rather than
+approximations: A is a port of `layout_A_L1_2x1_8x8block` plus `floatToBfp16`, B a port of
+`layout_transpose_L1_1x2_8x8block` plus the same encoder, and equality has been demonstrated
+byte-for-byte on real data for every type and both operand roles. What is *not* yet shown is any
+of this running inside the engine -- the packer and the A path are tools, and the wiring is the
+remaining engineering.
+
