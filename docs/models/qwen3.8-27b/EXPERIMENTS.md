@@ -2796,3 +2796,48 @@ losing half the warps costs about 10%.
 **So 8x4 stands, and this closes the warp-split lever.** The falsifier for any future claim
 is the same arm: a 4x4 (or other non-8x4) split beating the production 8x4 kernel on the
 full kernel, not just the inner loop.
+
+## The IQ3 formats: where their 15% penalty comes from, and why it is structural
+
+All of the fp16 investigation above was aimed at `kQ4_K`. That was the wrong target: Q4_K is
+the *fastest* format and only 11.8% of the 3.84 bpw shard's fp16 FLOP share, while IQ3_S
+(34.0%) and IQ3_XXS (25.1%) together are 59% and are the two slowest. ISA-compared at the
+production shape (kStore, 256x256, w8n4, BK=4):
+
+| format | K-loop body | vs Q4_K | global | wait | decode VALU | other VALU | measured ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Q4_K | 218 | -- | 9 | 21 | 76 | 14 | 11.97 |
+| IQ4_XS | 222 | +2% | 6 | 19 | 83 | 16 | ~11.85 |
+| IQ3_XXS | 275 | **+26%** | 18 | 29 | 71 | **48** | ~13.9 |
+| IQ3_S | 286 | **+31%** | 17 | 32 | 77 | **52** | 13.72 |
+
+Unlike the intra-Q4_K perturbations earlier in this document, **loop-body size tracks
+measured time across formats** -- Q4_K and IQ4_XS are within 2% of each other in both, and
+IQ3_S/IQ3_XXS are 26-31% larger and 15-16% slower. The excess is +38 other-VALU, +8 global
+loads and +11 `s_waitcnt` per stage. Signedness is not the cause: Q3_K and Q6_K also produce
+signed bytes through the same biased-subtract path and are only ~5% slower than Q4_K. The
+IQ3-specific cost is the codebook.
+
+`DecodeQuantSub16`'s kIQ3_S path does eight data-dependent table lookups per thread per
+stage -- four `kDeviceIq3sGrid[512]` codebook reads and four `kDeviceIq3sSignMask[16]`
+reads -- and the dependent chain index -> grid load -> mask load -> xor/add -> store is what
+the extra `s_waitcnt`s are waiting on. Both obvious fixes are dead:
+
+* **LDS-resident tables.** 2 KiB for the IQ3_S grid plus the mask table. The block already
+  occupies all 64 KiB, so this does not fit -- the same wall that blocked BK=8, the stride
+  padding, the fragment prefetch and warp specialisation.
+* **Computing the sign mask instead of loading it.** The table is exactly reproducible:
+  `m = (s&1) | ((s&2)<<7) | ((s&4)<<14) | ((s&8)<<21); mask = m * 0xFF`, which matches all
+  sixteen entries. But it costs about eleven ALU ops against one L1-resident load, and there
+  are eight such lookups per stage, so it replaces ~8 instructions with ~88. Worked out
+  before implementing; not attempted. The grid table is a 512-entry codebook and has no
+  arithmetic form at all.
+
+So the IQ3 penalty is the price of a lookup-based format, and the decoder is already the
+compact implementation of it. The remaining IQ3-specific structural item is that IQ3_S is
+excluded from the paired gate/up path (`static_assert(WRS % 2 == 0 && Type != kIQ3_S)`), so
+its gate/up tensors cost two passes instead of one -- but that role is only 6.6% of the
+shard's FLOPs.
+
+**Falsifier: an IQ3_S or IQ3_XXS arm that removes its codebook lookups without adding more
+than the ~8 instructions they cost, and beats 13.72 ms.**
