@@ -297,6 +297,59 @@ outliers are load-bearing and cannot be clipped away.
 Both of those are prerequisites for judging the mixed design, which remains
 unmeasured and would perturb far less than the global W4A4 measured here.
 
+### Per-GEMM: what a 4-bit activation actually costs
+
+The stable instrument is offline. `GUFO_DUMP_ACTIVATION=<path>` writes one real
+activation buffer once (the post-norm FFN input, fp16, batch x hidden), and
+`tools/qwen27b/int4_activation_error.py` reads it alongside a real Q4_K weight
+matrix and reports the per-GEMM relative error. No 64-layer amplification, no
+self-consistency metric, deterministic.
+
+Real weight `blk.3.attn_q.weight` (Q4_K, 12288x5120), real activation
+(2048x5120, layer 0, 256 tokens used), weight side identical in every row:
+
+| GEMM variant | per-GEMM relative error |
+| --- | ---: |
+| fp16/fp32 activations | 0.00000 (reference) |
+| int8 per-32 activations | 0.00569 |
+| int4 per-32 activations | **0.10983** |
+| int4 per-16 activations | 0.08966 |
+| int4 per-8 activations | 0.07153 |
+| `weight 4-bit grid (for comparison)` | 0.09736 |
+
+Per-32 block dynamic range (amax/rms; a Gaussian block sits near 2.5-3.5):
+
+| | mean | median | p90 | max |
+| --- | ---: | ---: | ---: | ---: |
+| weights | 2.36 | 2.31 | 2.83 | 4.55 |
+| activations | 2.66 | 2.50 | 3.51 | 5.65 |
+
+Two results, and the first corrects an assumption that was being repeated
+above and in the prose around it.
+
+**The activation here is not the outlier problem it is usually assumed to be.**
+Post-RMSNorm, the per-32 blocks are nearly as Gaussian as the weights -- 2.66
+against 2.36, and the p90 is 3.51. The "activations are heavy-tailed, so the
+scale is eaten by an outlier" argument does not apply at this point in the
+network, which is why finer granularity buys so little: per-16 recovers 0.090 and
+even per-8 only reaches 0.072. Neither is a fix.
+
+**A 4-bit activation adds an error term the same size as the one already
+present.** The weight side's 4-bit grid costs 0.097; a 4-bit activation grid
+costs 0.110. As independent terms the GEMM's relative error goes from 0.097 to
+sqrt(0.097^2 + 0.110^2) = 0.147, so **+51% on the eligible projections**. int8
+activations add 0.0057, which is negligible against 0.097.
+
+This is a much better position than the global W4A4 result, and consistently so:
+globally the *high-precision* IQ projections -- whose own weight error is small --
+each had an 0.11 activation error added on top, which is what broke top-1. The
+mixed design never touches them.
+
+So the price of the mixed design is now quantified and stable: **+51% GEMM error
+on the ~104 int4-eligible projections, for a 2x MMA rate on them.** Whether the
+model tolerates that is a genuine quality question that the sequential-vs-batched
+cosine cannot answer -- it needs a held-out metric (perplexity or KL).
+
 
 ## Deferred: Q2_K native prefill (chunked-path eligibility)
 

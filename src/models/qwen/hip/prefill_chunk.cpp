@@ -1,7 +1,9 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <vector>
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/hip_utils.hpp"
@@ -17,6 +19,32 @@ namespace {
 // whole-model gate and, inside gemm_weight, to route one projection at a time.
 [[nodiscard]] constexpr bool Fp16PrefillSupports(core::GgmlType type) noexcept {
   return type == core::GgmlType::kQ8_0 || detail::IsNativeWmmaQuant(type);
+}
+
+// Diagnostic: dump one activation buffer so the quantization error of a 4-bit
+// activation grid can be evaluated offline against real data. Enabled by
+// GUFO_DUMP_ACTIVATION=<path>; writes the first buffer it sees, then stops.
+void DumpActivationOnce(const void* buffer, std::size_t bytes,
+                        std::size_t batch, std::size_t dim) {
+  const char* path = std::getenv("GUFO_DUMP_ACTIVATION");
+  if (path == nullptr) {
+    return;
+  }
+  static bool dumped = false;
+  if (dumped) {
+    return;
+  }
+  dumped = true;
+  std::vector<std::uint8_t> host(bytes);
+  HIP_CHECK(hipMemcpy(host.data(), buffer, bytes, hipMemcpyDeviceToHost));
+  std::FILE* file = std::fopen(path, "wb");
+  if (file == nullptr) {
+    return;
+  }
+  std::fwrite(host.data(), 1, bytes, file);
+  std::fclose(file);
+  std::fprintf(stderr, "dumped activation %zux%zu (%zu bytes) to %s\n", batch,
+               dim, bytes, path);
 }
 
 bool UseQwen27bFp16Prefill(const models::QwenModelWeights& weights,
@@ -530,6 +558,9 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                                static_cast<const float*>(layer.ffn_norm.data),
                                nullptr, arena_.d_scratch_bf16, batch_size,
                                hidden_size, eps, arena_.stream);
+      DumpActivationOnce(arena_.d_scratch_bf16,
+                         batch_size * hidden_size * sizeof(std::uint16_t),
+                         batch_size, hidden_size);
     } else if (ffn_feeds_q8_only) {
       // The post-attention residual add folds into the norm: one pass reads the
       // hidden state and the attention output, writes the updated hidden state
