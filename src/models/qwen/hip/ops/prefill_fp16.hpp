@@ -52,6 +52,16 @@ void LaunchAtbDecodeCFp32(const void* packed, std::size_t rows,
 void LaunchAtbDecodeCFp16(const void* packed, std::size_t rows,
                           std::size_t n_slice, std::size_t n_full,
                           std::size_t n_offset, void* out, hipStream_t stream);
+// Moves the packed head of a partial-width FP16 projection into the first
+// columns of a full-width row, for the GPU's share of a split projection.
+void LaunchAtbExpandHeadFp16(const void* packed, void* out, std::size_t rows,
+                             std::size_t head_cols, std::size_t full_cols,
+                             hipStream_t stream);
+// The FP32 equivalent for the down projection, whose GPU share is a packed
+// partial that has to be added into the full-width residual rows.
+void LaunchAtbAddHeadFp32(const float* packed, float* out, std::size_t rows,
+                          std::size_t head_cols, std::size_t full_cols,
+                          hipStream_t stream);
 // C accumulated onto an existing FP32 row, for a projection whose residual the
 // GPU branch already wrote.
 void LaunchAtbDecodeCAccumulateFp32(const void* packed, std::size_t rows,

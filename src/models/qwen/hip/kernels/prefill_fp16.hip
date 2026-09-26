@@ -1017,6 +1017,44 @@ __global__ void AtbRepackSliceKernel(const void* __restrict__ w,
   }
 }
 
+// The GEMM kernels index their output as y[token * m + row], so a projection
+// that computes only part of the output width writes a packed [batch, m]
+// buffer. This moves such a head into the first columns of a full-width row,
+// which is what the down projection reads. One pass over the head only: the
+// tail columns are filled by the NPU's own decode.
+__global__ void AtbExpandHeadFp16Kernel(const __half* __restrict__ packed,
+                                        __half* __restrict__ out,
+                                        std::size_t head_cols,
+                                        std::size_t full_cols,
+                                        std::size_t rows) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= rows * head_cols) {
+    return;
+  }
+  const std::size_t r = i / head_cols;
+  const std::size_t c = i % head_cols;
+  out[r * full_cols + c] = packed[i];
+}
+
+// The same packed-head problem for the down projection, whose residual lives
+// at a full-width stride: the GPU's partial columns are added into the residual
+// rows here while the NPU accumulates the columns after them.
+__global__ void AtbAddHeadFp32Kernel(const float* __restrict__ packed,
+                                     float* __restrict__ out,
+                                     std::size_t head_cols,
+                                     std::size_t full_cols,
+                                     std::size_t rows) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= rows * head_cols) {
+    return;
+  }
+  const std::size_t r = i / head_cols;
+  const std::size_t c = i % head_cols;
+  out[r * full_cols + c] += packed[i];
+}
+
 // ATB A operand: FP16 activations [rows, k] into the bfp16 A L1 layout, the
 // same transform as tools/qwen27b/atb_encode_a.hip. L1 tiles of (128, 64) with
 // the k tile varying fastest, each shuffled into 2x1 vertically stacked 8x8
@@ -1292,6 +1330,33 @@ void LaunchAtbDecodeCFp16(const void* packed, std::size_t rows,
       <<<static_cast<unsigned int>(blocks), 256, 0, stream>>>(
       static_cast<const std::uint8_t*>(packed), n_slice / kAtbCL1N, groups,
       n_full, n_offset, static_cast<__half*>(out));
+}
+
+void LaunchAtbExpandHeadFp16(const void* packed, void* out,
+                               std::size_t rows, std::size_t head_cols,
+                               std::size_t full_cols, hipStream_t stream) {
+  if (packed == nullptr || out == nullptr || head_cols == 0 ||
+      head_cols > full_cols) {
+    return;
+  }
+  const std::size_t count = rows * head_cols;
+  const std::size_t blocks = (count + 255) / 256;
+  AtbExpandHeadFp16Kernel<<<static_cast<unsigned int>(blocks), 256, 0, stream>>>(
+      static_cast<const __half*>(packed), static_cast<__half*>(out), head_cols,
+      full_cols, rows);
+}
+
+void LaunchAtbAddHeadFp32(const float* packed, float* out,
+                             std::size_t rows, std::size_t head_cols,
+                             std::size_t full_cols, hipStream_t stream) {
+  if (packed == nullptr || out == nullptr || head_cols == 0 ||
+      head_cols > full_cols) {
+    return;
+  }
+  const std::size_t count = rows * head_cols;
+  const std::size_t blocks = (count + 255) / 256;
+  AtbAddHeadFp32Kernel<<<static_cast<unsigned int>(blocks), 256, 0, stream>>>(
+      packed, out, head_cols, full_cols, rows);
 }
 
 void LaunchAtbDecodeCAccumulateFp32(const void* packed, std::size_t rows,

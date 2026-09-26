@@ -66,6 +66,7 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/hipblaslt_gemm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/dflash_kernels.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/arena.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/atb_npu.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/batched_decode.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/decode.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/decode_step.cpp
@@ -81,6 +82,24 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/dflash/executor.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/dflash/batch.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/dflash/backend.cpp)
+
+  # The NPU half of the FFN split needs XRT and the amdxdna runtime. Neither is
+  # a hard dependency: without them atb_npu.cpp compiles to the stub that
+  # reports the path unavailable, so the same source tree builds everywhere.
+  find_path(GUFO_XRT_INCLUDE_DIR xrt/xrt_bo.h HINTS /usr/include /opt/xilinx/xrt/include)
+  find_library(GUFO_XRT_COREUTIL_LIBRARY xrt_coreutil
+    HINTS /usr/lib /usr/lib64 /opt/xilinx/xrt/lib)
+  # hsa-runtime64 is a ROCm library, so it is not on the default search path.
+  find_library(GUFO_HSA_RUNTIME_LIBRARY hsa-runtime64 HINTS /opt/rocm/lib)
+  if (GUFO_XRT_INCLUDE_DIR AND GUFO_XRT_COREUTIL_LIBRARY AND GUFO_HSA_RUNTIME_LIBRARY)
+    target_compile_definitions(gufo_core PRIVATE GUFO_ENABLE_NPU=1)
+    target_include_directories(gufo_core PRIVATE ${GUFO_XRT_INCLUDE_DIR})
+    target_link_libraries(gufo_core PRIVATE
+      ${GUFO_XRT_COREUTIL_LIBRARY} ${GUFO_HSA_RUNTIME_LIBRARY})
+    message(STATUS "Qwen ATB NPU split enabled: XRT ${GUFO_XRT_COREUTIL_LIBRARY}")
+  else()
+    message(STATUS "Qwen ATB NPU split disabled: XRT or hsa-runtime64 not found")
+  endif()
 
   # HIP helpers must share the kernel's wave size, so compile this unit
   # separately while the other Qwen kernels retain wave32.

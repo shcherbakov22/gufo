@@ -4526,3 +4526,80 @@ to pay.
 The down projection accumulates straight into `d_hidden` through
 `LaunchBatchedQuantGEMMResidualFp16`, which is what makes a column split of it legal: the two sides
 write disjoint columns of the same residual, so no partial sums are exchanged.
+
+## XRT inside the engine: the split runs, and it is worth about 6%
+
+`src/models/qwen/hip/atb_npu.hpp` and `.cpp` own the NPU side: the XRT device, one
+hardware context and kernel per shape, and the A, B and C operands. Those operands are
+`hipMalloc` allocations exported with `hsa_amd_portable_export_dmabuf` and imported as XRT
+BOs, so the iGPU writes A and B in place and reads C out of them -- no stage of the split
+copies a byte. `tools/qwen27b/atb_npu_run.hip` is the standalone proof of that path and is
+where the ERT opcode and the handoff findings came from.
+
+The engine's GEMM kernels index their output as `y[token * m + row]`, so a projection that
+computes part of the output width writes *packed* rows, not a slice of a wide row. The GPU's
+share therefore lands packed and is placed into full-width rows afterwards by
+`LaunchAtbExpandHeadFp16` (gate/up) or `LaunchAtbAddHeadFp32` (down), while the NPU's C
+decode writes the columns past it. Getting this wrong would have silently garbled every
+activation, which is why the call site carries the reasoning.
+
+The split is behind `GUFO_ATB_GU_XCLBIN/INSTS/NSLICE`, the same for `GUFO_ATB_DN_*`,
+`GUFO_ATB_BATCH`, and `GUFO_ATB_TRACE` for per-phase timings. It is off by default.
+
+**Two xclbins coexist.** Feeding the down instruction stream to the gate/up xclbin aborts the
+queue (`qds_device::wait() unexpected command state`), which earlier looked like one shape per
+process. That was wrong: a second hardware context with a different K and N is created and runs
+correctly -- `tools/qwen27b/atb_two_kernels.hip` prepares both, runs both, and re-runs the
+first. Only the instruction stream has to match its own xclbin.
+
+### Measuring this box honestly
+
+A width sweep taken in one sequence decays monotonically -- 487, 438, 420, 412 tok/s for
+increasing N -- with the *width* changing far less than the decay. That is thermal and power
+drift, the same effect that moves the pp2048 reference by 20% between sessions. **Any comparison
+taken across sequences on this box is worthless.** Only paired or interleaved A/B inside one
+session means anything, and the pair must alternate to share the thermal state.
+
+Paired base/split/base/split, three rounds, N=8192 of the gate/up width:
+
+| round | base tok/s | split tok/s | gain |
+| --- | ---: | ---: | ---: |
+| 1 | 479.93 | 509.82 | +6.2% |
+| 2 | 417.92 | 449.29 | +7.5% |
+| 3 | 390.53 | 412.76 | +5.7% |
+
+The split wins every round by 5.7-7.5%. The absolute numbers fall 20% across the three rounds,
+which is the drift; the paired difference does not.
+
+### Where the rest of the projection went
+
+Two things were ruled out by direct measurement:
+
+| probe | result |
+| --- | --- |
+| fixed cost per NPU launch | none: N=1024 takes 0.770 ms (27.9 TF), N=10240 takes 6.652 ms (32.3 TF) |
+| clock decay across idle gaps | none: 0/10/25/50 ms gaps all give 6.64-6.71 ms (32.0-32.3 TF) |
+
+So the NPU is fine on its own, and the shortfall is all in how it is driven. The gate/up slice
+runs while the GPU runs its own head of the same projection, but the *down* projection cannot
+start until the NPU's gate and up have both completed, because its reduction spans the whole
+intermediate width. That serialisation is what keeps the split near 6% instead of the ~30% a
+free second engine would give: at N=8192 the per-layer wait on the NPU is about 13 ms, and the
+GPU has nothing else it is allowed to run during it.
+
+### The CPU cost is real and comes out of the same budget
+
+gufo runs 4 threads. During the split two of them are each near 100%, for about 1.7 cores total;
+the baseline spins one (the known `libhsa-runtime64` spin). System time per benchmark rises
+from roughly 5 s to 9-11 s while user time falls, so the added cost is kernel time in the XRT
+command path. Because the SoC is capped near 95 W, that CPU work competes with the engines it is
+feeding -- the +6% above is measured *after* paying it.
+
+Two levers follow from that, neither taken yet:
+
+1. **Consolidate gate and up into one launch.** Their B slices can be concatenated into a single
+   N = 2 x n_slice GEMM, halving both the submissions and the waits, and halving whatever
+   per-command cost the XRT/amdxdna path carries.
+2. **The libhsa spin costs a full core in both paths.** It is not the split's fault and not the
+   split's cost, but at 95 W a core is a few percent of the budget, and it is paid on every
+   prefill the engine has ever run.

@@ -122,6 +122,9 @@ int main(int argc, char** argv) {
   const int reps = argc > 6 ? std::atoi(argv[6]) : 20;
   const std::string alloc_mode = argc > 7 ? argv[7] : "dev";
   const int stress = argc > 8 ? std::atoi(argv[8]) : 1;
+  // Idle time between timed launches, to test whether the NPU's clocks decay
+  // when the engine leaves it idle between layers.
+  const int gap_ms = argc > 9 ? std::atoi(argv[9]) : 0;
   const bool host_alloc = (alloc_mode == "host");
   const std::size_t a_vol = M * K * 9 / 8;
   const std::size_t b_vol = N * K * 9 / 8;
@@ -292,6 +295,7 @@ int main(int argc, char** argv) {
   for (int i = 0; i < 3; ++i) timed_run();
   double best = 1e30, total = 0.0;
   for (int i = 0; i < reps; ++i) {
+    if (gap_ms > 0) usleep(static_cast<unsigned>(gap_ms) * 1000);
     auto [ms, st] = timed_run();
     if (st != 4) std::printf("  rep %d state=%d\n", i, st);
     if (ms < best) best = ms;
@@ -299,8 +303,8 @@ int main(int argc, char** argv) {
   }
   const double flops = 2.0 * static_cast<double>(M) * static_cast<double>(N) *
                        static_cast<double>(K);
-  std::printf("npu: best %.3f ms  mean %.3f ms  -> %.2f TFLOPS (best)\n", best,
-              total / reps, flops / (best / 1000.0) / 1e12);
+  std::printf("npu: best %.3f ms  mean %.3f ms  -> %.2f TFLOPS (best) gap=%dms\n",
+              best, total / reps, flops / (best / 1000.0) / 1e12, gap_ms);
   std::printf("NPU_RUN %s\n", failures == 0 ? "PASS" : "FAIL");
 
   if (host_alloc) {

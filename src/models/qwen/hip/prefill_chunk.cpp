@@ -1,5 +1,6 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -8,6 +9,7 @@
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/gemm_route.hpp"
+#include "src/models/qwen/hip/atb_npu.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops.hpp"
@@ -27,6 +29,19 @@ namespace {
   return type == core::GgmlType::kQ4_0 || type == core::GgmlType::kQ4_1 ||
          type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ3_K ||
          type == core::GgmlType::kQ2_K;
+}
+
+// Diagnostic clock for the NPU split. GUFO_ATB_TRACE prints where each layer's
+// time goes; without it the split runs unmeasured.
+[[nodiscard]] double AtbTraceNowMs() {
+  using clock = std::chrono::steady_clock;
+  return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch())
+      .count();
+}
+
+[[nodiscard]] bool AtbTraceEnabled() {
+  static const bool enabled = std::getenv("GUFO_ATB_TRACE") != nullptr;
+  return enabled;
 }
 
 bool Int4MixedEnabled() {
@@ -270,6 +285,10 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         std::abort();
     }
   };
+
+  double atb_prep_gu_ms = 0.0, atb_wait_gu_ms = 0.0;
+  double atb_prep_dn_ms = 0.0, atb_wait_dn_ms = 0.0;
+  int atb_prep_gu_n = 0, atb_wait_gu_n = 0, atb_prep_dn_n = 0, atb_wait_dn_n = 0;
 
   // 3. Layer stack
   for (std::uint32_t l = 0; l < config.num_layers; ++l) {
@@ -674,7 +693,45 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
     const void* ffn_down_q8_act = arena_.d_scratch_q8_act;
     const void* ffn_down_input = arena_.d_scratch_bf16;
 
+    // NPU half of the FFN split. The ATB xclbin bakes M, K and N, so this only
+    // applies to the exact chunk and tensor shapes it was built for; anything
+    // else falls through to the GPU-only path unchanged.
+    AtbNpuOffload* const atb =
+        half_prefill ? AtbNpuOffload::Get(AtbRole::kGateUp) : nullptr;
+    const bool atb_split =
+        atb != nullptr && batch_size == atb->geometry().batch &&
+        hidden_size == atb->geometry().gu_k &&
+        intermediate_size == atb->geometry().gu_n_full &&
+        layer.ffn_gate.type == layer.ffn_up.type;
+    bool atb_launched = false;
+
     {
+      const double atb_prep_gu_start =
+          atb_split && AtbTraceEnabled() ? AtbTraceNowMs() : 0.0;
+      if (atb_split) {
+        // A is one encode shared by gate and up; B is only the NPU's tail rows
+        // of each tensor. Both are written in place in the NPU's own buffers,
+        // which are the iGPU's allocations, so nothing is copied.
+        LaunchAtbEncodeAFp16(arena_.d_scratch_bf16, batch_size, hidden_size,
+                             atb->activations(), arena_.stream);
+        const std::size_t tiles = atb->n_slice() / 128;
+        LaunchAtbRepackBfp16Slice(layer.ffn_gate.data, layer.ffn_gate.type,
+                                  intermediate_size, hidden_size,
+                                  atb->geometry().gu_n_gpu, tiles,
+                                  atb->gate_weights(), arena_.stream);
+        LaunchAtbRepackBfp16Slice(layer.ffn_up.data, layer.ffn_up.type,
+                                  intermediate_size, hidden_size,
+                                  atb->geometry().gu_n_gpu, tiles,
+                                  atb->up_weights(), arena_.stream);
+        // The NPU has no stream to order against, so its operands have to be
+        // complete before it is queued.
+        HIP_CHECK(hipStreamSynchronize(arena_.stream));
+        atb_launched = atb->Launch();
+      }
+      if (atb_split && AtbTraceEnabled()) {
+        atb_prep_gu_ms += AtbTraceNowMs() - atb_prep_gu_start;
+        ++atb_prep_gu_n;
+      }
       if (!half_prefill && !ffn_feeds_q8_only) {
         LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
                                      arena_.d_scratch_q8_act, batch_size,
@@ -695,7 +752,24 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
           IsFusedSwiGluGemmEpilogueSupported(
               layer.ffn_gate.type, batch_size, intermediate_size,
               batch_size * intermediate_size * sizeof(float));
-      if (half_prefill) {
+      if (half_prefill && atb_launched) {
+        // Rows [0, gu_n_gpu) stay here and [gu_n_gpu, intermediate) go to the
+        // NPU. These kernels index their output as y[token * m + row], so a
+        // partial-width projection writes packed rows: the gate head lands
+        // packed in d_ffn_gate, and the FP16 SwiGLU reuses d_ffn_act, which is
+        // dead on this path. LaunchAtbExpandHeadFp16 moves the head into
+        // d_ffn_up's full-width rows once the NPU has been collected.
+        const std::size_t n_gpu = atb->geometry().gu_n_gpu;
+        LaunchBatchedQuantGEMMFp16(layer.ffn_gate.type, layer.ffn_gate.data,
+                                   arena_.d_scratch_bf16, arena_.d_ffn_gate,
+                                   batch_size, n_gpu, hidden_size,
+                                   arena_.stream);
+        LaunchBatchedQuantGEMMSwiGLUFp16(
+            layer.ffn_up.type, layer.ffn_up.data, arena_.d_scratch_bf16,
+            arena_.d_ffn_gate, arena_.d_ffn_act, batch_size, n_gpu, hidden_size,
+            arena_.stream);
+        ffn_down_input = arena_.d_ffn_up;
+      } else if (half_prefill) {
         const bool paired = TryLaunchBatchedDualQuantGEMMSwiGLUFp16(
             layer.ffn_gate.type, layer.ffn_up.type, layer.ffn_gate.data,
             layer.ffn_up.data, arena_.d_scratch_bf16, arena_.d_ffn_up,
@@ -752,13 +826,94 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                                      arena_.d_scratch_q8_act, batch_size,
                                      intermediate_size, arena_.stream);
       }
+
+      if (atb_launched) {
+        // The GPU has been running its share since the NPU was queued; collect
+        // the tail and decode gate and up together into the FP16 SwiGLU the
+        // down projection reads.
+        const std::size_t n_gpu = atb->geometry().gu_n_gpu;
+        const double atb_wait_gu_start =
+            AtbTraceEnabled() ? AtbTraceNowMs() : 0.0;
+        const bool atb_gu_ok = atb->Wait();
+        if (AtbTraceEnabled()) {
+          atb_wait_gu_ms += AtbTraceNowMs() - atb_wait_gu_start;
+          ++atb_wait_gu_n;
+        }
+        if (!atb_gu_ok) {
+          throw std::runtime_error("ATB NPU slice did not complete");
+        }
+        // d_ffn_up holds FP16 under this path while keeping its FP32 pointer
+        // type. The expand fills columns [0, n_gpu) and the decode fills the
+        // NPU's tail in the same row stride, so the down projection sees one
+        // full-width FP16 activation.
+        LaunchAtbExpandHeadFp16(arena_.d_ffn_act, arena_.d_ffn_up, batch_size,
+                                n_gpu, intermediate_size, arena_.stream);
+        LaunchAtbDecodeSwiGLUFp16(
+            atb->gate_output(), atb->up_output(), batch_size, atb->n_slice(),
+            intermediate_size, n_gpu, arena_.d_ffn_up, arena_.stream);
+      }
+    }
+
+    // The down reduction spans the whole intermediate width, so a split here
+    // is by output column, not by reduction. The GPU's partial is packed by the
+    // residual GEMM, so it lands in d_ffn_out and is added into the full-width
+    // residual rows afterwards; the NPU accumulates the columns past it.
+    AtbNpuOffload* const atb_dn =
+        half_prefill ? AtbNpuOffload::Get(AtbRole::kDown) : nullptr;
+    const bool atb_dn_split =
+        atb_dn != nullptr && batch_size == atb_dn->geometry().batch &&
+        hidden_size == atb_dn->geometry().gu_n_full &&
+        intermediate_size == atb_dn->geometry().gu_k;
+    bool atb_dn_launched = false;
+    const double atb_prep_dn_start =
+        atb_dn_split && AtbTraceEnabled() ? AtbTraceNowMs() : 0.0;
+    if (atb_dn_split) {
+      LaunchAtbEncodeAFp16(ffn_down_input, batch_size, intermediate_size,
+                           atb_dn->activations(), arena_.stream);
+      LaunchAtbRepackBfp16Slice(layer.ffn_down.data, layer.ffn_down.type,
+                                hidden_size, intermediate_size,
+                                atb_dn->geometry().gu_n_gpu,
+                                atb_dn->n_slice() / 128, atb_dn->gate_weights(),
+                                arena_.stream);
+      HIP_CHECK(hipStreamSynchronize(arena_.stream));
+      atb_dn_launched = atb_dn->Launch();
+    }
+    if (atb_dn_split && AtbTraceEnabled()) {
+      atb_prep_dn_ms += AtbTraceNowMs() - atb_prep_dn_start;
+      ++atb_prep_dn_n;
     }
 
     if (half_prefill) {
-      LaunchBatchedQuantGEMMResidualFp16(
-          layer.ffn_down.type, layer.ffn_down.data, ffn_down_input,
-          arena_.d_hidden, batch_size, hidden_size, intermediate_size,
-          arena_.stream);
+      if (atb_dn_launched) {
+        const std::size_t n_gpu = atb_dn->geometry().gu_n_gpu;
+        HIP_CHECK(hipMemsetAsync(arena_.d_ffn_out, 0,
+                                 batch_size * n_gpu * sizeof(float),
+                                 arena_.stream));
+        LaunchBatchedQuantGEMMResidualFp16(
+            layer.ffn_down.type, layer.ffn_down.data, ffn_down_input,
+            arena_.d_ffn_out, batch_size, n_gpu, intermediate_size,
+            arena_.stream);
+        LaunchAtbAddHeadFp32(arena_.d_ffn_out, arena_.d_hidden, batch_size,
+                             n_gpu, hidden_size, arena_.stream);
+        const double atb_wait_dn_start =
+            AtbTraceEnabled() ? AtbTraceNowMs() : 0.0;
+        const bool atb_dn_ok = atb_dn->Wait();
+        if (AtbTraceEnabled()) {
+          atb_wait_dn_ms += AtbTraceNowMs() - atb_wait_dn_start;
+          ++atb_wait_dn_n;
+        }
+        if (!atb_dn_ok) {
+          throw std::runtime_error("ATB NPU down slice did not complete");
+        }
+        LaunchAtbDecodeCAccumulateFp32(
+            atb_dn->gate_output(), batch_size, atb_dn->n_slice(), hidden_size,
+            n_gpu, arena_.d_hidden, arena_.stream);
+      } else {
+        LaunchBatchedQuantGEMMResidualFp16(
+            layer.ffn_down.type, layer.ffn_down.data, ffn_down_input,
+            arena_.d_hidden, batch_size, hidden_size, intermediate_size,
+            arena_.stream);
+      }
     } else {
       gemm_weight(layer.ffn_down, ffn_down_input, arena_.d_ffn_act,
                   arena_.d_ffn_out, hidden_size, intermediate_size,
@@ -793,6 +948,13 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                                hipMemcpyDeviceToHost, arena_.stream));
     }
     HIP_CHECK(hipStreamSynchronize(arena_.stream));
+  }
+  if (AtbTraceEnabled()) {
+    std::fprintf(stderr,
+                 "atb-trace: gu prep %.3f ms x%d | gu wait %.3f ms x%d | "
+                 "dn prep %.3f ms x%d | dn wait %.3f ms x%d\n",
+                 atb_prep_gu_ms, atb_prep_gu_n, atb_wait_gu_ms, atb_wait_gu_n,
+                 atb_prep_dn_ms, atb_prep_dn_n, atb_wait_dn_ms, atb_wait_dn_n);
   }
   last_hidden_offset_ = (batch_size - 1) * hidden_size;
 
