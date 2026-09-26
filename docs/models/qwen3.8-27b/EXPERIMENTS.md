@@ -735,6 +735,41 @@ only route that can show an unexpected serialisation the counters cannot see);
 or accept 66% and change the instruction instead (int4, 2.2x, a quality
 decision).
 
+### ISA cycle-accounting: attempted, inconclusive
+
+Dumped device-only ISA for the exact production instantiations (Q4_K 256x256,
+kStore, Complete false and true) and tried to account one stage body by hand.
+Two problems stopped it:
+
+1. The compiler fully restructures the stage. Searching for barrier-separated
+   regions containing exactly 32 WMMAs -- the stage body MMA count -- finds
+   spans of 6500+ instructions, over 130 instructions per MMA, against the
+   counter-derived 4 VALU per MMA. Those spans are not stage bodies, so no
+   accounting from them is meaningful. Discarded rather than reported.
+2. `GRBM_COUNT` is not the dispatch duration either. It reads 23.46M cycles
+   (8.09 ms at 2.9 GHz) while the kernel measures 11.5-12 ms, about 34M cycles.
+   Every "% of GRBM" figure above is therefore a lower bound by about 1.45x.
+   Corrected: matrix pipe ~64%, TA ~14%, issue ~10%. Nothing saturated -- the
+   conclusion is unchanged, only the numbers move.
+
+What the ISA did show, and is checkable: `s_delay_alu` is **15.6% of the static
+instruction stream** (35819 of 230132), and 21% inside the stage-like span.
+That is RDNA3.s dependency-padding instruction. If those occupy issue slots they
+are a fifth of the issue budget; if the hardware treats them as free, they mean
+the scheduler could not otherwise separate dependent ALU operations. Either
+reading points at dependency latency in the address and loop arithmetic rather
+than at the memory system -- which would also explain why every memory-side
+hypothesis failed. Not enough to act on, and not confirmed.
+
+**Honest close: the cause of the 34% is not established.** The instrumentation
+surface is exhausted (no PC sampling, no stall counters, no TA sub-counters, no
+usable timestamps), and every structural lever tried is neutral or negative.
+The strongest facts remain that a pure-MMA loop with the same accumulator count,
+ISA and occupancy reaches 100% of the 48.3 TFLOPS ceiling, while the real kernel
+reaches 64-66% with no unit saturated. Acting on that needs stall data this ASIC
+does not expose.
+
+
 
 
 
