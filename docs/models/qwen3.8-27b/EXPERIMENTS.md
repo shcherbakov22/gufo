@@ -2222,3 +2222,60 @@ two costs more in boundaries than the overlap returns.
 One measurement note: `Stages=1` reads **41.11 TFLOPS** here against 39.5 in the
 ablation session, so there is roughly 4% of session-to-session variance in this
 harness. Effects below that are not resolvable without a null control.
+
+
+### The last structural door, measured shut: freeing the A stage is worth at most 5.5%
+
+The remaining idea was a weight decoder that emits **directly in WMMA fragment order**,
+so LDS stops being used as a layout transformer and the A stage (32 KiB) could be
+freed for a deeper K stage. Before rewriting every per-format decoder, measure its
+ceiling. An `AFree` ablation removes A entirely -- no A staging, and the A fetch is
+dead-coded because nothing consumes it, so **no decode either** -- and reads the A
+operand out of `s_b`'s storage (valid memory, garbage values, timing unaffected).
+
+Compile-only resource gate, all safe:
+
+| variant | LDS | scratch | VGPRs |
+| --- | ---: | ---: | ---: |
+| BK=4, A staged (baseline) | 65536 | 0 | 136 |
+| BK=4, AFree | 32768 | 0 | 154 |
+| BK=5, AFree | 40960 | 0 | 166 |
+
+**BK=8 is impossible even with A free**: B alone is `8*256*16*2 = 65536`, exactly the
+budget, and the CTA must still declare something for `s_a`. BK=5 (64 stages against
+80) is the deepest that fits.
+
+Measured at m=17408, k=5120, batch=2048:
+
+| variant | ms | TFLOPS | delta |
+| --- | ---: | ---: | ---: |
+| BK=4, A staged | 9.087 | 40.17 | -- |
+| BK=4, AFree | 8.764 | 41.66 | +3.6% |
+| BK=5, AFree | 8.589 | 42.51 | **+5.5%** |
+
+**+5.5% is the absolute upper bound on the entire decoder rewrite**, and +3.6% of it
+lies inside the ~4% session variance measured above. A real implementation would
+deliver less: it would not remove A's *decode*, only its staging, and the fragment
+layout replicates each row across two lanes, so the decode would either double or
+need extra permute-shuffle work to avoid that.
+
+**Verdict: not worth attempting.** Rewriting every decoder -- with the hang and
+correctness risk that carries -- for a measured ceiling of +5.5% on the GEMM (about
++4% on pp2048) that a realistic implementation would not reach.
+
+### The fp16 structural search, closed
+
+The 22% overhead decomposes as **commit 1.15 ms + fetch 0.89 ms + barriers 0.42 ms**,
+and each component is now pinned by a measured constraint rather than an argument:
+
+| constraint | evidence |
+| --- | --- |
+| the commit cannot be overlapped | LDS is exactly full; the double buffer measured **-10%** |
+| the K stage cannot grow (BK <= 4) | `(BM+BN)*BK*32 = 64 KiB` exactly at 256x256 |
+| the tile cannot grow | 8 accumulators/thread at 1024 threads; 256x512 needs 16 and blows the regfile |
+| freeing the A stage does not pay | measured ceiling **+5.5%**, and it would double the decode |
+
+The fp16 kernel is at a genuine structural optimum for this design on this part.
+Further gain requires a different *design*, not a different configuration -- and the
+one design that would break these constraints was measured to be worth at most 5.5%,
+so it is not worth its risk.
