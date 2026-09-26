@@ -1922,3 +1922,83 @@ So the kernel is limited by decoder work sitting on the critical path, with the
 
 A and B are the structural ones; C and D are narrower. All prizes except the
 0.89x/1.14x spread are extrapolations from the fits above, not measurements.
+
+
+### Three fp16 levers, screened and refuted
+
+The verified budget above identifies the fp16 `<256,256,8,4,...>` kernel as 78.1% of
+pp2048 and its efficiency as tracking VALU per FLOP. Three candidate attacks were
+screened at the production shape (M=17408, K=5120, batch=2048, 256x256 w8n4
+kStore) before any of them was built. All three fail.
+
+**Per-format throughput, production dispatch (`LaunchBatchedQuantGEMMFp16`),
+best of three:**
+
+| type | bytes/weight | TFLOPS | decode cost (VALU/MFLOP) |
+| --- | ---: | ---: | ---: |
+| IQ4_XS | 0.531 | **32.61** | 561 (grid codebook) |
+| Q4_K | 0.5625 | 32.34 | 482 (4-bit unpack) |
+| Q3_K | 0.430 | 31.42 | 704 |
+| Q5_K | 0.6875 | 31.04 | 491 |
+| IQ3_XXS | 0.344 | 30.86 | 652 |
+| IQ3_S | 0.4375 | 30.63 | 697 |
+| Q8_0 | 1.0625 | 29.54 | **231 (about one multiply)** |
+| Q6_K | 0.820 | 27.97 | 589 |
+
+**1. Pre-expanding the weights to FP16 is refuted.** Q8_0 has the cheapest possible
+decoder -- it needs one multiply per element against Q4_K's 4-bit unpack and
+IQ3_S's grid lookup -- and it is still **9% slower** than Q4_K, because it moves
+1.06 bytes per weight against 0.5625. So the entire decode is worth **less than
+9%**, and resident FP16 weights would move 2.0 bytes, 3.6x Q4_K. The bandwidth
+cost exceeds the decode saving, and the plan is a net loss. This is the cheapest
+refutation in this document: one bench run, no kernel written.
+
+**2. Cutting decoder VALU is refuted as the primary limiter.** IQ4_XS has a *more*
+expensive decoder than Q4_K (561 against 482 VALU/MFLOP) and is *faster* than it
+(32.61 against 32.34). Q8_0 has by far the fewest instructions of any format and
+is slower than all but one. Whatever sets throughput, it is not decoder
+arithmetic -- the earlier VALU correlation was real but not causal.
+
+**3. Widening `Complete` (tail-check elimination) to all types is refuted.** The
+production condition admits only Q4_K/Q5_K; a comment claims the other formats
+retain a better register schedule. That claim is correct and the measurement is:
+
+| type | Complete=false | Complete=true | effect |
+| --- | ---: | ---: | ---: |
+| Q4_K (control, already true) | 32.34 | 32.4 | -- |
+| IQ4_XS | 32.61 | 32.63 | neutral |
+| Q3_K | 31.42 | 31.81 | +1.3% |
+| IQ3_S | 30.63 | **29.10** | **-5.0%** |
+| IQ3_XXS | 30.86 | **29.80** | **-3.5%** |
+| Q6_K | 27.97 | 31.72 | +13.5% (0.18% of FLOPs) |
+
+Only Q6_K gains, and it carries 0.18% of the fp16 FLOPs. Widening the condition
+would cost 5% on IQ3_S, which carries 34%. Reverted.
+
+### What the plateau actually is
+
+Across eight weight formats whose decoders differ by **4x in instruction count**
+and **3x in bytes per weight**, throughput spans only **28.0-32.6 TFLOPS** -- and
+with the best `Complete` setting per type, 29.1-32.7. Every format lands within
+about 12% of every other. **The kernel is limited by something the weight format
+does not touch.**
+
+The structure says what: the two candidates that could break the plateau are both
+already closed. LDS is exactly 65536 B at `(BM+BN)*BK*32`, so `BK` is pinned at 4
+and there are 80 stage boundaries, each costing a fitted **~26 us** (BK=2 against
+BK=4 is 17%). A `BK=8` stage would need 128 KiB and cannot exist at this tile.
+And LDS is not the only cap: variant 4 of the BK sweep halved LDS to 32 KiB and
+still reported **one block per CU**, because 191 VGPRs at 1024 threads already
+consume the register file. Both resources forbid a second resident block, so
+there is nothing to hide the decode -> commit -> barrier -> MMA serialisation
+behind.
+
+The structural root is that **LDS is being used as a layout transformer, twice**:
+once to convert the decoder's register output into WMMA fragment order (the A
+stage, 32 KiB), and again for IQ3_S to transpose the accumulator into
+token-major order at store time. Removing the first is the only remaining door --
+a decoder that emits directly in fragment layout would free 32 KiB for `BK=8` --
+and it is a deep rewrite of every per-format decoder. Nothing cheaper is left:
+the epilogue's scalar 2-byte stores are forced by the accumulator fragment layout
+(each lane holds 8 values strided by `m`), so the direct-store path cannot be
+widened without the very transpose IQ3_S already pays for.
