@@ -631,7 +631,7 @@ __launch_bounds__(WM * WN * 32) __global__
         if (ks == (wave & (BK - 1)) && ks0 + BK < ksteps) decode_ra();
       }
     }
-    if constexpr ((Ablate & 16) != 0 ||
+    if constexpr ((Ablate & (16 | 2048 | 8192)) != 0 ||
                   (BM == 256 && BN == 256 &&
                    ((Type == gufo::core::GgmlType::kIQ4_XS &&
                     (!Mixed || UpType != gufo::core::GgmlType::kQ5_K)) ||
@@ -646,7 +646,14 @@ __launch_bounds__(WM * WN * 32) __global__
                    Type == gufo::core::GgmlType::kIQ2_XXS))) {
       // Interleave LDS reads with WMMA after the grid decoders. Mixed Q5
       // decoders retain the compiler's default instruction schedule.
-      __builtin_amdgcn_iglp_opt(0);
+      // Ablations 2048/8192 select the other iglp_opt immediates; 16 keeps
+      // the value the other instantiations already use.
+      if constexpr ((Ablate & 2048) != 0)
+        __builtin_amdgcn_iglp_opt(1);
+      else if constexpr ((Ablate & 8192) != 0)
+        __builtin_amdgcn_iglp_opt(2);
+      else
+        __builtin_amdgcn_iglp_opt(0);
     }
     PC_END(pc_loop);
     PC_START();

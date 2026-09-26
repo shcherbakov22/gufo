@@ -2754,6 +2754,24 @@ passes.
 One such pair now exists above, so the probe is retired as a screen and kept only as a
 source of ISA-level facts.
 
+The remaining scheduler-control lever is also neutral. `iglp_opt` had only ever been tried
+at value 0; values 1 and 2 were exposed as ablations 2048/8192 and A/B'd in the production
+kernel with the interleaved harness:
+
+| arm | median ms | TFLOPS | vs control |
+| --- | ---: | ---: | ---: |
+| control A | 8.819 | 41.40 | -- |
+| `iglp_opt(1)` | 8.853 | 41.24 | -0.4% |
+| `iglp_opt(2)` | 8.842 | 41.29 | -0.3% |
+| control B | 8.857 | 41.22 | -0.4% |
+
+All three are inside the control spread, so the hint does nothing for this instantiation
+at any value. With that, **every fp16 lever tried since the K-loop ceiling was measured has
+come out neutral or negative**: fragment prefetch, stride padding (blocked by the 64 KiB
+budget), fragment-request reduction, the 4x4 warp split, batched loads, and `iglp_opt`
+1 and 2. The shipped inner loop is what the compiler produces for this data flow, and
+perturbing it loses.
+
 ### The 4x4 warp split does not transport to the real kernel
 
 The probe's +2.9% was measured on the pure loop. Applied to the production kernel -- same
