@@ -13,6 +13,12 @@
 
 namespace gufo::hip {
 namespace {
+// A tensor the fp16 prefill kernels can decode in-kernel. Used both for the
+// whole-model gate and, inside gemm_weight, to route one projection at a time.
+[[nodiscard]] constexpr bool Fp16PrefillSupports(core::GgmlType type) noexcept {
+  return type == core::GgmlType::kQ8_0 || detail::IsNativeWmmaQuant(type);
+}
+
 bool UseQwen27bFp16Prefill(const models::QwenModelWeights& weights,
                            std::size_t batch) {
   const auto& config = weights.config;
@@ -23,8 +29,7 @@ bool UseQwen27bFp16Prefill(const models::QwenModelWeights& weights,
       config.AttentionSize() != 6144 || config.ssm_inner_size != 6144)
     return false;
   const auto supported = [](const models::QwenTensorRef& tensor) {
-    return tensor.type == core::GgmlType::kQ8_0 ||
-           detail::IsNativeWmmaQuant(tensor.type);
+    return Fp16PrefillSupports(tensor.type);
   };
   bool low_bit_ffn = false;
   for (const auto& layer : weights.layers) {
@@ -39,9 +44,12 @@ bool UseQwen27bFp16Prefill(const models::QwenModelWeights& weights,
           !supported(layer.attn_v) || !supported(layer.attn_output))
         return false;
     } else if (!supported(layer.attn_qkv) || !supported(layer.attn_gate) ||
-               !supported(layer.ssm_alpha) || !supported(layer.ssm_beta) ||
                !supported(layer.ssm_out))
       return false;
+    // ssm_alpha/ssm_beta are deliberately not gated: gemm_weight dispatches
+    // them per tensor, so a foreign type there costs its own projection instead
+    // of taking the whole model off the fp16 path. They are the only supported-
+    // looking roles that never launch a fp16-only kernel directly.
   }
   return low_bit_ffn;
 }
@@ -103,7 +111,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                                const void* bf16_input, const float* fp32_input,
                                float* output, std::size_t m, std::size_t k,
                                const void* q8_act = nullptr) {
-    if (half_prefill) {
+    if (half_prefill && Fp16PrefillSupports(w.type)) {
       LaunchBatchedQuantGEMMFp16(w.type, w.data, bf16_input, output, batch_size,
                                  m, k, arena_.stream);
       return;
@@ -209,12 +217,27 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         IsFusedRMSNormQuantizeQ8_1Supported(hidden_size) &&
         is_q8(layer.ffn_gate) && is_q8(layer.ffn_up);
 
-    // Pre-layer RMSNorm (generates BF16 into d_scratch_bf16 directly)
+    // Pre-layer RMSNorm (generates the fp16 row into d_scratch_bf16 directly).
+    const bool ssm_gate_needs_fp32 =
+        !layer.is_full_attention &&
+        (!Fp16PrefillSupports(layer.ssm_alpha.type) ||
+         !Fp16PrefillSupports(layer.ssm_beta.type));
     if (half_prefill) {
       LaunchBatchedRMSNormFp16(arena_.d_hidden, nullptr,
                                static_cast<const float*>(layer.attn_norm.data),
                                nullptr, arena_.d_scratch_bf16, batch_size,
                                hidden_size, eps, arena_.stream);
+      if (ssm_gate_needs_fp32) {
+        // A GDN gate projection that is not fp16-capable is dispatched through
+        // the route-resolved fallback, which reads the FP32 normed row. The
+        // fp16 norm kernel cannot produce one -- its fp32 operand is the
+        // reduction sum -- so emit it here with the kernel that does. Only
+        // artifacts with a foreign gate type pay for the extra pass.
+        LaunchBatchedRMSNorm(arena_.d_hidden,
+                             static_cast<const float*>(layer.attn_norm.data),
+                             arena_.d_normed, nullptr, batch_size, hidden_size,
+                             eps, arena_.stream);
+      }
     } else if (norm_feeds_q8_only) {
       LaunchBatchedFusedRMSNormQuantizeQ8_1(
           arena_.d_hidden, /*residual=*/nullptr,

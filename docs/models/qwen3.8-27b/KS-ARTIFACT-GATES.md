@@ -132,4 +132,35 @@ Part 1 alone is worth roughly +36% on such artifacts and is what the numbers
 above measure; part 2 is what makes it correct. Both are small, and together they
 replace the two fixes originally proposed here (requantizing the artifact, or
 writing new int8-WMMA small-n kernels / fusing the GDN gate projections).
+
+### Implemented, and the trap in part 2
+
+The first attempt at part 2 reused `LaunchBatchedRMSNormFp16` and passed
+`arena_.d_normed` in its fourth parameter, on the assumption that the argument
+after the weight was an FP32 output (the sibling `LaunchBatchedRMSNorm` takes
+`(x, weight, out_fp32, out_bf16, ...)`). It is not: the fp16 kernel's signature
+is `(input, residual, weight, float* sum_out, void* output, ...)`, and the
+fourth argument is the **reduction sum**. That silently wrote a sum buffer into
+`d_normed`, which `ssm_alpha` then read. It still measured 579.61 t/s, and it
+still passed `top1_match=yes finite=yes` -- only the cosine gave it away, at
+0.9934 against a pre-change 0.99936. The fp16 norm kernel cannot produce an FP32
+normed row at all, so the correct part 2 is a second pass with
+`LaunchBatchedRMSNorm`, paid only by artifacts that have a foreign gate type.
+
+Final state, `-p 2048 -n 1`, `--validate-prefill 2048`:
+
+| `ssm_f32q8` | cosine | max_abs_diff | pp2048 t/s |
+| --- | --- | --- | --- |
+| before | 0.99935561 | 0.3754 | 424.46 +/- 0.68 |
+| per-tensor gate, no FP32 row (invalid) | 0.98234493 | 1.67 | 579.61 +/- 7.98 |
+| per-tensor gate, sum buffer reused (invalid) | 0.99340147 | 1.0870 | -- |
+| **per-tensor gate + FP32 norm pass** | **0.99999970** | **0.0089** | **504.31 +/- 24.46** |
+
+`base_q4kpure` as the no-regression control: 0.99999970 / 0.0076, 588.42 +/- 8.32
+against a 555-589 baseline.
+
+So the fix is +18.8% and *better* numerics than the original, which makes sense:
+the fp16 WMMA path is more accurate than the int8-activation path the gate was
+forcing every large GEMM onto. The all-native production artifacts take neither
+new code path -- `ssm_gate_needs_fp32` is false, so they pay nothing.
 followed by `gufo bench -m OUT -p 2048 -n 1 -r 1`.
