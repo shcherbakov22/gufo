@@ -4182,3 +4182,27 @@ accepted elsewhere, so the engine wiring is not gated on quality. The diagnostic
 behind its env var as the instrument for any future datatype change (an int8 path would want the
 same measurement, and on the int8 anchor it would land 10x higher).
 
+## The C handoff is not a risk (item 1 of the split)
+
+The split projection assumes the NPU's FFN output reaches the GPU without a meaningful cost.
+Checked rather than assumed:
+
+* **NPU side exports dma-buf.** `amdxdna` carries `amdxdna_dmabuf_ops`,
+  `amdxdna_gem_dmabuf_mmap`, `amdxdna_cbuf_dmabuf_ops` and `amdxdna_ubuf_dmabuf_ops`, and
+  XRT exposes `xrt::bo::export_buffer()` (`/usr/include/xrt/xrt_bo.h:545`).
+* **GPU side imports it.** `hipExternalMemoryHandleTypeOpaqueFd = 1` and
+  `hipImportExternalMemory` are present in the ROCm headers we build against.
+* **So the intended path is a dma-buf import, not a copy.** The NPU's output buffer is ordinary
+  system RAM on this APU, so once the mapping exists a GPU kernel reads it in place.
+
+And the pessimistic case is bounded anyway. The NPU's share of the FFN output is
+`0.438 x 81.8 M` elements per layer = 35.8 M, or **40 MB** at bfp16, against the ~19.5 ms of NPU
+compute that produces it -- a required 2.05 GB/s. This box does roughly 100-250 GB/s to DRAM
+(the document's own figures: 43 GB/s described as 17% of peak, 108 GB/s as half), so even a full
+system-RAM **copy** is ~0.4 ms, about **2% of the NPU's per-layer time**, and zero if the import
+works. Either way it does not move the 1.42x.
+
+What is *not* done: the two-engine functional test (NPU writes, GPU imports the fd and verifies
+the bytes). That is the confirming measurement, and it belongs with the split wiring rather than
+before it -- the cost bound above is what the projection needs, and it holds in the worst case.
+
