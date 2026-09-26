@@ -678,5 +678,63 @@ ablation that changes correctness therefore has a data-dependent bias, which is
 what makes experiment 3 unreadable. Treat any correctness-breaking ablation here
 as usable only for direction, never for magnitude.
 
+### Instrumentation inventory, and the end of the attribution
+
+What this box actually exposes, verified by trying each one:
+
+| capability | status |
+| --- | --- |
+| PMC counters | ~37 in the gfx1151 flat list: instruction counts, `SQ_WAVE_CYCLES`, occupancy, `SQC_LDS_BANK_CONFLICT`, L2 hit/miss, `TA_BUSY_avr`, `MemUnitBusy`, `GPUBusy` |
+| PC sampling | **no agents support it** (`rocprofv3-avail list --pc-sampling` is empty) |
+| `SQ_WAIT_*` stall counters | not defined for gfx1151; the SDK lists them for other archs, gfx1151 reports `Missing` |
+| `SQ_VMEM_TA_CMD_FIFO_FULL`, `SQ_VMEM_TA_ADDR_FIFO_FULL`, `SQ_INSTS_VMEM*` | not available |
+| `TA_BUFFER_COALESCEABLE_WAVEFRONTS`, `TA_ADDR_STALLED_BY_TC_CYCLES`, `GL2C_EA_RDREQ_*` | not available |
+| ATT perfcounters | gfx9 only |
+| kernel timestamps | broken (start == end), so no per-kernel duration either |
+
+So the top-down method stops here: it can establish that no unit is saturated,
+but not which latency is binding, because every stall-reason counter is absent.
+
+**Correction.** `TA_TA_BUSY` at 80% of `GRBM_COUNT` was read above as the load
+path being saturated. It is an aggregate; the per-unit average is
+`TA_BUSY_avr` = 4.61e6 of 23.46e6 cycles = **20%**, and `MemUnitBusy` = 21.5.
+So the load path is not saturated either. The honest reading of the counters is
+that *nothing* is saturated -- matrix pipe 66%, TA ~20%, memory unit ~22%,
+issue ~14%, DRAM ~17% of peak, LDS conflicts zero -- while a pure-MMA loop with
+the same 8 accumulator chains, the same ISA and the same occupancy reaches 100%.
+
+The load-path conclusion is therefore withdrawn too: it was based on the
+aggregate misread.
+
+### Last lever tried: software pipelining the LDS operand loads
+
+The remaining structural reading was that each K step loads its six operands and
+immediately consumes them, so the LDS latency sits in front of the MMA group.
+Restructured the K loop to issue step i+1's loads before step i's MMAs, same
+instructions, same arithmetic:
+
+| | Q4_K | IQ3_XXS |
+| --- | ---: | ---: |
+| base | 11.47 / 11.45 | 12.34 / 12.72 |
+| pipelined | 11.92 / 11.82 | 12.31 / 12.36 |
+
+Neutral on IQ3_XXS and 3% worse on Q4_K, with VGPRs up from 136 to 160. Reverted.
+Either the compiler already schedules this, or the register cost cancels the
+benefit.
+
+The state after all of it: a reproducible 34% deficit that no unit attribution
+explains and no restructuring recovers. Everything tried is listed above -- tile
+geometry, LDS conflicts, decode cost, operand reuse, occupancy, wave64, the
+store epilogue, L2 residency and row-group width, LDS read volume, manual
+pipelining, and the staging ablation. The staging is worth 10-22% but no change
+that keeps the kernel correct has collected it.
+
+What is left, in order of expected value: static ISA cycle-accounting of one
+stage body read straight out of the disassembly (no profiler needed, and the
+only route that can show an unexpected serialisation the counters cannot see);
+or accept 66% and change the instruction instead (int4, 2.2x, a quality
+decision).
+
+
 
 
