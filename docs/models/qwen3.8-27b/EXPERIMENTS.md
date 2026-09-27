@@ -6006,6 +6006,32 @@ Three levers exist, in increasing cost:
    (`SetDriverDramAddrHigh/Low`) are the driver's own, shared with the metrics table, so a userspace push
    would fight the driver.
 
+### Where the limits actually come from
+
+Three candidate sources for the clamp's parameters were checked, and all three came back empty:
+
+- **The VBIOS.** `amdgpu_vbios` (`/sys/kernel/debug/dri/1/amdgpu_vbios`) is a **17 KB stub**
+  (`55 aa 22 00`, md5 `da2d11982cd8c70fd0381e9c6e9e2542`) with no `PPTable` section at all. On an APU
+  the real power table is not in the VBIOS.
+- **`amd_pmf`.** amdgpu's debugfs `current_power_limits` -- which reads `spl`/`fppt`/`sppt`/
+  `sppt_apu_only`/`stt_min`/`stt[APU]`/`stt[HS2]` back from the SMU -- is created only when
+  `pmf_if_version == PMF_IF_V1` (`core.c:136`) and is absent here; and `amd_pmf_dump_sps_defaults()`
+  never printed because `amd_pmf_set_sps_power_limits()` is gated on
+  `APMF_FUNC_STATIC_SLIDER_GRANULAR`, which this BIOS does not advertise (`dmesg`: "No Smart PC policy
+  present"). **So amd_pmf is not the writer of the 80 W figure**, contrary to the earlier note that the
+  kernel feeds the SMU through it.
+- **The feature mask.** `amdgpu_pm_info` reports `SMC Feature Mask: 0x5eb5f3f2cbfffffd`, and **bit 19
+  (`FEATURE_IPU_DPM_BIT`, `smu_v14_0_0_pmfw.h:54`) is set** -- IPU DPM is enabled, consistent with the
+  earlier experiment where clearing it changed nothing.
+
+That leaves the SPS limits being written from the platform/EC side through the PMF mailbox (message ids
+`SET_SPL 0x03`, `SET_SPPT 0x05`, `SET_STT_LIMIT_APU 0x19`, `SET_PMF_PPT 0x25`, `pmf.h`) rather than
+by anything in the amdgpu path.
+
+Note for reproducing any of this: `debugfs` was not mounted, so the amdgpu nodes only appear after
+`mount -t debugfs none /sys/kernel/debug`; the useful ones are `amdgpu_pm_info` (feature mask, clocks,
+SoC power), `amdgpu_vbios`, `amdgpu_regs_smc` and `amdgpu_smu_debug`.
+
 A side observation from the raw BAR5 mailbox work: a deferred machine check (`MC28_STATUS`, "Power,
 Interrupts, etc.", `mem/io: IO`) was logged at uptime 2963 s, coinciding with the direct BAR5 writes. It
 was non-fatal and the machine continued normally, but the raw-mmapped register path is not entirely clean
