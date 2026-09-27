@@ -5205,3 +5205,59 @@ Both are present and both were unpacked (`/lib/firmware`, zstd on this distro):
 IPU as a first-class power domain with a clock, a power, per-column busy and read/write bandwidth --
 and yet no field anywhere sets its share. That is the whole finding in one sentence: the mechanism
 is documented, the telemetry is complete, and the allocation has no knob.
+
+## What the kernel can and cannot do about it
+
+The firmware arbitrates, but the kernel *feeds* it, and one kernel driver on this box is a live power
+policy engine rather than a passthrough: **`amd_pmf`**, which is loaded and is what supplies the NPU
+metrics to amdxdna (`amd_pmf 94208 1 amdxdna`).
+
+**The live lever is `platform_profile`.** The profile class core's `_store_class_profile` walks every
+registered handler and calls `profile_set` on each whose choices include the bit, so one write drives
+*both* providers present here:
+
+    /sys/class/platform-profile/platform-profile-0  name=amd-pmf    (AMDI0105:00, SPS)
+    /sys/class/platform-profile/platform-profile-1  name=asus-wmi   (throttle_thermal_policy)
+
+and `amd_pmf` maps the profile onto a power mode and then pushes the package limits itself
+(`sps.c`):
+
+| platform_profile | amd_pmf mode | Smart PC TA slider |
+| --- | --- | --- |
+| performance / balanced_performance | `POWER_MODE_PERFORMANCE` | `AMD_PMF_TA_BEST_PERFORMANCE` |
+| **balanced (current)** | `POWER_MODE_BALANCED_POWER` | `AMD_PMF_TA_BETTER_PERFORMANCE` |
+| low_power / quiet | `POWER_MODE_POWER_SAVER` | `AMD_PMF_TA_BEST_BATTERY` |
+
+`amd_pmf_set_sps_power_limits()` then writes SPL, FPPT, SPPT, **SPPT_APU_ONLY**, STT_MIN and the
+STT_LIMIT entries through APMF to the EC/SMU. So the profile is a kernel-mediated knob on exactly the
+limits that clamp the NPU, and the box is sitting in the middle of the three.
+
+Two things follow that matter. First, **`stapm_power_limit` reads 66/66 W while the package draws
+93 W**, so something other than the WMI ppt value is producing the sustained limit, and SPS/STT is
+the prime suspect -- which makes the profile a direct test rather than a side issue. Second, the
+Smart PC / CNQF path that `smart_pc_support=Y` enables is **not** registered here: its debugfs
+(`pb/update_policy`, `current_power_limits`) is absent, so SPS is what is actually live. And
+`metrics_table_loop_ms` defaults to 1000, which is the ~1 s time constant behind every filtered
+Averaging field in this document.
+
+**The PMF interface does carry NPU-specific rail limits** -- the first NPU-specific quantities found
+anywhere in the stack (`pmf.h`):
+
+    vddcr_npu_set_voltage, vddcr_npu_telemetry_voltage, vddcr_npu_telemetry_power
+    tdc_vddcr_npu_limit, tdc_vddcr_npu_fused_limit,
+    tdc_vddcr_npu_max_irm_limit, tdc_vddcr_npu_max_pbo_limit
+    tdc_vddcr_npu_value_acc, tdc_vddcr_npu_residency_acc
+    npuclk_freq, npu_power, npu_busy[8], mpnpuclk_freq, npu_reads, npu_writes   (enact table input)
+
+The NPU has its own **VDDCR_NPU rail with a TDC (current) limit** and the enact table receives its
+clock, power and per-column busy. Whether `tdc_vddcr_npu_limit` is what bounds it is unknown, but it
+is the one NPU-specific limit that exists, and it is consumed by the signed TA rather than exposed as
+a sysfs attribute.
+
+**So: yes, the kernel affects this, and no, it cannot redirect the split.** Every kernel-side knob --
+`platform_profile`, SPS's SPL/FPPT/SPPT/STT set, CNQF, `throttle_thermal_policy`, the five
+`ppt_*` -- moves the size of the whole-package budget, and the budget is shared. The decision that
+divides that budget between GFX and IPU lives in the SMU firmware's arbitration, and where Smart PC
+is active, in an AMD-signed TA. The NPU driver's own vocabulary is five SMU messages, of which the
+clock request is already the top DPM level, and the SMU grants less than asked. There is no kernel
+path that asks for the IPU's share, because no such request exists in the interface.
