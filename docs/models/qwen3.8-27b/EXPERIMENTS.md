@@ -6508,3 +6508,41 @@ That makes the patch surface concrete and small: on smu14, source `driver_pptabl
 adapted to this ASIC -- no PSP, no signature, no firmware image, just a table the driver already reads and a
 transfer path it already has. It would let us ship a modified PPTable and see what the SMU does with it, which
 is the only way to test the SoC-EDC hypothesis.
+
+
+### How the PPTable's zeros and the real current limits are handled
+
+Mostly figured out, and the answer is in the header comments rather than the firmware.
+
+**No driver code reads the EDC/Xvmin fields at all.** A whole-tree grep for `GfxEdcLimit`, `SocEdcLimit`,
+`XVmin_Gfx_Edc*`, `XVmin_Soc_Edc*` and `CacEdc*` finds them only *defined* in
+`smu14_driver_if_v14_0.h`, never referenced in any `.c`. They are pure PMFW inputs, so what a zero means is
+decided by the SMU firmware and the header comments are the only documentation.
+
+**The comments refute the reading given earlier.** `XVmin_Soc_EdcThreshold` is annotated
+`// LPF: number of cycles Xvmin_trig_filt will react.` -- **a filter cycle count, not amperage.** Its
+neighbours are `XVmin_Soc_EdcStepUpTime` ("10 bit, refclk count to step up throttle when PCC remains
+asserted"), `StepDownTime`, and `InitPccStep` ("3 bit, First Pcc Step number that will applied when PCC
+asserts"). That cluster is a **voltage-droop throttle controller driven by a PCC assertion** -- GFX disabled
+(all zeros), SoC enabled with a 50-cycle LPF, 10/10 step times and initial step 5. It steps a throttle; it is
+not a current limit, and the "50 A" reading was wrong.
+
+**The actual current limits are the TDC pair, units in the comments:**
+
+    uint16_t VrTdcLimit[TDC_THROTTLER_COUNT];        // In Amperes. Current limit associated with VR regulator maximum temperature
+    uint16_t PlatformTdcLimit[TDC_THROTTLER_COUNT];  // In Amperes. Current limit associated with platform maximum temperature per VR current rail
+
+Both read `{224, 84}`. `GfxEdcLimit` / `SocEdcLimit` are `uint32_t` with **no comment at all**, sitting
+after `LoadlineGfx`/`LoadlineSoc` in `BoardTable_t`, and both zero -- so the fast EDC limiter is off and
+TDC is what binds.
+
+**And the real currents are measured and reported, just not to userspace.** `SmuMetrics_t` carries
+`AvgVoltage[SVI_PLANE_COUNT]`, `AvgCurrent[SVI_PLANE_COUNT]`, `ApuSTAPMLimit`, `ApuSTAPMSmartShiftLimit`,
+`AverageSocketPower`, `AvgApuSocketPower` and `AverageTotalBoardPower`. The user-facing
+`struct gpu_metrics_v3_0` keeps only `stapm_power_limit` / `current_stapm_power_limit` and **drops the
+currents entirely** -- which is exactly why hwmon, `amdgpu_pm_info` and `gpu_metrics` all showed none.
+
+That makes the observability patch small: expose `AvgCurrent[]` / `AvgVoltage[]` / `ApuSTAPMLimit` from
+`SmuMetrics_t`, either in the metrics conversion or as a debugfs dump. It also explains the **66/66** seen
+repeatedly -- the SMU's sustained budget (`ApuSTAPMLimit`) is 66 W while the package draws 80 W. That is a
+readable number and a plausible clamp driver, unlike the zeroed EDC fields.
