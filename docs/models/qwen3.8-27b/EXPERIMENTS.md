@@ -6253,3 +6253,88 @@ Two honest qualifications:
 
 The cmdline change was reverted; `/boot/limine.conf` is byte-identical to the pre-experiment backup
 (md5 `e18f3d48c3aef67dc75d253cd0132acd`, 4702 bytes, no `fw_load_type`).
+
+
+## Has anyone found a PSP vulnerability that loads a modded SMU firmware?
+
+Asked after the direct-load route closed. Short answer: **no.** The record is worth recording because it closes
+the whole class of approaches.
+
+### The SMU firmware is a signed PSP directory entry
+
+AMD's own `amd/firmware_binaries` repository lists, for Strix Halo:
+
+    strixhalo/PSP/TypeId0x00_RootKey_STXH.tkn
+    strixhalo/PSP/TypeId0x01_PspBootLoader_STXH.sbin
+    strixhalo/PSP/TypeId0x02_PspOS_STXH.sbin
+    strixhalo/PSP/TypeId0x05_RtmPubSigned_STXH.key
+    strixhalo/PSP/TypeId0x08_SmuFirmware_STXH.sbin
+    strixhalo/PSP/TypeId0x09_SecureDebugUnlockKey_STXH.stkn
+
+**The SMU firmware is `TypeId 0x08` inside the PSP firmware directory** (Krackan carries
+`TypeId0x08_SmuFirmware_STXH.csbin`, `.csbin` being coreboot's "compressed, signed" suffix), sitting beside
+the root key token and the `RtmPubSigned` key -- it is part of the PSP's signed image set, which the parser
+finds by matching a signature while walking SPI flash from the top (`0xfffa0000`, `0xfff20000`, ...).
+
+`TypeId 0x09_SecureDebugUnlockKey` is the entry that governs anything resembling "backdoor loading".
+coreboot documents it as *"Public key token used during Secure Debug unlock process to verify message payload
+from AMD server"*, alongside `0x13: PSP Secure Debug unlock debug image` and `0x22: PSP Token Unlock data`.
+**The only documented route to load unsigned code is that unlock flow, and it needs a payload signed by AMD's
+server.**
+
+### The historical claims
+
+- **CTS Labs "Masterkey" (March 2018)** claimed a PSP secure-boot bypass allowing a re-flashed, patched PSP
+  firmware. It drew heavy criticism for a 24-hour disclosure, AMD said physical or administrative access was
+  required, and **AMD then encrypted the PSP firmware** -- CTS-Labs' own follow-up is titled "New AMD Update
+  Encrypts PSP Firmware". A SPI dump no longer yields an editable image.
+- **PSPReverse `amd-sp-glitch`** gets custom code execution on the AMD Secure Processor via **voltage fault
+  injection** on Zen1-Zen3. Physical bench attack; not Zen5, not available here.
+- **MilanLaunchy (EPYC Milan)** is software-only code execution on the AMD secure processor, but it is
+  server/SEV-specific (extracting the root VCEK seed) and patched.
+- **CVE-2021-26331** -- *"AMD SMU contains a potential issue where a malicious user may be able to manipulate
+  mailbox entries leading to arbitrary code execution"* (7.8, local). That is literally the mailbox
+  `ryzen_smu` drives. Fixed in EPYC AGESA PI (SB-1021, Nov 2021).
+- **CVE-2020-12961** -- *"PSP ... may allow an attacker to zero any privileged register on the System
+  Management Network which may lead to bypassing SPI ROM protections"* (7.9). Also EPYC, also AGESA-fixed.
+- **Google/AMD SB-7033** is AMD's one software-only, signature-defeating result -- but it targets **CPU
+  microcode**, loaded by the kernel at ring 0, on Zen1-Zen4. It does not touch the PSP or the SMU image.
+
+Both CVEs are server-scoped and fixed in AGESA long before this BIOS (GZ302EA.311, 2025-08-01). There is no
+public PSP flaw that a root user on this machine can use to install modified SMU firmware.
+
+### The real opening: the firmware carries a soft PPTable, and tables can be injected
+
+Decoding the container as `smc_firmware_header_v2_0` rather than v1_0 changes the picture:
+
+    struct smc_firmware_header_v1_0 { struct common_firmware_header header; uint32_t ucode_start_addr; };
+    struct smc_firmware_header_v2_0 { struct smc_firmware_header_v1_0 v1_0;
+                                      uint32_t ppt_offset_bytes; uint32_t ppt_size_bytes; };
+
+`smu_14_0_3.bin` has `header_size_bytes = 44`, exactly the v2.0 size, and the fields read:
+
+    ucode_start_addr = 0x00020000
+    ppt_offset_bytes = 0x0004FF00
+    ppt_size_bytes   = 0x000016B4   (5812)
+
+**So the block at 0x4FF00 -- earlier dismissed as an unexamined "second section" -- is the soft PPTable.**
+Its first four bytes are `B4 16 17 00`, i.e. an `ATOM_COMMON_TABLE_HEADER` with
+`usStructureSize = 0x16B4`, which is **exactly `ppt_size_bytes`**, and `ucTableFormatRevision = 0x17`.
+That is the same structure `smu_sys_set_pp_table()` validates (`header->usStructureSize != size` -> EIO),
+and it is what AMD's May 2026 series ("Add helper functions to fetch pptable") adds
+`smu_cmn_get_pptable_v2_0/v2_1` to read out of firmware binaries of this shape.
+
+Why this is the opening: **a PPTable can be injected, not flashed.** `amdgpu-custom-ppt` documents two
+routes -- UPP writing `/sys/class/drm/card*/device/pp_table` (their note: unstable, can freeze the GPU), or
+a **patched amdgpu that loads `custom_ppt_<VID>_<PID>.bin` during early boot** (their recommended method),
+requiring `ppfeaturemask=0xffffffff`, which this machine already passes on every entry.
+
+On this APU `pp_table` is absent because **no SMU14 ppt function implements `get_pp_table`/`set_pp_table`**
+(`grep` finds none in `smu14/`), and the generic `smu_sys_get_pp_table()` returns `-EOPNOTSUPP` while
+`smu_table->power_play_table` and `hardcode_pptable` are both NULL -- which they are, because
+`smu_v14_0_init_pptable_microcode()` returns early for IP 14.0.2/14.0.3. Exposing it is **a kernel patch,
+not a PSP bypass**, and this machine has already booted patched kernels three times.
+
+So the next move on the IPU clamp is to read the embedded PPTable, find the field that governs the IPU split,
+and inject a modified table through a patched driver. It is unsigned by construction because it never touches
+the PSP's image.
