@@ -7,6 +7,8 @@
 // so it raises the GPU's clocks and its share of the SoC power budget without
 // touching DRAM. Running the NPU loop against each says whether its ~25%
 // concurrency tax is bandwidth or power/scheduling.
+#include <unistd.h>
+
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -58,6 +60,11 @@ int main(int argc, char** argv) {
   }
   const bool mem = std::strcmp(argv[1], "mem") == 0;
   const int seconds = std::atoi(argv[2]);
+  // Duty cycle in percent. Pacing the device between syncs sets the average
+  // package power without touching any power or clock setting, which is what
+  // separates "the NPU is squeezed by the shared budget" from "the NPU is
+  // clamped whenever the GPU is active at all".
+  const int duty = argc > 3 ? std::atoi(argv[3]) : 100;
   const std::size_t n = kMemBytes / sizeof(float);
   float* in = nullptr;
   float* out = nullptr;
@@ -66,7 +73,8 @@ int main(int argc, char** argv) {
   if (hipMemset(in, 0x3f, kMemBytes) != hipSuccess) return 1;
   const int blocks = 2048;
   const int threads = 256;
-  std::printf("gpu_load %s for %d s\n", mem ? "mem" : "compute", seconds);
+  std::printf("gpu_load %s for %d s at %d%% duty\n", mem ? "mem" : "compute",
+              seconds, duty);
   std::fflush(stdout);
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
@@ -77,6 +85,7 @@ int main(int argc, char** argv) {
   // saturated and the process finite.
   int in_flight = 0;
   while (std::chrono::steady_clock::now() < deadline) {
+    const auto t0 = std::chrono::steady_clock::now();
     if (mem) {
       StreamKernel<<<blocks, threads>>>(in, out, n, kMemPasses);
     } else {
@@ -85,6 +94,13 @@ int main(int argc, char** argv) {
     if (++in_flight == 2) {
       if (hipDeviceSynchronize() != hipSuccess) return 1;
       in_flight = 0;
+    }
+    if (in_flight == 0 && duty < 100) {
+      const auto busy = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+      const long long off = busy * (100 - duty) / duty;
+      if (off > 0) usleep(static_cast<unsigned>(off));
     }
   }
   if (hipDeviceSynchronize() != hipSuccess) return 1;

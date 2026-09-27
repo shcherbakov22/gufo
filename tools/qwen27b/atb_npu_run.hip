@@ -308,6 +308,10 @@ int main(int argc, char** argv) {
     total += ms;
     samples.push_back(ms);
   }
+  // Time-ordered copy, so a warm-up ramp is visible as a falling per-decile
+  // mean. The sorted samples below answer a different question (the shape of the
+  // distribution); this one answers "does it get faster as the load persists".
+  const std::vector<double> ordered = samples;
   std::sort(samples.begin(), samples.end());
   const auto pct = [&](double q) {
     const std::size_t i = std::min(
@@ -319,6 +323,15 @@ int main(int argc, char** argv) {
                        static_cast<double>(K);
   std::printf("npu: best %.3f ms  mean %.3f ms  -> %.2f TFLOPS (best) gap=%dms\n",
               best, total / reps, flops / (best / 1000.0) / 1e12, gap_ms);
+  std::printf("deciles:");
+  for (int b = 0; b < 10; ++b) {
+    const std::size_t lo = ordered.size() * static_cast<std::size_t>(b) / 10;
+    const std::size_t hi = ordered.size() * static_cast<std::size_t>(b + 1) / 10;
+    double sum = 0.0;
+    for (std::size_t i = lo; i < hi; ++i) sum += ordered[i];
+    std::printf(" %.3f", hi > lo ? sum / static_cast<double>(hi - lo) : 0.0);
+  }
+  std::printf("\n");
   std::printf("dist: min %.3f p10 %.3f p25 %.3f p50 %.3f p75 %.3f p90 %.3f "
               "max %.3f n=%zu\n",
               samples.front(), pct(0.10), pct(0.25), pct(0.50), pct(0.75),
