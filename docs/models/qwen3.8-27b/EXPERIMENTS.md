@@ -6983,3 +6983,41 @@ engines never get. Part of the gain is that pacing effect rather than NPU offloa
 therefore not a like-for-like arm.
 
 Harness `tools/qwen27b/atb_downoffload_ab.sh`, analyzer `tools/qwen27b/an_atb_dn_ab.py`.
+
+
+### Lean tuning protocol, and the n_gu figure (130 W)
+
+The sweep approach was wrong and expensive. A 25-run Latin square with 15 s gaps costs ~14 minutes per
+question, and the three attempts made here produced nothing: one was invalidated mid-run by a TDP change,
+one used a greedy `sed 's/.*| *//'` that matches the *trailing* pipe and deletes the whole row (empty
+results, not an error -- the same bug is live in `build/atb/pairetdp.sh`), and one used an awk program with
+backslash-escaped dollars inside single quotes, where the escapes reach awk literally so the field never
+matches and the result is EMPTY rather than a failure.
+
+**What works is one run per config against an *adjacent* baseline run, alternating, with 15 s gaps.**
+Six runs, ~3 minutes, and every candidate is compared against a baseline measured minutes apart rather
+than against a number from another session. At 130 W, `-r 3`, 2048-token prefill, splitless = base:
+
+| candidate | base | candidate | delta |
+| --- | ---: | ---: | ---: |
+| gu=8192 | 436.28 (Tctl 59 C) | 488.07 (61 C) | +11.9% |
+| gu=10240 | 423.68 (62 C) | 527.43 (62 C) | +24.5% |
+| gu=12288 | 408.33 (62 C) | 520.04 (62 C) | +27.4% |
+
+**Reading it:** the split beats its adjacent baseline at every point. On absolute candidate values 10240
+(527.43) and 12288 (520.04) are level and 8192 (488.07) is clearly behind, so **the curve has flattened by
+10240** and the 10240 already in use is a fine choice. The +27.4% at 12288 is *not* a further gain -- it is
+the denominator drifting: the splitless arms fell monotonically 436 -> 424 -> 408 across the three pairs,
+while the same splitless configuration read **515-526** in a paired session twenty minutes earlier. The
+percentage is inflated by a falling base, which is exactly why this protocol reports both numbers.
+
+**Noted baseline (130 W, `-r 3`, 15 s gap, splitless, splitless path): 515-526 tok/s in a fresh session,
+degrading to ~410 within a few minutes.** Single-rep `-r 1`, which takes the one boosted rep and does not
+average it with two unboosted ones, reads **546.95** -- matching the ~550 the operator expects. That
+`-r 1`/`-r 3` gap also explains an earlier false alarm: `-r 3` sits 4-21% below `-r 1` depending on how warm
+the box is at the start, and comparing an `-r 3` number against an `-r 1`-based expectation produced a
+'130 W is slower' conclusion that a paired 80-vs-130 test refuted (+9.3%, 3/3 rounds, mechanism = the
+enforced GFX ceiling moving 1953-1979 MHz -> 2145-2220 MHz).
+
+Consequence for tuning: **only adjacent-paired deltas are usable, and any claim below ~10% needs its own
+adjacent baseline.** Harness `tools/qwen27b/lean_gu.sh`.
