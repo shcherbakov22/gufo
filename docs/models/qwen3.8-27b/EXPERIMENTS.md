@@ -6433,3 +6433,35 @@ for the memory-bound case. Moving more of the prefill onto the NPU therefore red
 reduces the pressure that produces the clamp in the first place -- a cycle that feeds itself, and the same
 direction as the pending engine work (token split, repack off the critical path), which was worth ~+25%
 before any of this.
+
+
+### There is no GPU power limit in the PPTable; the per-domain caps are current, not watts
+
+Following the socket-wide correction, the obvious question is whether the *GPU's* share can be capped so the
+remainder falls to the IPU. It cannot -- there is no per-GPU power field anywhere in the table:
+
+- The only power limits are `SocketPowerLimitAc[4] = {304, 1200, 0, 0}` and
+  `SocketPowerLimitDc[4] = {35, 1200, 0, 0}`, both socket-wide, plus `SocketPowerLimitSpare[10] = {80, ...}`.
+  80 appears exactly once in the whole table, in a field the header calls spare.
+- `SocketPowerLimitAcTau` and `DcTau` are **all zero** -- no LPF time constant on either socket limit.
+
+What does exist per domain is **current** limiting, and the asymmetry is the interesting part:
+
+    BoardTable_t  GfxEdcLimit           0        SocEdcLimit            0
+    SkuTable_t    XVmin_Gfx_EdcThreshold 0       XVmin_Soc_EdcThreshold 50
+                  XVmin_Gfx_EdcEnableFreq 0      XVmin_Soc_EdcEnableFreq 0
+                  XVmin_Gfx_EdcThreshScalar 0.4  XVmin_Soc_EdcThreshScalar 1.3
+                  CacEdcCurrLimitGuardband 0     CacEdcGfxClkScalar 0   CacEdcGfxClkIntercept 0
+                  (Soc: StepUpTime 10, StepDownTime 10, InitPccStep 5)
+
+**GFX's current limiting is entirely disabled; only the SoC domain carries an active EDC threshold (50).** The
+`Xvmin_*_Edc` cluster reads as voltage-droop protection -- a clock step controller with thresholds, wait
+times and a PCC step -- which is a plausible shape for something that clamps a clock and *holds* it, but that
+is a hypothesis and the units of "50" are unknown.
+
+Worth separating from the idea it came from: capping the GPU does not *create* budget, it reallocates one
+fixed by cooling. The clock-cap version of exactly this has already been measured -- soft-max SCLK 2000 MHz
+moved the NPU from 7.247 ms to 6.506 ms and the engine from 533.7 to 508.5, a net ~-1.3%. A power or current
+cap would be strictly better *if it existed*, because it would limit only when the GPU actually exceeds its
+share rather than capping the clock unconditionally -- that is the real argument for the idea, and the reason
+it is worth revisiting only if a cap can be reached.
