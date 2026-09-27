@@ -6595,3 +6595,22 @@ State note: PPT0 was set to 80 during the test and then restored to **200**, the
 accepted with `args[0] = 0xC8` and no change to idle power (15.9 W) or clocks, so the write path is now
 verified at both ends of its range. There is still no readback for it, but with the ceiling restored the
 platform side is the only cap again.
+
+
+### PPT0 does nothing observable on this platform
+
+Proper A/B -- same NPU + GPU-compute workload, only PPT0 changed:
+
+    PPT0=80    NPU best 5.304 ms  mean 6.621 ms | package mean 67.2 W, peak 80.0 W
+    PPT0=200   NPU best 5.311 ms  mean 6.618 ms | package mean 67.1 W, peak 80.0 W
+
+Identical within noise. So `SetPptLimit` is accepted, echoed, and has **no effect** on either the NPU's grant
+or the package ceiling on this APU -- consistent with `stapm_power_limit` not moving and with the package
+peaking at exactly 80 W in both arms. The message is a no-op here; whatever caps the package is enforced
+elsewhere.
+
+That also answers the safety question the write raised: **setting PPT0 to 200 did not remove the 80 W cap** --
+the package still peaks at 80.0 W, so the write was harmless and there is nothing to restore.
+
+Harness kept at `/home/q/smu/ppt0_ab.sh`: sets the limit through the userspace mailbox, samples
+`gpu_metrics` once a second, runs `atb_npu_run` against `gpu_load compute`, and reports both arms.
