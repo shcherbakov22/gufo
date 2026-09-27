@@ -5121,3 +5121,87 @@ Only all five at 130 releases the clamp (mean 5.618 against a solo 5.359), and i
 monotonically, 6.084 -> 5.472, settling at solo speed. Note the engine under *concurrent* NPU load is
 +9.2% at 130 W (499.50 vs 457.20), larger than the +6.4% it gains with no NPU running -- when the
 NPU is also competing for the budget, opening the budget matters more.
+
+## The SMU reports the clamp directly, and it says the NPU is at 0.9 W
+
+The claim two sections ago -- "whatever the SMU actually grants is invisible from the host" -- is
+wrong, and the correction is the strongest evidence in this document. `amdgpu`'s `gpu_metrics`
+sysfs file is a 264-byte `struct gpu_metrics_v3_0` (`kgd_pp_interface.h`), world-readable, and for
+an APU it is the whole SMU metrics table -- including a first-class IPU block and the throttle
+counters:
+
+    uint16_t average_ipuclk_frequency;   // time filtered target IPUCLK [MHz]
+    uint16_t average_mpipu_frequency;    // time filtered target MPIPUCLK [MHz]
+    uint16_t average_ipu_activity[8];    // per-column busy % [0-100]
+    uint16_t average_ipu_power;          // time filtered IPU power [mW]
+    uint16_t average_ipu_reads, average_ipu_writes;      // [MB/sec]
+    uint32_t average_socket_power, average_apu_power, average_gfx_power, average_all_core_power;
+    uint16_t stapm_power_limit, current_stapm_power_limit;
+    uint16_t average_gfxclk_frequency, average_fclk_frequency, average_uclk_frequency;
+    uint16_t current_gfx_maxfreq;        // GFXCLK limit enforced on GFX [MHz]
+    uint32_t throttle_residency_prochot, _spl, _fppt, _sppt, _thm_core, _thm_gfx, _thm_soc;
+    uint32_t time_filter_alphavalue;     // metrics table alpha filter time constant [us]
+
+There is a second path to the same data. `npu4_update_counters()` (`npu4_regs.c`) overwrites the
+driver's *cached request* with the SMU's granted values before every clock query:
+
+    ret = AIE2_GET_PMF_NPU_METRICS(&npu_metrics);
+    ndev->npuclk_freq = npu_metrics.mpnpuclk_freq;   // granted MP-NPU
+    ndev->hclk_freq   = npu_metrics.npuclk_freq;     // granted H clock
+    ndev->curr_tops   = NPU4_DPM_TOPS(ndev, ndev->hclk_freq);
+
+so the `DRM_AMDXDNA_QUERY_CLOCK_METADATA` / `QUERY_RESOURCE_INFO` ioctls return the granted level,
+not the request (`build/atb/npu_clk.c`, 30 lines, no privileges). `NPU4_DPM_TOPS` is
+`4096 * cols * hclk / 1e6`, which is where the `tops_max=58` at 1800 MHz comes from.
+
+**Measured through gpu_metrics at ppt = 93 W, engine prefill with the NPU running alongside:**
+
+| quantity | value |
+| --- | --- |
+| IPUCLK / MPIPUCLK granted | **1285 / 985 MHz** (peak 1286 / 986) |
+| DPM level 3 is | {npuclk 975, hclk 1267} |
+| DPM level 7 is | {npuclk 1267, hclk 1800} |
+| IPU per-column busy | **99% on all 8 columns** |
+| **IPU power (SMU's own field)** | **0.94 W** (peak) |
+| GFXCLK | 1860-1979 MHz |
+| current_gfx_maxfreq during load | **1705-1985 MHz** (never 2900; 2900 only at idle) |
+| socket / gfx / all-core power | 93.0 W (at the cap) / ~22 W / ~4-5 W |
+| STAPM limit | **66 / 66 W** (below the 93 W being drawn) |
+| throttle residency delta over the run | SPL +12207, FPPT +17087, SPPT +25, thm_gfx +1538, PROCHOT 0 |
+
+**1285 / 1267 = level 3. 985 / 975 = level 3.** The granted clock is the level-3 row of the DPM
+table to within 1.5%, which is the clamp the timing data inferred, now read straight out of the
+SMU's own table. The NPU is at **99% utilization on every column and 0.94 W** while held at level 3,
+and the GFX is simultaneously capped by the SMU at 1705-1985 MHz against a 2900 MHz ceiling, with
+SPL *and* FPPT *and* GFX-thermal residency all accumulating.
+
+That is the operator's claim as a table: **the arbiter withholds well under a watt from a
+99%-utilised IPU, costs it 29-33% of throughput, and simultaneously caps the GFX it is feeding at
+60-68% of its ceiling.** The exchange rate is ~60x better on the IPU side and the arbiter spends
+the budget on the wrong one.
+
+Two measurement notes. The field is explicitly **time filtered** (`time_filter_alphavalue` 1000000,
+tau ~1 s): through the same run IPUCLK reads 499, 697, 994, 1186 and only then settles at 1270-1286,
+so a single sample during a short load understates it -- the same trap that made the NPU look like a
+1.5 W part. And the IPU power block sums to ~27 W of the 93 W drawn (gfx 22 + cores 4.5 + ipu 0.9),
+so the SMU itself does not attribute the remaining ~66 W to any engine.
+
+### What the firmware blobs did and did not yield
+
+Both are present and both were unpacked (`/lib/firmware`, zstd on this distro):
+
+* **SMU / PMFW** -- `amdgpu/smu_14_0_3.bin`, 333236 bytes, header parses as
+  `{size 0x515b4, hdr 0x2c, seg 0x4fe00/0x4ff00, extra 0x16b4}`; the 0x4ff00 field is exactly the
+  size of `smu_14_0_3_kicker.bin` (327424) and 327424 + 5812 = 333236. It contains plain data
+  tables: at 0x7552 there is a clock ladder `1000, 1100, ... 1800`. But there are no symbols, no
+  strings and no ELF, and the IPU clock values do not appear as a table -- the driver sends
+  MPNPUCLK/HCLK numerically, so the SMU has no IPU table to find. Nothing about the arbitration
+  policy is recoverable this way; it is custom-ISA code.
+* **NPU** -- `amdnpu/17f0_11/npu.sbin.1.1.2.65`, 429680 bytes. Not ELF, no strings except
+  `Release 1.1.2.65` glued to a long hex blob, i.e. a signed/obfuscated image. Not disassemblable
+  in practice.
+
+**The interface headers were the prize, not the binaries.** `smu14_driver_if_v14_0_0.h` documents the
+IPU as a first-class power domain with a clock, a power, per-column busy and read/write bandwidth --
+and yet no field anywhere sets its share. That is the whole finding in one sentence: the mechanism
+is documented, the telemetry is complete, and the allocation has no knob.
