@@ -5096,3 +5096,28 @@ The engine's own baseline is indifferent to the limit in this range -- 530.30 (`
 538.83 (`-r 1`, 93 W), 531.54 +/- 9.90 (`-r 3`, 93 W) -- so the only thing that changes with the
 limit is whether the NPU is allowed to work. **The knee is between 93 and 130 W, and the optimum
 standing limit for a split workload is therefore above the optimum for a baseline workload.**
+
+### The NPU's budget is not a separate domain -- the platform/APU split is inert
+
+The "trick the firmware" route was to feed the NPU out of a different PPT domain, since the five
+`ppt_*` files are documented as different limits (platform SPPT vs APU-only SPPT vs sustained SPL).
+Tested one variable at a time from the all-80 state, NPU running under the real engine prefill,
+1500 commands each:
+
+| arm | spl / sppt / apu / plat / fppt | engine pp2048 | NPU best | NPU mean | deciles | package |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| A control | 80 / 80 / 80 / 80 / 80 | 457.20 +/- 21.17 | 6.947 | 7.666 | flat ~7.65 | 70.8 mean / **80.0 max** |
+| B platform | 80 / 80 / 80 / **130** / 80 | 457.73 | 6.921 | 7.649 | flat ~7.65 | 70.8 / **80.0** |
+| C apu | 80 / 80 / **130** / 80 / 80 | 459.21 | 6.903 | 7.647 | flat ~7.65 | 71.1 / **80.0** |
+| D all | **130 / 130 / 130 / 130 / 130** | **499.50 +/- 5.28** | 5.314 | **5.618** | 6.084 -> **5.472** | 92.3 / 120.9 |
+
+**B and C are inert.** Raising `ppt_platform_sppt` alone, or `ppt_apu_sppt` alone, changes neither
+the engine, nor the NPU (7.649 and 7.647 against the control's 7.666), nor the package -- which sits
+at exactly 80.0 W in all three, the value of `ppt_pl1_spl`. The sustained limit is the one that
+binds, and it binds both engines together: there is no domain in which the NPU can be fed while the
+GPU stays constrained. **The "trick the firmware" idea is closed by measurement.**
+
+Only all five at 130 releases the clamp (mean 5.618 against a solo 5.359), and its deciles fall
+monotonically, 6.084 -> 5.472, settling at solo speed. Note the engine under *concurrent* NPU load is
++9.2% at 130 W (499.50 vs 457.20), larger than the +6.4% it gains with no NPU running -- when the
+NPU is also competing for the budget, opening the budget matters more.
