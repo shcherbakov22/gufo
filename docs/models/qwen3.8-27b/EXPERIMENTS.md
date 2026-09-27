@@ -7049,3 +7049,45 @@ therefore drift-exposed, but the two runs were minutes apart in one session.
 Caveat: the ATB path is bf16, so widening it changes the numerics of the 28 added layers. The change sits
 behind the `GUFO_ATB_*` opt-in, which is off by default, so the default path is untouched -- but the split
 path's quality gate should be re-run before anyone relies on it.
+
+
+### Operating point: n_gu = 8192, not 10240 -- the earlier sweep had it backwards
+
+The lean three-candidate run above reported 8192 as the *worst* arm (+11.9% against its base, versus
++24.5% for 10240). That was drift-poisoned -- it compared each candidate against a *splitless* base which
+itself fell 436 -> 424 -> 408 across the three pairs, inflating whichever candidate ran later with a
+smaller share. Paired directly against 10240, with 15 s gaps and one run each, it reverses:
+
+| rep | 8192 | 10240 | delta |
+| --- | ---: | ---: | ---: |
+| 1 | 618.65 | 577.13 | **+7.2%** |
+| 2 | 575.28 | 541.57 | **+6.2%** |
+| 3 | 583.44 | 588.59 | -0.9% |
+
+Two of three with clear margins, mean +4.2%. **The trace agrees and explains it:** `gu wait` -- the
+*exposed* NPU slice time, measured inside a single run and therefore drift-free -- scales linearly with
+slice width,
+
+| n_gu | gu prep/layer | gu wait/layer | total/layer | pp2048 |
+| ---: | ---: | ---: | ---: | ---: |
+| 8192 | 37.7 ms | **11.2 ms** | **48.9 ms** | 650.41 |
+| 10240 | 39.1 ms | 13.6 ms | 52.7 ms | 602.78 |
+| 12288 | 34.8 ms | 16.3 ms | 51.1 ms | 622.28 |
+
+11.2 / 13.6 / 16.3 ms for 8192 / 10240 / 12288 is 2.4 ms per 2048 rows, so the NPU's slice costs about
+4.6% of a 52.7 ms layer between 8192 and 10240 -- the same figure the paired end-to-end test measures.
+**The operating point is n_gu = 8192.**
+
+Also worth recording: the whole prefill is now accounted for by two trace fields. `gu prep` plus `gu wait`
+is 52.7 ms x 64 layers = 3.37 s against a 3.40 s run, so the split path has no unattributed time left --
+and the NPU's slice is 13.6 ms of that, fully *exposed* rather than overlapped with the GPU. Within the
+N-split there is nothing to overlap it with: the FFN chain (gate/up -> SwiGLU -> down) is a strict
+dependency and layer L+1 needs layer L's output, so only a token split -- which gives each engine an
+independent chain -- can remove it.
+
+**Combined so far:** the type-guard removal (36/64 -> 64/64 layers, +5.6%) and the move to 8192 take the
+opt-in split path from 570.87 to a best measured 650.41, about **+14%**, against a noted splitless
+130 W baseline of 515-526 (`-r 3`) / 546.95 (`-r 1`).
+
+Harness `tools/qwen27b/lean_ab.sh` (paired candidate-vs-candidate) and `tools/qwen27b/lean_gu.sh`
+(candidate-vs-splitless-base, which is the weaker design and is what produced the wrong ranking).
