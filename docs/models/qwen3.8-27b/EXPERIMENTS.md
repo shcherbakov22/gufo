@@ -5729,3 +5729,38 @@ Enumerated live rather than from the source. **Writable and functional:**
 Peak package power moves by ~2 W and the grant stays at level 3. So the unattributed power is not fabric clock power either, and **the GFX soft-max remains the one control that shifts the balance** -- moving the grant to 1776-1809 and the NPU to 5.4-5.6 ms against these arms' 7.2-7.4.
 
 For completeness, the scope of what a userspace lever can reach is now bounded on both sides: the NPU side has one feature bit that does nothing, and the GPU side has exactly one control that does something, which is `SMU_MSG_SetSoftMaxGfxClk` through the OD table. Everything else either does not exist, is read-only, or is rejected.
+
+### Could the GPU be current-starved? No -- and it is not reachable from userspace at all
+
+The last two ideas were raw BAR MMIO to the SMU mailbox (to send messages the driver does not) and the
+`smu_pptable_id` boot parameter. Reconnaissance killed both before anything was written.
+
+**No SMU message sets a current limit.** The complete 86-message smu14 set contains `SetPptLimit` (power),
+`Set(Soft|Hard)(Min|Max)ByFreq` (clocks, by `PPCLK` -- no IPU), and `SetThrottlerMask`, which selects
+*which* throttlers apply rather than a limit value, and which **no driver in the tree calls** (it exists
+only as a `#define` in the smu11/smu13/smu14 headers). There is no `SetTdcLimit` of any kind.
+
+**TDC values live in the PPTable, not the message path:**
+
+    uint16_t VrTdcLimit[TDC_THROTTLER_COUNT];        // Amperes, VR regulator max temp
+    uint16_t PlatformTdcLimit[TDC_THROTTLER_COUNT];  // Amperes, platform max temp per rail
+
+and nothing in the driver assigns them -- they arrive in the pptable image and are transferred to the SMU.
+
+**The OD interface has no TDC command, for any ASIC.** `enum PP_OD_DPM_TABLE_COMMAND` is exactly
+`SCLK_VDDC, MCLK_VDDC, FCLK, CCLK_VDDC, VDDC_CURVE, RESTORE_DEFAULT, COMMIT_DPM_TABLE, VDDGFX_OFFSET,
+FAN_CURVE, ACOUSTIC_LIMIT, ACOUSTIC_TARGET, FAN_TARGET_TEMPERATURE, FAN_MINIMUM_PWM,
+FAN_ZERO_RPM_ENABLE, FAN_ZERO_RPM_STOP_TEMP`. The `Tdc` field and `PP_OD_FEATURE_TDC_BIT` in the interface
+header are for the limits table the SMU reports, not a userspace path. So **no AMD GPU exposes a current
+cap through OD**, and `smu_v14_0_od_edit_dpm_table` having no TDC case is not an smu14 omission.
+
+**`smu_pptable_id` is smu13-only.** It is read in `smu_v13_0.c` and nowhere in `smu_v14_0*` or
+`smu_v14_0_2_ppt.c`, so that boot parameter is a no-op on Strix Halo.
+
+That leaves exactly one mechanism for a current cap: **a kernel patch that rewrites
+`VrTdcLimit[GFX]` / `PlatformTdcLimit[GFX]` in the PPTable before it is transferred to the SMU** (in or
+after `smu_v14_0_init_pptable_microcode`). Raw MMIO was not exercised: it could send messages the driver
+does not, but none of them is a current limit, so writing GPU BAR registers would risk a hang for no
+expected gain. A patch plus a reboot is the same cost we just paid for the IPU DPM attempt, and the
+advantage of a current cap over the measured GFX soft-max is unproven -- the soft-max is free, runtime,
+and already characterized.
