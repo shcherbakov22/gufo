@@ -6546,3 +6546,26 @@ That makes the observability patch small: expose `AvgCurrent[]` / `AvgVoltage[]`
 `SmuMetrics_t`, either in the metrics conversion or as a debugfs dump. It also explains the **66/66** seen
 repeatedly -- the SMU's sustained budget (`ApuSTAPMLimit`) is 66 W while the package draws 80 W. That is a
 readable number and a plausible clamp driver, unlike the zeroed EDC fields.
+
+
+### What is next
+
+The 66 W trace is now concrete rather than speculative, because SMU14 does implement the setter:
+
+- `smu_v14_0_2_ppt.c:2809` defines `smu_v14_0_2_set_ppt_limit()`, registered as `.set_ppt_limit`
+  (line 2909), delegating to `smu_v14_0_set_ppt_limit()` (`smu_v14_0.c:700`).
+- `smu_set_ppt_limit()` (`amdgpu_smu.c:3015`, exposed as `.set_power_limit`) validates against
+  `smu->ppt_limits.range[power_source][limit_type]` and a `supported_mask`, then calls that op.
+- `amdgpu_smu.c:512-527` restores limits per type from `smu->user_dpm_profile.ppt_limits` -- i.e. the
+  driver already tracks each limit type, its range, and its default.
+
+So the questions worth answering, in order: **which `SMU_LIMIT_TYPE_*` reports 66 W, is it in
+`supported_mask`, and can it be set to 80?** If the SMU is arbitrating an 80 W platform against a stale 66 W
+sustained limit of its own, raising that one number would relax the clamp at no thermal cost — a free win.
+The falsifier is clean: set it, and if the package still draws 80 W with the IPU still pinned at level 3, the
+thread closes for good.
+
+Independently, the engine work is the sure gain: the token split (M<2048 xclbin, row-offset decode) and
+taking the B repack off the critical path were worth ~+25% before any of this, and moving work onto the NPU
+lowers package draw (GPU-only compute measured 87.0 W against 72.9 W for GPU + NPU), which relieves the clamp
+as a side effect rather than as a fight.
