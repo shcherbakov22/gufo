@@ -6697,3 +6697,27 @@ What is *not* exposed is the rail's own limit and throttle residency: `tdc_vddcr
 `tdc_vddcr_npu_residency_acc` sit in the `iod` block the kernel already reads and are dropped. Exposing those
 two fields is the decisive measurement -- residency climbing during the clamp would mean the NPU rail is
 current-throttling, and that would *be* the clamp.
+
+
+### The NPU's own rail telemetry is readable from userspace, no patch needed
+
+`/dev/accel/accel0` (mode 666) plus `DRM_IOCTL_AMDXDNA_GET_INFO` with `param = DRM_AMDXDNA_QUERY_SENSORS`
+returns nine sensors: one `AMDXDNA_SENSOR_TYPE_POWER` (from `amd_pmf_npu_metrics.npu_power`, mW) and eight
+`COLUMN_UTILIZATION`. Tool: `tools/qwen27b/amdxdna_power.c`; build with
+`-D__user= -D__force= -D__iomem= -D__bitwise= -I<kernel>/include/uapi -I<kernel>/include/uapi/drm`.
+
+Measured with `atb_npu_run` plus `gpu_load compute`:
+
+    idle                       POWER 0-1 mW        cols  0  0  0  0  0  0  0  0
+    NPU + GPU compute (busy)   POWER 774-924 mW    cols 99 99 99 99 99 99 99 99
+    ramp down                  POWER 282 -> 5 mW    cols 30 -> 1
+
+So **the NPU draws ~0.9 W while sitting at 99% column utilisation**. That is a genuinely new quantity -- the
+SMU-side `average_ipu_power` is a different number, and the PMF one is an accumulator delta so absolute levels
+need care, but the busy/idle contrast is unambiguous.
+
+**And it makes the rail-TDC hypothesis more plausible rather than less.** A ~0.9 W rail at ~0.8 V carries
+about 1 A. A dedicated TDC limit (`tdc_vddcr_npu_limit`) on a rail that small could easily sit right at the
+level-3 operating point -- which is exactly the shape of the clamp: a *held* clock reduction, i.e. a lower DPL
+level picked to keep the rail's current under its ceiling. The number that settles it remains
+`tdc_vddcr_npu_residency_acc`, still unexposed.
