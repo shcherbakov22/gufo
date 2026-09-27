@@ -6073,6 +6073,62 @@ set all five to 130, then drop `ppt_apu_sppt` alone to 60, restore, then `ppt_pl
 -- is what would show which of them the IPU clamp actually tracks. It is the only remaining lever that can
 move the grant without a reboot, and it changes power limits, so it needs the owner's say-so.
 
+
+## SMU modding III: the firmware is Xtensa, and message dispatch is a table
+
+Following up on what a patch would actually be a patch *of*.
+
+### The ISA is Xtensa, little-endian
+
+Public reverse-engineering work on AMD SMU firmware
+(`bc250-collective/amd_smu_reverse_engineering`) establishes the SMU core is **Xtensa, little-endian**,
+with its address space starting at 0 -- that project loads images into Ghidra as `Xtensa-le` after
+stripping the leading **0x100-byte header**. That is exactly the `ucode_array_offset_bytes = 0x100` in
+`smu_14_0_3.bin`'s `smc_firmware_header_v1_0`. So the payload `0x100..0x4FF00` is Xtensa code and data,
+and the firmware is not an opaque blob -- it is a disassemblable image with a known ISA.
+
+### Message dispatch is a handler table, and `0xFE` means "no handler"
+
+The same work describes the runtime: a cooperative scheduler with tasks, locks, timers and events, and a
+message path of `queue_descriptor_table_offs_0[8]` -- **eight queues, each a `{CMD, ARG, RSP}` register
+triple**, which is why several distinct C2PMSG sets exist (NPU `C2PMSG_0/60/61`, ryzen_smu
+`C2PMSG_10/30/38`, the PMF pair). `queue_table_8` points at per-queue handler tables whose entries are
+`queue_msg_handler` (function pointer plus config bytes, the latter carrying guard behaviour and
+sync/async). `queue_dispatch` reads the message id from `CMD`, validates the handler, and writes status
+codes: **`0xfe` invalid/no handler, `0xfd` guard reject, `0xfc` busy**.
+
+**That retro-explains the PMF result exactly.** `GET_SPL` and friends returned `0xFE` -- not a timeout,
+not garbage. The SMU read the message id, looked it up, found no handler and said so. The protocol was
+correct all along; this platform simply does not implement those messages.
+
+### The tables are findable in the blob
+
+- `0x03B00000` (`MP1_Public`) appears at file offset `0xE3C`, inside a descriptor region marked by
+  **`DEAD0001`..`DEAD0006` sentinels** (at `0xE90`, `0xE0C`, `0xE10`).
+- Stride-8 pointer runs (`queue_msg_handler`) give candidate dispatch tables: `0x16C10` with 75 entries,
+  `0x16850` with 68, `0x19104` with 64 (irregular).
+- A run of 128 identical `0x11E8` entries at `0x154A0` looks like a default/stub table.
+- Config data is interleaved with the pointers: `500.0`, `1250.0`, `25000.0` cluster near `0xE50`, and
+  `0.24`, `62.0`, `64.0` at `0x19040`.
+
+75-88 entries is the right order of magnitude for SMU14's 86 `PPSMC_MSG_*` ids, which is consistent with
+these being the dispatch tables.
+
+### What a patch therefore requires
+
+Moving the IPU clamp means locating the DPM arbitration in that code and changing it. There is no shortcut
+in the data: `PPCLK_COUNT` is 11 and none is IPU, no IPU message exists in the Linux interface, the APU
+VBIOS is a stub with no PPTable, and **the IPU DPM ladder is not present as plain data in the blob** --
+u16 `396` and `975` have zero hits, and the `1267`/`1809`/`1285` hits all sit inside high-entropy code
+(the driver's own table is near-linear, so the firmware most likely computes it). **There is no single byte
+whose meaning is known, so a blind edit would be a guess with a real chance of breaking SMU init.**
+
+Doing this properly needs a disassembler. `llvm-objdump` on this box has no Xtensa target, but the distro
+carries **`ghidra 12.1.2`** (Ghidra has an Xtensa processor module -- the tool the public RE work uses)
+and `qemu-system-xtensa`. So the next step for the firmware route is: install Ghidra, load the payload at
+`0x100` as `Xtensa-le` starting at address 0, recover the queue handler tables, and walk from a known
+message id (e.g. `GetSmuVersion 0x02`) to the DPM/arbitration code.
+
 A side observation from the raw BAR5 mailbox work: a deferred machine check (`MC28_STATUS`, "Power,
 Interrupts, etc.", `mem/io: IO`) was logged at uptime 2963 s, coinciding with the direct BAR5 writes. It
 was non-fatal and the machine continued normally, but the raw-mmapped register path is not entirely clean
