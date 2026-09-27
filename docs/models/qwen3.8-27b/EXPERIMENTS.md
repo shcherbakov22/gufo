@@ -5308,3 +5308,50 @@ and 0.9 W to the IPU, leaving **~66 W unattributed**. If the budget is being con
 unattributed part rather than by the GFX clock, capping GFX will not un-clamp anything. That is the
 experiment, and it is falsifiable in one run: cap GFX, watch `average_ipuclk_frequency` in
 `gpu_metrics` -- 1267 means still level 3, 1800 means the NPU got its level back.
+
+### Measured: capping GFX releases the clamp completely, level 3 -> level 7
+
+Three arms, NPU under the engine, `gpu_metrics` sampled throughout (`build/atb/gfxcap.sh`):
+
+| GFX setting | peak IPUCLK | peak MPIPUCLK | peak package | engine pp2048 | NPU mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `auto` (control) | 1327 | 1007 | **93.0 W** | 498.63 | 7.442 |
+| `manual` + `pp_dpm_sclk=1` (write rejected) | 1290 | 988 | 93.0 W | 492.50 | 7.579 |
+| **`low`** (600 MHz) | **1810** | **1267** | **61.0 W** | 147.99 | **5.365** |
+
+DPM level 7 is {npuclk 1267, hclk 1800}; level 3 is {975, 1267}. The `low` arm lands exactly on the
+**level-7** row (1267 / 1810) and the NPU's mean returns to its solo value (5.365 against 5.351
+solo, best 5.309). **The clamp is released by nothing but package headroom**: 61 W peak -> level 7,
+93 W at the cap -> level 3.
+
+The cost is the problem. `low` pins GFX at 600 MHz and the engine falls from 498.63 to 147.99, a
+70% loss, so the control is useless as a setting.
+
+### The intermediate cap is not reachable -- and that is the patch worth writing
+
+* `echo 1 > pp_dpm_sclk` -> **EINVAL**. `amdgpu_set_pp_dpm_sclk` exists only as the sysfs wrapper in
+  `amdgpu_pm.c:1114`; **there is no smu14 implementation**, so the per-level selection has nothing to
+  call.
+* `echo "s 1 1600" > pp_od_clk_voltage` -> **EINVAL**, even with `ppfeaturemask=0xffffffff`.
+* `smu_v14_0_0_force_clk_levels` handles SOCCLK, FCLK, VCLK, DCLK, VCLK1 and DCLK1 and **explicitly
+  omits GFXCLK** (default: -EINVAL).
+* But `smu_v14_0_0_set_soft_freq_limited_range` **does** handle SMU_GFXCLK, mapping it to
+  `SMU_MSG_SetSoftMinGfxclk` / `SMU_MSG_SetSoftMaxGfxClk`, with the comment *"SoftMin lets PMFW
+  throttle gfxclk"*.
+
+So the message path is implemented and simply not wired to any user interface. **A small patch
+exposing `SMU_MSG_SetSoftMaxGfxClk` is the one kernel patch with a mechanism** -- not to address the
+NPU, which no SMU clock id can name, but to leave the package the headroom that releases it.
+
+### Why that patch probably still loses, and what to do instead
+
+The NPU carries about 29% of prefill (43.8% of the FFN, which is ~67% of prefill). A 38.7% NPU
+improvement cuts roughly **7.8%** of total time; a GFX cap costing more than ~8% of GPU throughput
+gives that straight back. Only a cap sitting right at the threshold would be free, and the threshold
+is unknown -- so the patch would buy the answer, not the win.
+
+**Raising the package limit is strictly better.** It buys the same level-7 grant (the all-130 W arm
+already measured NPU mean 5.618 with the engine running), costs the GPU nothing by construction, and
+instead adds +9.2% to the engine under concurrent NPU load. Capping GFX pays for the NPU's level with
+GPU throughput; raising the limit pays with heat. There is no third option, because the arbiter
+inside the SMU is the only thing that decides, and it decides on the package budget.
