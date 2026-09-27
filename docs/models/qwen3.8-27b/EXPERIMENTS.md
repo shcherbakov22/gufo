@@ -6208,7 +6208,8 @@ writes landed. The falsifier is explicit in the code -- `smu_load_microcode()` l
 `"Load microcode failed"` if `smu_v14_0_load_microcode()` returns non-zero (it returns `-ETIME` when
 `MP1_FIRMWARE_FLAGS` never reports interrupts enabled).
 
-`/home/q/smu/verify-fwloadtype.sh` classifies the resulting boot. A success means a modified
+`tools/qwen27b/verify_fwloadtype.py` (also on disk at `/home/q/smu/verify-fwloadtype.sh`) classifies
+the resulting boot. A success means a modified
 `smu_14_0_3.bin` is viable and the next step is an inert validation patch -- bump `ucode_version` in the
 container header and confirm dmesg reports the new value, which proves the driver consumed our file before
 any edit that could matter. A failure closes the firmware route and returns us to the mailbox or
