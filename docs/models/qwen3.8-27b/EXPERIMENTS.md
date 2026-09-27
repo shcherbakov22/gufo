@@ -4901,3 +4901,41 @@ busy, it is not the NPU's own consumption. Two candidates remain open -- a polic
 does not reflect the measured power, or a shared clock domain whose divider moves with the GPU's
 state (which would explain why the drop lands on a discrete table level rather than varying
 smoothly). Both are outside anything the engine, XRT or the NPU driver can set.
+
+### Found it: the contention is configured through the ASUS WMI power limits, not amd_pmf
+
+The NPU's granted clock is decided by the SMU from the package power limits, and on this machine
+those limits are ordinary writable sysfs attributes. Two interfaces expose them, and they do not
+agree with each other:
+
+    /sys/devices/platform/asus-nb-wmi/          (mode 0666)
+      ppt_pl1_spl           80
+      ppt_pl2_sppt          80
+      ppt_apu_sppt          80
+      ppt_platform_sppt     80
+      ppt_fppt              80
+
+    /sys/devices/virtual/firmware-attributes/asus-armoury/attributes/
+      ppt_pl1_spl  "Set the CPU slow package limit"      60   [28..80]
+      ppt_pl2_sppt "Set the CPU fast package limit"      75   [32..92]
+      ppt_pl3_fppt "Set the CPU fastest package limit"   86   [45..93]
+
+The armoury interface is the ranged, documented one and goes up to 92 on the fast limit. Which of
+the two the SMU actually takes is not yet established -- writing one and reading the other is the
+test -- but the sustained package draw measured under GPU load was exactly **80.0 W**, which is the
+WMI value and not any of the armoury ones.
+
+**This is the lever, and it means a kernel patch is probably unnecessary.** The contention is not
+hidden in the SMU: it is the package power limit, it is exposed by mainline `asus-nb-wmi`, and it
+is bounded and reversible. Raising the fast/second limit (75 -> 92 by its own range, or the WMI
+platform limit above 80) gives the SMU headroom, and the prediction from the measurements above is
+concrete: the NPU's power should return from ~1.0 W toward 1.5 W and its mean command time from
+~6.5-9.5 ms back toward 5.3, because the 0.64-0.67x power collapse is the level-3 clamp.
+
+**It is a power change, so it is the operator's call**, and the cost is heat: the package already
+runs at 80-85 W with Tctl 86-90 C and both fans at 6100 RPM during these runs, and skin temperature
+limits (`STT_SKINTEMP_*`) are in the same policy family.
+
+The precedence question is also worth settling first, because it decides whether the write should go
+to `ppt_pl2_sppt` or `ppt_platform_sppt` / `ppt_apu_sppt`: the APU limit and the platform limit are
+different domains, and the NPU lives inside the APU.
