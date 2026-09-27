@@ -6929,3 +6929,57 @@ sensor, sharper than the time-filtered `gpu_metrics` averages and needing no loa
 State note: `/home/q/smu/aie_smu_probe.py` (queue probe) and `/home/q/smu/aie_freq_clamp.sh` (frequency
 request under load). No clock was left changed -- both requests were clamped, and the driver re-asserts
 its own DPM level on every device open.
+
+
+### The down offload is a real loss, not a thermal artifact -- item closed
+
+The tuning list called the down offload open, because *"it was rejected on a comparison that is now
+known to have been thermally confounded"*. Re-measured properly: four arms, four rounds, arm order
+rotated by round so **every arm visits every position exactly once** (a Latin-square design -- the sum
+of positions is 6 and the sum of time indices 46 for every arm, so the means are corrected for a linear
+drift trend). All in one session, `-r 3` per run, batch 2048.
+
+Arms: `base` (no offload), `gu10240` (gate/up only), `gu+dn2048`, `gu+dn3072`. pp2048:
+
+| round | base | gu10240 | gu+dn2048 | gu+dn3072 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 548.6 | 547.2 | 483.6 | 446.7 |
+| 2 | 396.1 | 544.7 | 481.8 | 445.9 |
+| 3 | 437.3 | 461.6 | 479.1 | 447.8 |
+| 4 | 355.3 | 484.2 | 486.0 | 446.9 |
+| **mean** | **434.3** | **509.4** | **482.6** | **446.8** |
+
+**Paired against gate/up-only inside each round, the down offload loses every time:**
+
+| round | gu10240 | gu+dn3072 | delta |
+| --- | ---: | ---: | ---: |
+| 1 | 547.2 | 446.7 | -18.4% |
+| 2 | 544.7 | 445.9 | -18.1% |
+| 3 | 461.6 | 447.8 | -3.0% |
+| 4 | 484.2 | 446.9 | -7.7% |
+
+4/4 rounds, mean **-11.8%**. The intermediate width agrees: `dn2048` (482.6) loses less than `dn3072`
+(446.8), so the loss grows monotonically with the NPU's share of the down width. **The down offload is
+genuinely a loss; the earlier rejection was correct and the thermal suspicion does not rescue it.** The
+narrower slice at 2048 was already built and still loses, so this is not a badly chosen width either.
+
+Two things fell out that matter more than the closure:
+
+**The drift warning is not academic.** `base` moved 548.6 -> 355.3 across four rounds, a **35% swing**,
+while `gu+dn3072` stayed inside 445.9-447.8. Any comparison taken across sequences on this box is
+worthless, and an arm that happens to sit still looks good for the wrong reason. Which is also why the
+down-offload result is trustworthy: it is a 4/4 paired result, not a difference of means from separate
+sessions.
+
+**The gate/up split measured +17.3% here, not the +6% on record.** base 434.3 -> gu10240 509.4, and
+paired per round +19.8% mean / +20.9% median. Same session, so it is comparable: n_gu=10240 against the
++10% recorded for 8192 in the width sweep, i.e. the curve still looked like it was rising where the
+recorded sweep stopped. The xclbins for 8192/10240/11264/12288/14336/15360 already exist, so **the n_gu
+optimum is the cheapest open question left in the engine** and is being swept now.
+
+Caveat on that +17.3%: the `base` arm is the *unpaced* baseline, which burns ~17-19 s of user CPU in the
+`libhsa` spin that the split collapses to ~2 s. So the baseline both runs hotter and pays power the
+engines never get. Part of the gain is that pacing effect rather than NPU offload, and `base` is
+therefore not a like-for-like arm.
+
+Harness `tools/qwen27b/atb_downoffload_ab.sh`, analyzer `tools/qwen27b/an_atb_dn_ab.py`.
