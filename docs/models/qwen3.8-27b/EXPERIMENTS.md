@@ -6591,6 +6591,7 @@ which returned `CMD_UNKNOWN` on the queue probed earlier, and which `amd_pmf` do
 either. **The budget the SMU arbitrates is told to it from the platform side and is not reachable through any
 SMU message we can send.** With cooling being the real ceiling, that closes the clamp thread.
 
-State note: PPT0 is now 80 W, and no readback exists to restore a previous value. It matches the elected set
-point, so it should be neutral, and the EC rewrites it on a profile change; `SetPptLimit(200)` restores the
-ceiling if wanted.
+State note: PPT0 was set to 80 during the test and then restored to **200**, the `MsgLimits` ceiling --
+accepted with `args[0] = 0xC8` and no change to idle power (15.9 W) or clocks, so the write path is now
+verified at both ends of its range. There is still no readback for it, but with the ceiling restored the
+platform side is the only cap again.
