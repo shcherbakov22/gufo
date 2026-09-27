@@ -4939,3 +4939,133 @@ limits (`STT_SKINTEMP_*`) are in the same policy family.
 The precedence question is also worth settling first, because it decides whether the write should go
 to `ppt_pl2_sppt` or `ppt_platform_sppt` / `ppt_apu_sppt`: the APU limit and the platform limit are
 different domains, and the NPU lives inside the APU.
+
+## The NPU draws about 21 W, not 1.5 W -- and the metric that said otherwise
+
+An earlier section reports the NPU at ~1.0-1.5 W under load and calls it anomalous. It is an
+artifact of how the number is produced. `amd_pmf` does not sample NPU power; it reads an
+*accumulator* from the SMU metrics table and turns it into a rate:
+
+    metrics.c: val_diff = curr_value - prev_value; return val_diff / counter_diff;
+               data->npu_power = amd_pmf_q10_acc_to_mW(val);   /* acc/1024*1000, capped at u16 */
+
+The value is the average over the interval **between two sensor reads**, not an instantaneous
+power. A read taken during a short burst after a long idle is averaged against the idle time, and
+the first read after the device has been unused returns `N/A` for the same reason. Polling during a
+steady load gives a usable number, but it is not ground truth.
+
+Package power is. Same shape (N=8192, K=5120) held for 16 s at 130 W:
+
+| state | package | delta |
+| --- | ---: | ---: |
+| idle | 18.2 W | -- |
+| NPU at full tilt, 32.39 TFLOPS | 39.5 W | **+21.3 W** |
+| GPU compute load only | 87.0 W | -- |
+| GPU compute load + NPU | 72.9 W | **-14.1 W** |
+| GPU memory load only | 82.0 W | -- |
+| GPU memory load + NPU | 80.0 W | **-2.0 W** |
+
+**The NPU is not a 1.5 W device.** At full tilt it moves the package by ~21 W on an otherwise idle
+box, which is ~1.5 TFLOPS/W for the 32.4 TF int8 GEMM and matches the older "31 TF for ~30 W"
+figure that the 1.5 W reading had contradicted. The sensor was wrong; the old estimate was right.
+
+**And its marginal cost on top of an already-active GPU is zero, even negative.** The 21 W is mostly
+shared SoC infrastructure -- fabric, memory controllers, SLC -- that the GPU has already powered up.
+Adding the NPU to a busy GPU adds no package power at all; it slightly *lowers* it, because the NPU
+is throttled in the shared budget and the GPU's clock is pulled back with it.
+
+That also means the split's power story is not "the NPU spends 21 W". It is "the NPU spends nothing
+the GPU was not already spending, but it takes execution slots in a shared budget".
+
+## The GPU does not stall more at higher power -- it barely clocks up at all
+
+The suggestion was that extra package power cannot become throughput because the GPU is internally
+data-movement bound, so more power just buys more stalls. Sampled at 0.1 s through a full prefill,
+almost the opposite shows up: **throughput tracks the clock almost exactly, and it is the watts that
+fail to become clock.**
+
+Same benchmark, 0.5 s sampling of `pp_dpm_sclk` and `gpu_busy_percent`:
+
+| limit | mean clock | max clock | pp2048 | TFLOPS | TFLOPS per MHz |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 80 W | 1799 MHz | 1875 MHz | 479.13 | 25.87 | 0.014378 |
+| 130 W | 2016 MHz | 2221 MHz | 528.73 | 28.55 | 0.014161 |
+
++12.1% clock and +10.35% throughput: the work done per clock falls by **1.5%**, i.e. there is
+essentially no extra stalling. What is broken is the conversion of watts into clock. Mean package
+draw went 71.3 -> 88.5 W (+24%) for +12% clock, the GPU never reaches its top level (2900 MHz; the
+sampled maximum is 2221), and `gpu_busy` sits at ~85% at both limits.
+
+### The boost window is the clearest case: 14 W buys a *lower* clock
+
+A single `-r 1` prefill at `ppt=80`, 0.1 s resolution, reproduces the original test case -- the ramp
+to ~96 W and the step back to the 80 W cap -- and shows what the boost actually buys:
+
+| t (s) | package | gpu busy | sclk |
+| ---: | ---: | ---: | ---: |
+| 1.1 | 23.9 W | 5% | 1445 MHz |
+| 3.8 | 85.0 W | 87% | 2039 MHz |
+| 7.6-9.6 | **95.8-96.0 W** | 100% | 2023-2054 MHz |
+| 9.69 | 94.8 W | 100% | 2128 MHz |
+| 10.13 | **81.8 W** | 88% | **2135 MHz** |
+
+The plateau ends at ~9.6 s and the package steps down to the cap. Through the whole 95.9 W plateau
+the clock is 2023-2054 MHz; the moment the power falls, the clock **rises** to 2135 MHz. The 14
+extra watts of boost are not going to the GPU clock at all.
+
+**Consequence for the split.** If the GPU is not throttling on data movement but has a steep V/f
+curve near its ceiling, then 130 W buying only +6.4% is expected, and the headroom is in *replacing*
+GPU work with NPU work -- which is exactly why the split's gain grows from +5.1% at 80 W to +8.5% at
+130 W -- not in feeding the GPU more watts.
+
+### Measurement regime, and why the earlier baselines disagreed
+
+`-r 3` averages three reps inside one process and only the first gets the boost. A single `-r 1` run
+at 80 W reads **530.30 tok/s**, while the sensor-gated `-r 3` protocol on the same box, same session,
+same binary reads **493.7** -- a 7% regime difference with nothing to do with clocks or power
+settings. The 543.93 standing reference and the 15 s-gap numbers (477) are further protocols again;
+only same-protocol comparisons mean anything.
+
+Sensor-gated (`Tctl <= 51 C`, package <= 20 W), fan at the original curve:
+
+| limit | baseline | split (n_gu=7168) | split gain |
+| --- | ---: | ---: | ---: |
+| 80 W | 504.03 / 483.44 | 517.53 / 520.57 | **+5.1%** |
+| 130 W | 523.38 / 526.88 | 570.19 / 569.03 | **+8.5%** |
+
+The gate needs relaxing: this box idles at 52 C, so a `Tctl <= 51` gate can never open and the wait
+loop spins until its timeout. A run that "never started" is this bug, not a hang.
+
+## The ASUS fan curve is a two-step write, and maxing it changes nothing
+
+`asus-nb-wmi`'s `asus_custom_fan_curve` hwmon has a trap that silently discards an edit. From the
+running kernel's `asus-wmi.c`:
+
+    fan_curve_store()       -> data->enabled = false;         /* on every point write */
+    fan_curve_write()       -> if (!data->enabled) return 0;  /* line 3700 */
+    fan_curve_enable_show() -> out = data->enabled ? 1 : 2;
+
+Writing any `pwm*_auto_point*_pwm` disables the curve, and `fan_curve_write` then returns without
+touching the EC. The curve only takes effect on `echo 1 > pwm*_enable` **after** the last point
+write, and `pwm*_enable` reads **1 when enabled and 2 when disabled** -- the reverse of the usual
+hwmon reading, which makes the two easy to confuse. There are two independent curves (`pwm1` = CPU,
+`pwm2` = GPU) and 255 is 100% (`100 * percents[i] / 255`, line 3807).
+
+The first attempt at this experiment wrote the points and left the curve disabled, so it measured
+nothing. Done correctly, on both fans:
+
+| fans | peak RPM | peak Tctl | peak package | 80 W base | 130 W base |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| EC automatic | 8200 / 8500 | 95.2 C | 110.2 W | 477.6 / 477.1 | 512.3 / 509.6 |
+| both curves at 100% | 8900 / 8900 | **95.25 C** | **103.3 W** | 479.7 | 520.0 |
+
+100% adds 400 RPM but no cooling: peak Tctl is identical to two decimals and the peak package is
+*lower*. The EC's automatic control is already near saturation under load, so the fan is not a
+lever. The original curve is saved in `build/atb/fan_curve_backup.txt` and has been restored.
+
+## z13ctl is the same surface, with the profile as the live path
+
+`/usr/local/bin/z13ctl` (Go, socket at `$XDG_RUNTIME_DIR/z13ctl/z13ctl.sock`) drives the same
+`asus-nb-wmi` PPT files for `tdp`, the `platform-profile` attribute for `profile`, and the same
+`asus_custom_fan_curve` hwmon for `fancurve`. It is not a different power path -- setting 80 through
+it produces the identical `ppt_*` = 80 state, and the trace above is that setting.
