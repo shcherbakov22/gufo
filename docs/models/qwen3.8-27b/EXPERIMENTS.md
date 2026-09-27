@@ -6656,3 +6656,44 @@ Next step: surface `AvgCurrent`/`AvgVoltage` for `SVI_PLANE_VDD_SOC` (and the li
 `ApuSTAPMLimit`), then read the SoC rail current at the moment the IPU drops to level 3. If it sits at ~84 A,
 the clamp is the SoC rail's current limit and the question becomes whether it can be raised safely rather than
 whether it exists.
+
+
+### There is a rail map in the kernel -- three of them, and the NPU only appears in one
+
+Asked whether any map exists. There are three, at different layers, and they disagree in a way that explains
+the whole puzzle.
+
+**1. SMU / SVI3 -- no NPU.** `smu14_driver_if_v14_0.h`:
+
+    SVI_PLANE_e     = VDD_GFX, VDD_SOC, VDDCI_MEM, VDDIO_MEM
+    TDC_THROTTLER_e = GFX, SOC
+
+**2. Platform / SPS -- the NPU has its own rail.** `drivers/platform/x86/amd/pmf/pmf.h:265`,
+`struct amd_pmf_metrics_iod`, AMD's SPS telemetry interface:
+
+    rails:  VDDCR, VDDCR_SOC, VDDCR_NPU, VDDCR_LP, VDDCR_GFX, VDD_MISC
+            each with set_voltage, telemetry_voltage, telemetry_power
+    throttlers: fppt, sppt, spl,
+                tdc_vddcr, tdc_vddcr_soc, tdc_vddcr_npu, tdc_vddcr_lp, tdc_vddcr_gfx,
+                each with fused_limit, max_irm_limit, max_pbo_limit, limit, value_acc, residency_acc
+                plus edc_vddcr and thermal
+
+**3. The NPU metrics interface.** `include/linux/amd-pmf-io.h:79`, `struct amd_pmf_npu_metrics`:
+`npuclk_freq`, `npu_busy[8]`, `npu_power` [mW], `mpnpuclk_freq`, `npu_reads`, `npu_writes`, `npu_temp`.
+
+**Which resolves the puzzle.** The NPU has a dedicated rail, `VDDCR_NPU`, with a dedicated TDC throttler and a
+throttle-residency counter -- and it appears **only** in the platform/SPS map, not in the SMU's SVI3 planes.
+So the missing IPU field in the PPTable was never an oversight: **the NPU's power management is a platform/SPS
+concern, not an SMU-PPTable one.** Everything searched at the SMU layer -- 86 PPSMC messages, the PPCLK ids,
+the PPTable -- was the wrong layer for the NPU's rail. It also means the "SoC rail = 84 A" idea was aimed at
+the wrong rail too; the relevant limit is `tdc_vddcr_npu_limit`, which is not in the PPTable at all.
+
+**And it is readable.** `amd_pmf_get_npu_data()` is exported and `amdxdna` consumes it -- `aie2_get_sensors()`
+builds a sensor with `type = AMDXDNA_SENSOR_TYPE_POWER`, `input = npu_metrics.npu_power`, `unitm = -3`,
+"Total Power" in mW -- so **NPU power already reaches userspace** through the amdxdna DRM ioctl. That also
+proves the SPS telemetry path is live on this box even though the ACPI slider functions are not.
+
+What is *not* exposed is the rail's own limit and throttle residency: `tdc_vddcr_npu_limit` and
+`tdc_vddcr_npu_residency_acc` sit in the `iod` block the kernel already reads and are dropped. Exposing those
+two fields is the decisive measurement -- residency climbing during the clamp would mean the NPU rail is
+current-throttling, and that would *be* the clamp.
