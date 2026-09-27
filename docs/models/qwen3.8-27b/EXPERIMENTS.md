@@ -6129,6 +6129,65 @@ and `qemu-system-xtensa`. So the next step for the firmware route is: install Gh
 `0x100` as `Xtensa-le` starting at address 0, recover the queue handler tables, and walk from a known
 message id (e.g. `GetSmuVersion 0x02`) to the DPM/arbitration code.
 
+
+### Correction: the SMU firmware is loaded by the PSP, not the driver
+
+The earlier sections of this document say the driver loads `smu_14_0_3.bin` itself and that
+`amdgpu_ucode_validate()`'s size-only check means a modified image loads. **That is wrong for this
+machine.**
+
+`adev->firmware.load_type` comes from `amdgpu_ucode_get_load_type(adev, amdgpu_fw_load_type)`.
+`amdgpu_fw_load_type` defaults to **-1** (`amdgpu_drv.c:164`), and the `default:` branch of that function
+returns `AMDGPU_FW_LOAD_DIRECT` only for `load_type == 0`, `RLC_BACKDOOR_AUTO` for 3, and
+**`AMDGPU_FW_LOAD_PSP` otherwise**. Strix Halo hits `default:` with -1, so the load type is PSP. There is
+no APU early-out in that function.
+
+Consequently neither driver-side loader runs:
+
+- `smu_load_microcode()` (`amdgpu_smu.c:2861`) begins
+  `if (adev->firmware.load_type == AMDGPU_FW_LOAD_PSP) return 0;`
+- `smu_start_smc_engine()` (`amdgpu_smu.c:1915`) gates its call behind
+  `amdgpu_ip_version(adev, MP1_HWIP, 0) < IP_VERSION(11, 0, 0)`; Strix Halo is 14.0.3.
+
+So `smu_v14_0_load_microcode()` -- and its writes to `MP1_SRAM` at SMN 0x03c00004 -- **is dead code here**.
+Instead `smu_v14_0_init_microcode()` registers `adev->pm.fw` as `AMDGPU_UCODE_ID_SMC`, and
+`psp_load_non_psp_fw()` calls `psp_load_smu_fw()`. The PSP loads it, and the PSP verifies its firmware.
+
+Worse for the plan, `fw_load_skip_check()` returns true for `AMDGPU_UCODE_ID_SMC` when
+`psp_smu_reload_quirk() || psp->autoload_supported || psp->pmfw_centralized_cstate_management`. If either
+of the latter two holds on Strix Halo the driver never pushes the blob at all and the PSP/BIOS supplies the
+SMU firmware from its own source -- in which case editing
+`/usr/lib/firmware/amdgpu/smu_14_0_3.bin` would have **no effect whatsoever**.
+
+So the "unsigned, size-checked only" argument described an unused code path. `amdgpu_ucode_validate()`
+is a driver-side sanity check on the file before handing it to the PSP; it says nothing about what the PSP
+accepts.
+
+The precondition that must be tested before any patching is therefore: **does the driver-side path work at
+all?** Booting with `amdgpu.fw_load_type=0` forces `AMDGPU_FW_LOAD_DIRECT`, which makes
+`smu_load_microcode()` call `smu_v14_0_load_microcode()`. If the SMU initialises successfully that way a
+modified blob is viable; if it fails, the PSP path is mandatory and the firmware route is closed.
+
+### Correction: the SMN C2PMSG array is shared, and probing it broke the display once
+
+The "eight independent queues" description was too glib. `regMP1_SMN_C2PMSG_n` sits at
+`0x3B10800 + (0x40 + n) * 4`, which puts the display's own SMU registers in
+`dcn35_smu_send_msg_with_param()` at `C2PMSG_91` (response) = 0x3B10A6C, `C2PMSG_83` (param) =
+0x3B10A4C, and **`C2PMSG_67` (message id) = 0x3B10A0C**. But `AMD_PMF_REGISTER_ARGUMENT0_V2` is also
+`0x0A0C` -- the same register.
+
+The PMF v2 probe wrote 0 to that argument register on every one of its seven tries. Each such write looks
+to the SMU like message id 0 arriving on the display's queue, so it wrote `0xFE` (no handler) into the
+display's response register. The display's next idle-power message then read that stale value and asserted:
+
+    [ 3870.817486] WARNING: ../display/dc/clk_mgr/dcn35/dcn35_smu.c:143 at dcn35_smu_send_msg_with_param+0x150/0x1b0 [amdgpu]
+    [ 3870.820184] amdgpu 0000:c4:00.0: [drm] SMU response after wait: 254, msg id = 25
+
+It fired exactly once, the display is fine, and the registers were restored afterwards. But the lesson is
+that this array is shared across agents and writing a queue register can collide with the DCN display path.
+**The "SPS messages are not implemented" conclusion is weakened with it**: the queue probed as "PMF v1"
+(`0x3B10A18/A58/A78` = `C2PMSG_70/86/94`) may not be the PMF queue at all.
+
 A side observation from the raw BAR5 mailbox work: a deferred machine check (`MC28_STATUS`, "Power,
 Interrupts, etc.", `mem/io: IO`) was logged at uptime 2963 s, coinciding with the direct BAR5 writes. It
 was non-fatal and the machine continued normally, but the raw-mmapped register path is not entirely clean
