@@ -5698,3 +5698,34 @@ nearly cancels the NPU's 8.6% gain on 29% (-2.5% time) -- roughly 1% net negativ
 21% loss is clearly not covered. The cap only becomes attractive if the balance point moves far enough
 toward the NPU to exploit it, which is a *split* measurement, not a baseline one: the right experiment is
 the split throughput at several caps, re-finding n_gu at each.
+
+### The complete GPU tunable surface, and which of it works
+
+Enumerated live rather than from the source. **Writable and functional:**
+
+| control | scope | works? |
+| --- | --- | --- |
+| `power_dpm_force_performance_level` | auto / low / high / manual / `profile_*` | yes |
+| `pp_od_clk_voltage` | SCLK min/max (in `manual`) -> `SetHardMinGfxClk` + `SetSoftMaxGfxClk` | **yes, the only lever that releases the NPU** |
+| `pp_dpm_socclk` | force SOCCLK level (in `manual`) | yes, no NPU budget effect |
+| `pp_dpm_fclk` | force FCLK level (in `manual`) | yes, no NPU budget effect |
+| `pp_dpm_dclk`, `_vclk`, `_dclk1`, `_vclk1` | force VCN/DCN levels | yes |
+| `pp_force_state`, `thermal_throttling_logging`, `reset_method`, `reset` | misc | yes |
+| `resource0/2/4/5` (0600) | **raw MMIO to the GPU BARs -- i.e. the SMU mailbox registers** | the only userspace route to arbitrary SMU messages, no patch needed |
+| module params at boot | `ppfeaturemask`, `smu_pptable_id`, `pg_mask`, `cg_mask`, `bapm`, `iommu_perfopt`, ... | boot-time only (0444) |
+| debugfs | `amdgpu_smu_debug`, `amdgpu_benchmark`, `amdgpu_compute_sched_mask`, ... | misc |
+
+**Rejected:** `pp_dpm_sclk` (no smu14 `set_pp_dpm_sclk`) and `pp_dpm_mclk`. **Read-only:** all of amdgpu's hwmon -- `power1_input/average`, `temp1_input`, `freq1_input`, `in0/in1` -- with **no fan and no power cap**. **Not exposed anywhere:** TDC/current (`SetThrottlerMask` 0x3A is defined but never called by the driver; the OD table's TDC type falls through to `-ENOSYS`; no `power1_cap` in hwmon).
+
+**FCLK and SOCCLK forcing does nothing for the NPU budget**, contrary to the hope that the ~60 W of unattributed package power was fabric power that could be turned down:
+
+| arm | engine pp2048 | NPU mean | granted IPUCLK | pkg peak |
+| --- | ---: | ---: | ---: | ---: |
+| `auto` | 530.7 +/- 23.2 | 7.415 ms | 1367 | 96.0 W |
+| FCLK 1400 | 535.6 +/- 13.9 | 7.217 ms | 1396 | 93.8 W |
+| FCLK 1200 | 522.0 +/- 9.1 | 7.213 ms | 1404 | 94.7 W |
+| SOCCLK 883 | 530.6 +/- 21.2 | 7.383 ms | 1357 | 96.0 W |
+
+Peak package power moves by ~2 W and the grant stays at level 3. So the unattributed power is not fabric clock power either, and **the GFX soft-max remains the one control that shifts the balance** -- moving the grant to 1776-1809 and the NPU to 5.4-5.6 ms against these arms' 7.2-7.4.
+
+For completeness, the scope of what a userspace lever can reach is now bounded on both sides: the NPU side has one feature bit that does nothing, and the GPU side has exactly one control that does something, which is `SMU_MSG_SetSoftMaxGfxClk` through the OD table. Everything else either does not exist, is read-only, or is rejected.
