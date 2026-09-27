@@ -6032,6 +6032,47 @@ Note for reproducing any of this: `debugfs` was not mounted, so the amdgpu nodes
 `mount -t debugfs none /sys/kernel/debug`; the useful ones are `amdgpu_pm_info` (feature mask, clocks,
 SoC power), `amdgpu_vbios`, `amdgpu_regs_smc` and `amdgpu_smu_debug`.
 
+### The SPS path is inactive -- the limit lives in the ASUS WMI `ppt_*` files
+
+The PMF/SPS mailbox was located exactly rather than guessed. `amd_pmf` reads its base address out of
+*SMN* (`core.c:493`): `AMD_PMF_BASE_ADDR_LO = 0x13B102E8`, `_HI = 0x13B102EC`, with the masks swapped
+relative to the register names (`lo = LO & GENMASK(31,20)`, `hi = HI & GENMASK(15,0)`), then
+`ioremap(base + 0x10000, 0x1000)`. Reading them gives `base = 0xFD100000`, so the mailbox is physical
+`0xFD110000`.
+
+**That window is the same register block as SMN `0x3B10000`** -- every value matches the SMN sweep
+(`+0x054 = 0x0A640200` is the SMU firmware version, `+0x028 = 1` is `FIRMWARE_FLAGS`, `+0x928/0x978/
+0x998` are `addr_mp1_mb_cmd/rsp/args`). So the PMF mailbox is addressable at:
+
+    v1  msg 0x3B10A18   arg 0x3B10A58   resp 0x3B10A78
+    v2  msg 0x3B10A04   arg 0x3B10A0C   resp 0x3B10A08
+
+At rest the v1 triple reads `MSG=0x16` (`SET_TRANSFER_TABLE`), `RESP=1` (`RESULT_OK`), `ARG=7` -- a
+valid completed PMF command, so **v1 is the live layout** (v2's `resp` reads 15, which is not a valid
+result code). Driving the mailbox there is the same protocol `amd_pmf_send_cmd()` uses: wait for
+`resp != 0`, zero it, write the argument, write the message id, wait for `resp != 0`, read the argument.
+
+Sending that platform's entire power-limit read set -- `GET_SPL 0x0B`, `GET_SPPT 0x0D`, `GET_FPPT 0x0F`,
+`GET_SPPT_APU_ONLY 0x1E`, `GET_STT_MIN_LIMIT 0x1F`, `GET_STT_LIMIT_APU 0x20`, `GET_STT_LIMIT_HS2 0x21`
+-- returns **`0xFE` = `AMD_PMF_RESULT_CMD_UNKNOWN` for every one**. The SMU understands the mailbox and
+rejects the message set, so **this firmware implements none of the SPS power-limit messages**, matching
+the missing `APMF_FUNC_STATIC_SLIDER_GRANULAR` and the absent `current_power_limits` node. (The registers
+were restored to `MSG=0x16 RESP=1 ARG=7` afterwards.)
+
+So the 80 W figure is not set through the SMU's SPS interface at all. It lives in the ASUS WMI interface
+z13ctl drives:
+
+    /sys/devices/platform/asus-nb-wmi/ppt_pl1_spl         80
+    /sys/devices/platform/asus-nb-wmi/ppt_pl2_sppt        80
+    /sys/devices/platform/asus-nb-wmi/ppt_apu_sppt        80
+    /sys/devices/platform/asus-nb-wmi/ppt_platform_sppt   80
+    /sys/devices/platform/asus-nb-wmi/ppt_fppt            80
+
+These five are the EC's own package-budget knobs, writable at runtime. The unconfounded grouping test --
+set all five to 130, then drop `ppt_apu_sppt` alone to 60, restore, then `ppt_platform_sppt` alone to 60
+-- is what would show which of them the IPU clamp actually tracks. It is the only remaining lever that can
+move the grant without a reboot, and it changes power limits, so it needs the owner's say-so.
+
 A side observation from the raw BAR5 mailbox work: a deferred machine check (`MC28_STATUS`, "Power,
 Interrupts, etc.", `mem/io: IO`) was logged at uptime 2963 s, coinciding with the direct BAR5 writes. It
 was non-fatal and the machine continued normally, but the raw-mmapped register path is not entirely clean
