@@ -6614,3 +6614,45 @@ the package still peaks at 80.0 W, so the write was harmless and there is nothin
 
 Harness kept at `/home/q/smu/ppt0_ab.sh`: sets the limit through the userspace mailbox, samples
 `gpu_metrics` once a second, runs `atb_npu_run` against `gpu_load compute`, and reports both arms.
+
+
+### Correction: the current-limit avenue was dismissed on a wrong rail mapping
+
+Asked why the current work was dropped. Going back over it, the dismissal was not sound.
+
+The reasoning was: `VrTdcLimit = {224, 84}` A, and 80 W into ~1 V is ~73 A, so current is nowhere near the
+limit. That conflated the rails. The header defines them explicitly:
+
+    typedef enum { TDC_THROTTLER_GFX, TDC_THROTTLER_SOC, TDC_THROTTLER_COUNT } TDC_THROTTLER_e;
+    typedef enum { SVI_PLANE_VDD_GFX, SVI_PLANE_VDD_SOC, SVI_PLANE_VDDCI_MEM, SVI_PLANE_VDDIO_MEM,
+                   SVI_PLANE_COUNT } SVI_PLANE_e;
+
+so `{224, 84}` is **GFX = 224 A, SOC = 84 A** -- not "main rail, secondary rail" as assumed. The SoC rail's
+limit is 84 A, about 84 W at ~1 V, **and the IPU is a SoC-side block**. The arithmetic that killed the
+hypothesis was done on the wrong rail.
+
+Two further errors compounded it:
+
+- Reading `XVmin_Soc_EdcThreshold // LPF: number of cycles Xvmin_trig_filt will react` correctly as "a filter
+  count, not amps" -- and then stopping. The *rest* of that cluster is an active controller
+  (`XVmin_Soc_EdcEnableFreq`, `StepUpTime`, `StepDownTime`, `InitPccStep`, `SocXvminEdcFddDsm[6]`), and the
+  load-bearing fact is the **asymmetry**: the SoC side is enabled (threshold 50, step 10/10, initial step 5)
+  while every GFX counterpart is zero. That is a droop/EDC throttle configured on exactly the domain the IPU
+  sits in.
+- Treating it as untestable because nothing user-visible reports current. Wrong:
+  `SmuMetrics_t` carries `AvgVoltage[SVI_PLANE_COUNT]` and `AvgCurrent[SVI_PLANE_COUNT]` with named plane
+  indices and the driver reads that struct -- it simply drops the currents from the user-facing `gpu_metrics`.
+
+What survives: at 80 W the **GFX** rail is nowhere near 224 A (~246 W), so the package-level limit is not
+binding. What does not survive: any claim about the **SoC** rail, which was never measured and sits at a limit
+of the same order as the operating point.
+
+It also explains what the cooling-budget story did not: why the GPU can consume 250-300 W while the NPU starves
+(different rails, 224 A vs 84 A), why the SoC-side droop controller is enabled while the GFX one is off, and
+why capping the GFX clock releases the clamp -- less total draw, less SoC-rail current, SoC throttle releases
+-- with a *held* clock step, which is what a droop controller produces.
+
+Next step: surface `AvgCurrent`/`AvgVoltage` for `SVI_PLANE_VDD_SOC` (and the likewise-dropped
+`ApuSTAPMLimit`), then read the SoC rail current at the moment the IPU drops to level 3. If it sits at ~84 A,
+the clamp is the SoC rail's current limit and the question becomes whether it can be raised safely rather than
+whether it exists.
