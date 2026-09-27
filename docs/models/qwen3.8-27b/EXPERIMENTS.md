@@ -5653,3 +5653,48 @@ Worth recording, because four separate things silently defeat the obvious approa
 Verify by md5-ing the module, **extracting the initramfs and md5-ing the module inside it**, and
 diffing `limine.conf` against a saved copy. An `M=` build also lacks the `intree` modinfo tag, so the
 kernel logs `loading out-of-tree module taints kernel`; a full in-tree `make modules` avoids that.
+
+### Correction: the GPU *can* be capped smoothly from userspace
+
+The earlier claim that "no moderate GFX cap is reachable" was wrong, and the reason is one line in
+`smu_v14_0_od_edit_dpm_table`:
+
+    /* Only allowed in manual mode */
+    if (smu_dpm->dpm_level != AMD_DPM_FORCED_LEVEL_MANUAL)
+        return -EINVAL;
+
+My probe never set `manual` first, so the OD write bailed before parsing. The table it edits is
+`gfx_actual_soft_max_freq`, committed with `SMU_MSG_SetHardMinGfxClk` + **`SMU_MSG_SetSoftMaxGfxClk`** --
+the exact soft cap the driver's own comment describes ("SoftMin lets PMFW throttle gfxclk"). So:
+
+    echo manual > /sys/class/drm/card1/device/power_dpm_force_performance_level
+    echo s 1 <mhz> > /sys/class/drm/card1/device/pp_od_clk_voltage     # s=SCLK, 0=min, 1=max
+    echo c > /sys/class/drm/card1/device/pp_od_clk_voltage             # commit
+    # restore:  echo r > .../pp_od_clk_voltage ; echo auto > .../power_dpm_force_performance_level
+
+Verified: `s 1 1600` holds the GFX at 1594-1596 MHz with `gfxmax=1600`. (`pp_dpm_sclk` remains
+unwritable -- smu14 has no `set_pp_dpm_sclk`, and `force_clk_levels` omits GFXCLK -- but OD covers it.)
+`pp_od_clk_voltage` also accepts `m`/`f`/`p` (MCLK/FCLK/CCLK) and `r`; TDC is **not** among the
+types this ASIC's `od_edit_dpm_table` handles (they fall through to `-ENOSYS`), so a current cap is not
+exposed -- the soft-max clock is the practical equivalent.
+
+**The trade curve at 80 W**, NPU under the engine, capped in manual mode:
+
+| GFX soft-max | engine pp2048 | NPU mean | granted IPUCLK | gfxclk | pkg peak |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| `auto` | 533.7 +/- 18.4 | 7.247 ms | 1379 (level 3) | 2297 | 95.9 W |
+| manual, 2900 | 538.0 +/- 10.9 | 7.122 ms | 1399 (level 3) | 2256 | 93.1 W |
+| 2000 | 508.5 +/- 9.0 | 6.506 ms | 1584 | 2000 | 92.9 W |
+| 1600 | 425.8 +/- 3.6 | **5.614 ms** | 1776 | 1600 | 91.3 W |
+| 1200 | 325.0 +/- 0.6 | **5.421 ms** | **1809 (level 7)** | 1200 | 82.8 W |
+
+`manual` alone is neutral (538.0 against 533.7), which isolates the effect to the cap rather than the
+mode. The clamp releases monotonically and is fully gone by 1600 (NPU solo is 5.35 ms). **2000 MHz is the
+cheap point: engine -5.4%, NPU +8.6%.**
+
+**Whether that pays depends on the split's work share, and on these numbers it probably does not.** The
+NPU carries ~29% of prefill, so at cap 2000 the engine's 5.4% loss on 71% of the work (+3.8% time) very
+nearly cancels the NPU's 8.6% gain on 29% (-2.5% time) -- roughly 1% net negative. At 1600 the engine's
+21% loss is clearly not covered. The cap only becomes attractive if the balance point moves far enough
+toward the NPU to exploit it, which is a *split* measurement, not a baseline one: the right experiment is
+the split throughput at several caps, re-finding n_gu at each.
