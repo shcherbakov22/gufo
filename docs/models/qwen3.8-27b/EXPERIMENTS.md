@@ -6879,3 +6879,53 @@ with the telemetry this part exposes.
 
 Harness: `/home/q/smu/socrail_probe.sh` (70 samples, `amdgpu_pm_info` VDD lines plus the refreshed SPS
 `SAMPLE` record, under a held GPU+NPU clamp).
+
+
+### The NPU's own SMU queue is reachable from userspace -- and it confirms the clamp at the grant
+
+**The queue exists, and it is a third MP1 namespace.** `npu4_regs.c` maps `amdxdna`'s SMU registers
+into the same MP1 C2PMSG space amdgpu and amd_pmf use:
+
+    SMU_CMD_REG  = MP1_C2PMSG_0      SMU_RESP_REG = MP1_C2PMSG_61
+    SMU_ARG_REG  = MP1_C2PMSG_60     SMU_OUT_REG  = MP1_C2PMSG_60   (same register, read back)
+    SMU_INTR_REG = MMNPU_APERTURE4_BASE
+
+i.e. SMN `0x3B10900 / 0x3B109F0 / 0x3B109F4` -- alongside amdgpu's mailbox and the PMF queue
+(`0x3B10A18/A58/A78`). So it is **one SMU with several queues, each with its own message namespace**,
+which is exactly why `smu14_driver_if_v14_0.h` has no IPU clock id while the SMU still sets NPU clocks.
+The AIE namespace is `POWER_ON 0x3`, `POWER_OFF 0x4`, `SET_MPNPUCLK_FREQ 0x5`, `SET_HCLK_FREQ 0x6`,
+`SET_SOFT_DPMLEVEL 0x7`, `SET_HARD_DPMLEVEL 0x8`.
+
+**The grant is readable -- contradicting an earlier claim in this file.** Probed over SMN with the same
+queue primitive used for the PMF queue (`/home/q/smu/aie_smu_probe.py`; `POWER_ON`/`POWER_OFF` never sent),
+idle:
+
+    op=0x99 (bogus)           status=0xfe   no handler        <- clean control
+    op=0x07 SET_SOFT_DPMLEVEL arg=7   status=0x1  out=0x7
+    op=0x08 SET_HARD_DPMLEVEL arg=7   status=0x1  out=0x7
+    op=0x05 SET_MPNPUCLK_FREQ arg=1267   status=0x1  out=0x4f3 = 1267
+    op=0x06 SET_HCLK_FREQ     arg=1800   status=0x1  out=0x712 = 1810
+
+`out=1810` for `arg=1800` is not an argument echo -- `SMU_OUT_REG` carries the **granted** frequency.
+That is the readback this file previously called invisible. What is invisible is the *policy*; the
+`ndpu->npuclk_freq` cache is just a stale request, and `gpu_metrics_v3_0` drops the fields.
+
+**And it is governed, so there is no bypass.** The same messages, now sent while the package was pinned
+at 80 W with the NPU busy on 99% of every column:
+
+    HARD_DPMLEVEL 7  -> OK out=7        MPNPUCLK 1267 -> OK out=0x420 = 1056   (asked 1267)
+    SOFT_DPMLEVEL 7  -> OK out=7        HCLK     1800 -> OK out=0x4f3 = 1267   (asked 1800)
+
+The SMU accepts each command and returns a **reduced grant**, and the measured clocks do not move:
+`npuclk` 1307-1366 / `mpnpuclk` 1054-1056 before and after, package 79.9-80.1 W throughout. So the
+governor acts *at the grant*, identically for a DPM level and for a bare frequency. Naming an absolute
+frequency is not a way around it, which closes the last command-based route into the NPU clock.
+
+**Which measures the clamp directly, for the first time.** 1267 / 1800 = **0.704**, matching the 0.70
+the timing data had inferred from the driver's table. The clamp is no longer an inference: it is a number
+the SMU hands back. `SET_HCLK_FREQ 1800` plus a read of `SMU_OUT_REG` is therefore a one-shot clamp
+sensor, sharper than the time-filtered `gpu_metrics` averages and needing no load harness.
+
+State note: `/home/q/smu/aie_smu_probe.py` (queue probe) and `/home/q/smu/aie_freq_clamp.sh` (frequency
+request under load). No clock was left changed -- both requests were clamped, and the driver re-asserts
+its own DPM level on every device open.
