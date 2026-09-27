@@ -5261,3 +5261,50 @@ divides that budget between GFX and IPU lives in the SMU firmware's arbitration,
 is active, in an AMD-signed TA. The NPU driver's own vocabulary is five SMU messages, of which the
 clock request is already the top DPM level, and the SMU grants less than asked. There is no kernel
 path that asks for the IPU's share, because no such request exists in the interface.
+
+## Could a kernel patch feed the NPU more?
+
+The direct route does not exist, and the reason is now precise rather than rhetorical.
+
+**The SMU's clock messages cannot name the NPU.** `SetSoftMinByFreq`, `SetSoftMaxByFreq`, `SetHardMinByFreq`,
+`SetHardMaxByFreq`, `GetDpmFreqByIndex`, `GetMinDpmFreq` and `GetMaxDpmFreq` are all addressed by a
+`PPCLK_e` clock id, and that enum is (`smu14_driver_if_v14_0.h`):
+
+    PPCLK_GFXCLK, PPCLK_SOCCLK, PPCLK_UCLK, PPCLK_FCLK, PPCLK_DCLK_0, PPCLK_VCLK_0,
+    PPCLK_DISPCLK, PPCLK_DPPCLK, PPCLK_DPREFCLK, PPCLK_DCFCLK, PPCLK_DTBCLK
+
+**There is no IPU or NPU clock id.** So the amdgpu SMU driver has no register in its vocabulary for the
+NPU clock -- it can neither set it nor read it. The NPU driver's vocabulary is the five messages
+already described, and its clock request is already the top DPM level. A patch can therefore ask
+louder, but there is nothing quieter to ask.
+
+**One direct bit does exist.** The PMFW feature set carries `FEATURE_IPU_DPM_BIT = 19` (and
+`FEATURE_DS_IPUCLK_BIT = 58`), and `PPSMC_MSG_SetAllowedFeaturesMaskLow/High` is sent by the driver --
+so a patch could **exclude bit 19 and disable the SMU's IPU DPM block**, on the theory that the
+NPU driver's own `SET_MPNPUCLK_FREQ` then stands. That is the only direct patch with a mechanism, and
+it is a gamble: with IPU DPM off the clock may pin anywhere, including lower, and the NPU firmware's
+own DVFS may depend on the feature. Worth knowing it exists; not worth betting the IPU on without a
+way to read the grant, which the `gpu_metrics` decoder now provides.
+
+**The indirect route is real, and the kernel says which one it intends.** The GFX branch above
+deliberately picks the *soft* messages, and the comment states the reason: *"SoftMin lets PMFW
+throttle gfxclk; HardMin would override SoftMax."* The kernel is structured to hand the arbitration to
+the firmware. The clamp on the NPU is that same arbitration, so the way to un-clamp the NPU from the
+kernel is to stop exhausting the budget with the GPU.
+
+The duty sweep already proved the mechanism: at 75% GPU duty the package peaks at 84.3 W, under the
+93 W cap, and the NPU's execution floor is still 5.30 ms; at 100% duty the package sits exactly on the
+cap and the floor collapses to 6.83 ms. **Hold the package under the cap and the NPU keeps level 7.**
+
+And that needs no patch, because the GFX side is already exposed and writable:
+`/sys/class/drm/card1/device/power_dpm_force_performance_level` (currently `auto`) and
+`pp_dpm_sclk`, both root-writable. Capping GFX to keep the package clear of the cap is the one trade
+the numbers say should be net-positive -- the GPU returns +1.6% per 13 W near its ceiling while the
+NPU returns 29-42% for the sub-watt it was denied -- but the optimum is an empirical balance point,
+because capping GFX also slows the GPU's share of the split.
+
+Caveat that keeps this honest: at ppt 93 W the metrics attribute only 22 W to GFX, 4.5 W to the cores
+and 0.9 W to the IPU, leaving **~66 W unattributed**. If the budget is being consumed by that
+unattributed part rather than by the GFX clock, capping GFX will not un-clamp anything. That is the
+experiment, and it is falsifiable in one run: cap GFX, watch `average_ipuclk_frequency` in
+`gpu_metrics` -- 1267 means still level 3, 1800 means the NPU got its level back.
