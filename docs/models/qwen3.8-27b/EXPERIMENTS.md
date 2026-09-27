@@ -7107,3 +7107,39 @@ Below 8192 the trace's linear `gu wait` trend suggested a smaller slice might st
 Mean -0.8%, 8192 ahead in 2 of 3, and the within-session drift (7168 falls 604 -> 523) is far larger than
 the difference. **A tie: the balance curve has flattened and there is nothing left between 7168 and 8192.**
 The operating point stays **8192**, with 10240 and 12288 measurably worse. That closes the n_gu question.
+
+
+### Step 2 measured: do NOT build the repack hoist -- and the NPU slice was never exposed
+
+`rocprofv3` turned out to be absent (the record's kernel-trace numbers came from an environment where it
+was present); it is packaged as `rocprofiler` 7.2.4 and installing it restores `rocprofv3`. One
+`--kernel-trace` run over a single prefill, split on at n_gu=8192, pp2048 642.15:
+
+**The GPU stream is 96% busy.** 3610 dispatches, 6475.0 ms busy over a 6745.2 ms span -- 4.0% idle, and
+only seven gaps above 0.5 ms, all of them at model load or the embedding lookup (152 ms, 36 ms, 18 ms),
+none per-layer. The prefill is GEMM-dominated: the top eight kernels are all `HalfPrefillGemmKernel` and
+account for 4238 ms of the 6475 ms busy time (65%).
+
+**The repack is 2.3%, not 6%.** `AtbRepackKernel`: **256 calls, 148.6 ms total, 0.581 ms each** -- 128
+calls per forward (64 layers x gate+up) = **74.4 ms of a ~3.19 s prefill**. That is also three times
+cheaper per call than the 1.53 ms/tensor on record, so the earlier estimate was stale.
+
+**Two corrections that matter more than the repack itself.**
+
+1. **There is no idle window to hide the repack in.** The change was premised on the GPU stream being idle
+   during the 11.2 ms `gu wait`, and it is not: the GPU is 96% busy, so moving the repack later only moves
+   it within a saturated stream. Hiding it would need a second stream overlapping a memory-bound repack
+   with compute-bound GEMMs, for at most 2.3%.
+2. **The NPU's slice was never exposed.** The earlier claim that `gu wait` (11.2 ms) is 23% of the layer of
+   *unhidden* NPU time is wrong. `kPrefillPaceDepth = 3` keeps three layers in flight, so the CPU blocking
+   in `atb->Wait()` happens while the GPU is busy with other layers' work. `gu wait` is CPU-blocked time,
+   not idle GPU time -- which is exactly what a 96%-busy stream in a 3-deep pipeline looks like.
+
+**So the decision is not to build it.** The repack hoist buys at most 2.3%, has no window to sit in, and
+needs double-buffering to get there. The step-3 premise weakens with it: if the NPU slice is already
+overlapped, a token split cannot claim to *hide* it. Its remaining case is rebalancing between two engines
+of near-equal marginal efficiency -- which is what the n_gu curve already measured the crossing point of.
+
+**What the trace says the real constraint is:** the GPU is saturated. The lever is removing GPU work
+(which is what the split does, and why the n_gu optimum exists at all) or making the GPU faster, not
+overlapping the NPU. Analyzer kept at `tools/qwen27b/an_timeline.py`.
