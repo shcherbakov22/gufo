@@ -5593,3 +5593,63 @@ likely, and both are one reboot from reverting.
 `module_param_named(iommu_perfopt, amdgpu_iommu_perfopt, int, 0444)`. So the `iommu=pt` regression
 thread has a documented knob in the driver as well as the boot parameter, which is worth knowing if
 that ~10% ever needs re-testing.
+
+## Measured: disabling IPU DPM does not release the clamp
+
+The experiment was run and the lever is closed. The patch (kept at `/home/q/ipudpm-experiment.patch`)
+made `smu_v14_0_set_allowed_mask()` clear `FEATURE_IPU_DPM_BIT` from the allowed mask and then send
+`DisableSmuFeaturesLow` with that bit -- clearing alone is not enough, because the SMU enables IPU DPM
+itself and the allowed list is already "all".
+
+NPU under the engine at 80 W, after rebooting into the patched module:
+
+| | stock | patched |
+| --- | ---: | ---: |
+| NPU mean | 7.408 / 7.599 / 7.666 ms | **7.220 ms** |
+| granted IPUCLK peak | 1236-1387 MHz | **1388 MHz** |
+| deciles | flat ~7.4 | flat ~7.2 |
+| NPU best | 5.31 ms | 5.346 ms |
+| package peak | 80.0 W | 80.6 W |
+
+The granted clock is **still level 3**, and the best-case command still runs at full speed while the mean
+stays clamped -- behaviourally identical. The 2-4% on the mean and the +8% on the engine are the
+fresh-boot effect (the engine also read 538 against 479-498 immediately pre-reboot), not a mechanism
+change.
+
+**The IPU DPM feature block is not what arbitrates the NPU clock.** The clamp lives elsewhere in SMU
+firmware we cannot read, and the search has now exhausted every software path: the level request is
+already maximum, re-requesting does nothing, context lifetime does nothing, time at 80 W does nothing,
+no clock id names the IPU, the control plane has no IPU field, and the one IPU-specific feature bit does
+nothing. Package headroom and the package limit are the whole lever set.
+
+One honest caveat: the feature mask cannot be read back, so the negative admits two readings -- the
+feature is not the clamp, or the disable was ignored. The granted clock is unchanged at level 3 either
+way, so the lever is dead regardless; distinguishing them would need a diagnostic build that prints the
+message return codes and enabled mask, and would not change the outcome.
+
+### How to build and boot a patched amdgpu module on this box
+
+Worth recording, because four separate things silently defeat the obvious approach.
+
+1. **It is a module rebuild, not a kernel rebuild.** `amdgpu` is `amdgpu.ko.zst`, and the source tree is
+   `/home/q/linux-7.3rc` with a git HEAD matching the running kernel. Build with
+   `make -j$(nproc) M=drivers/gpu/drm/amd/amdgpu`. **Do not** use `make .../amdgpu.ko`: that takes the
+   `single_modules` path, regenerates `Module.symvers` from scratch and fails with ~166 undefined
+   `drm`/`ttm` symbols.
+2. **Vermagic.** A dirty tree appends `-dirty`, and `CONFIG_MODVERSIONS` is *not* set, so
+   `same_magic()` is a plain `strcmp` and the module is refused. The string comes from
+   `include/generated/utsrelease.h` -- **not** `include/config/kernel.release`, which the `M=` build
+   ignores. `CONFIG_MODULE_FORCE_LOAD=y` exists as a fallback but taints.
+3. **The initramfs carries its own copy.** `HOOKS` includes `kms`, so `amdgpu.ko.zst` is inside the image
+   and is what loads for early KMS. Replacing only `/lib/modules` silently runs the old code. Regenerate
+   with `mkinitcpio -g <path> -k <kver>` (`/etc/mkinitcpio.d/` is empty here, so there are no presets to
+   use `-P` with).
+4. **The limine entry is hash-verified.** `module_path: ...#<hash>`; refresh with
+   `limine-entry-tool --add-kernel linux-perfopt <initramfs> <vmlinuz>`, which updates in place (entry
+   count stays 1) and changes exactly one line. The hash is limine's own 512-bit digest rather than
+   sha512 of the file, and a stale one still booted here, so it is not enforced -- but regenerating is
+   cheap and the diff against a backup is the cleanest way to confirm the edit.
+
+Verify by md5-ing the module, **extracting the initramfs and md5-ing the module inside it**, and
+diffing `limine.conf` against a saved copy. An `M=` build also lacks the `intree` modinfo tag, so the
+kernel logs `loading out-of-tree module taints kernel`; a full in-tree `make modules` avoids that.
