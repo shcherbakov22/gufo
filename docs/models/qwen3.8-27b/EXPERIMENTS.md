@@ -5531,3 +5531,65 @@ complete lever set is now closed:
   61 W -- or **a higher package limit**, 130 W.
 
 There is no software route to the IPU's share. Whatever the SMU decides is what runs.
+
+## Digging the SMU itself: what is and is not in there
+
+Four passes over the interface and the binary, exhaustively rather than by sampling.
+
+**The control plane contains no IPU field at all.** Scanning every PMFW interface header
+(`smu14_driver_if_v14_0.h`, `smu14_driver_if_v14_0_0.h`, `smu_v14_0_0_pmfw.h`, `smu_v14_0_2_ppsmc.h`)
+for any identifier containing `ipu` or `npu` returns exactly eight hits, and they are only:
+
+    FEATURE_IPU_DPM_BIT 19, FEATURE_DS_IPUCLK_BIT 58        (feature bits)
+    IpuclkFrequency, MpipuclkFrequency, IpuPower, IpuBusy[], IpuReads, IpuWrites   (metrics)
+
+`PPTable_t` -- the entire table the driver hands the SMU -- has **none**, and `PPCLK_e` enumerates
+eleven clocks with the IPU absent. There is no NPU power, current, voltage or allocation field anywhere
+in what the kernel can say to the SMU. The "put the NPU in the CPU pool" idea is closed for good: the
+vocabulary for it does not exist.
+
+**The driver does not switch IPU DPM on -- the SMU does.** `smu_v14_0_0_dpm_features` does contain
+`SMU_FEATURE_BIT_INIT(FEATURE_IPU_DPM_BIT)`, but its only consumer is `smu_v14_0_0_is_dpm_running()`,
+which *reads* the enabled mask back. And the 14.0.3 path, `smu_v14_0_2_init_allowed_features()`, is one
+line: `smu_feature_list_set_all(smu, SMU_FEATURE_LIST_ALLOWED)`. Everything is allowed; nothing is
+selectively enabled by the driver.
+
+**The firmware is neither compressed nor encrypted, and its tables are plain.** Shannon entropy over
+every 4 KB window of the 333236-byte blob: **no window exceeds 7.5 bits/byte**, 42 of 81 fall below 5.0,
+and `0x4000`/`0x5000` are all-zero. The header parses cleanly
+(`{0x515b4, 0x2c, 2, 0xe, 0x684f00, 0x4fe00, 0x100, 0x2771d83b, 0x20000, 0x4ff00, 0x16b4}`; and
+327424 + 5812 = 333236), and clock ladders sit in the open:
+
+    @0x7534  300 400 500 600 700 800 900 1000 1100 1200 1300 1400 1500 1600 1700 1800
+    @0x7554  {200 400 500 600 700 750 800 2000}   also at 0x7564, 0x7574   (three domains)
+    @0x756a  {600 700 750 800 870 900 1050 1100}
+    @0x757a  {100 450 550 770 870 1000}
+    @0xc808  a ladder containing 1285 and 1797
+
+That last one is the interesting one: **1285 and 1797 are the clocks we measured the SMU actually
+apply** (1285 under engine load, 1797-1810 with headroom), whereas the driver's own `npu4_dpm_clk_tbl`
+says 1267 and 1800. The firmware has its own level table and the driver's copy is an approximation of
+it. So the IPU level table is in the SMU image, findable, and slightly different from what the kernel
+believes.
+
+**But there is no ISA.** No symbols, no strings, no ELF, and no public documentation of the PMFW core.
+The tables can be read; the arbitration policy that consumes them cannot be disassembled in practice.
+Data yes, control flow no.
+
+**The one patchable bit.** `FEATURE_IPU_DPM_BIT` (19) is the only IPU-specific thing in the SMU's
+feature set, and `smu_cmn.c` already has the senders (`SMU_MSG_DisableSmuFeaturesLow/High`). A patch
+that clears bit 19 and disables the feature is the single experiment the interface admits. It must
+*disable* rather than merely disallow: the allowed list is already all, and the feature is already on.
+
+Two outcomes, and they are both informative. If the SMU's IPU DPM block is what clamps the clock, then
+with it off the NPU should keep whatever the driver last asked for -- level 7, 1800 -- under full engine
+load, which would be the win this whole hunt has been after. If the feature is load-bearing, the NPU
+clock will stick low or the DPM requests will start failing, and it reverts. Nothing in between is
+likely, and both are one reboot from reverting.
+
+### Aside found on the way
+
+`amdgpu` exposes the IOMMU PerfOpt work as a module parameter:
+`module_param_named(iommu_perfopt, amdgpu_iommu_perfopt, int, 0444)`. So the `iommu=pt` regression
+thread has a documented knob in the driver as well as the boot parameter, which is worth knowing if
+that ~10% ever needs re-testing.
