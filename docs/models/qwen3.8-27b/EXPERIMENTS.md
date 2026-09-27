@@ -6409,3 +6409,27 @@ One unexplained detail to keep: `SkuTable_t.SocketPowerLimitSpare[10]` holds `{8
 header labels spare, inside the firmware's *static* SkuTable, holding exactly the set point in use. It may be
 nothing (80 is a round number) or a repurposed slot in this SMU revision. Not actionable, but worth a look if
 the budget-writing path is ever mapped.
+
+
+### Correction: the limit is cooling, not the VRMs and not the EC
+
+The 304 W PPTable ceiling is the electrical/VRM limit and the VRMs genuinely take it; what actually caps this
+machine is **cooling**, at roughly 80-93 W sustained. So the set point is not an arbitrary software budget
+sitting under an unused 304 W ceiling -- it is the practical thermal limit of the laptop.
+
+That sharpens the conclusion instead of changing it. The clamp is the SMU allocating a budget fixed by
+physics, so **there is no headroom to buy out of it**. Every lever above was closed for the same reason:
+nothing about the IPU allocation is tunable, because the thing being allocated is heat.
+
+It also makes one already-recorded result much more pointed. The clamp **relaxes at 93 W and is permanent at
+80 W**, and 93 W is *inside* the cooling-limited band. The threshold therefore sits within the viable
+operating range, and the set point alone decides whether the clamp exists. That is a settings question for
+the owner, not an engineering one.
+
+And it names the only engineering route that works against a fixed thermal budget: **lower total demand.**
+The NPU is not free on its own -- solo it moves the package +21.3 W -- but it *displaces* GPU work that costs
+more power than it does: GPU-only compute measured 87.0 W against 72.9 W for GPU + NPU, and 82.0 against 80.0
+for the memory-bound case. Moving more of the prefill onto the NPU therefore reduces package draw, which
+reduces the pressure that produces the clamp in the first place -- a cycle that feeds itself, and the same
+direction as the pending engine work (token split, repack off the critical path), which was worth ~+25%
+before any of this.
