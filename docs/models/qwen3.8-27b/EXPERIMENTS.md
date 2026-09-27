@@ -6569,3 +6569,28 @@ Independently, the engine work is the sure gain: the token split (M<2048 xclbin,
 taking the B repack off the critical path were worth ~+25% before any of this, and moving work onto the NPU
 lowers package draw (GPU-only compute measured 87.0 W against 72.9 W for GPU + NPU), which relieves the clamp
 as a side effect rather than as a fight.
+
+
+### Result: SetPptLimit works, but STAPM is a different limit -- the 66 W is not reachable this way
+
+Ran it through the userspace mailbox. `SetPptLimit` (0x32) accepts the write and echoes it:
+
+    SetPptLimit(80) -> status=1  args[0]=0x50 (=80)
+
+So the message works, the units are **Watts**, and 80 sits under the `MsgLimits.Power[PPT0][AC] = 200` ceiling.
+Two negatives came back with it:
+
+- **`GetPptLimit` (0x33) is non-functional on this ASM.** It returns the *parameter*, not a limit --
+  `param=0x0 -> args[0]=0x0`, `param=0x10000 -> args[0]=0x10000`. That is why it read 0 earlier. There is no
+  readback for the PPT limit at all.
+- **`stapm_power_limit` did not move: 66/66 before and after.** STAPM/sustained is a *different* limit from
+  PPT0, and `SetPptLimit` does not touch it.
+
+So `SetPptLimit` sets PPT0 only. The 66 W is set through the SPS/SPL path -- the PMF namespace, not PPSMC --
+which returned `CMD_UNKNOWN` on the queue probed earlier, and which `amd_pmf` does not drive on this platform
+either. **The budget the SMU arbitrates is told to it from the platform side and is not reachable through any
+SMU message we can send.** With cooling being the real ceiling, that closes the clamp thread.
+
+State note: PPT0 is now 80 W, and no readback exists to restore a previous value. It matches the elected set
+point, so it should be neutral, and the EC rewrites it on a profile change; `SetPptLimit(200)` restores the
+ceiling if wanted.
