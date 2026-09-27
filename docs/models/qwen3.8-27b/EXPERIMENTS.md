@@ -5764,3 +5764,62 @@ does not, but none of them is a current limit, so writing GPU BAR registers woul
 expected gain. A patch plus a reboot is the same cost we just paid for the IPU DPM attempt, and the
 advantage of a current cap over the measured GFX soft-max is unproven -- the soft-max is free, runtime,
 and already characterized.
+
+## How NPU power management actually works: the complete interface, read from the source
+
+Prompted by "why not dig into the firmware and kernel" -- done, and the result is that the *interface* is
+now fully mapped while the *policy* is provably not readable.
+
+**There are two separate firmware channels, and neither carries a power group or a power priority.**
+
+| channel | ops | power-relevant |
+| --- | --- | --- |
+| **SMU mailbox** (`aie_smu.c`) | 6 total: `POWER_ON/OFF` 0x3/0x4, `SET_MPNPUCLK_FREQ` 0x5, `SET_HCLK_FREQ` 0x6, `SET_SOFT_DPMLEVEL` 0x7, `SET_HARD_DPMLEVEL` 0x8 | this is the whole DVFS path |
+| **NPU management channel** (`aie2_msg_priv.h`) | 32 `MSG_OP_*`: context lifecycle, buffers, exec, `SYNC_BO`, `GET_TELEMETRY` | only `GET_TELEMETRY` (a read) and `SET_RUNTIME_CONFIG` |
+
+`AIE2_RT_CFG_*` is exactly `{INIT, CLK_GATING, FORCE_PREEMPT, FRAME_BOUNDARY_PREEMPT}` -- clock gating is
+the only power-adjacent runtime config, and it is the `turbo` toggle.
+
+**The only power request the kernel can make is the DPM level, and it is already maximum.** `aie2_pm.c`
+walks `dpm_clk_tbl` to find `max_dpm_level` and requests it; `aie2_solver.c` also picks
+`max_dpm_level` whenever QoS is absent. **QoS can only make it worse**: `set_dpm_level()` walks levels
+from 0 upward and stops at the first that satisfies `gops`/`fps`/`latency`, so advertising QoS gets the
+*lowest* level that just meets it -- which is why an xclbin that grew QoS metadata would silently lose
+throughput.
+
+**The priority question has a precise answer, and it is the wrong kind of priority.**
+
+    struct aie_qos { ... u32 priority; /* Request priority */ };      /* in the solver */
+
+is **dead for power**: `aie2_solver.c` never reads it -- `is_valid_qos_dpm_params()` tests only
+`gops`/`fps`/`latency`, and `calculate_gops()`/`qos_meet()` ignore it. The *live* priority is the
+context priority, user-settable through the UAPI:
+
+    AMDXDNA_QOS_REALTIME_PRIORITY 0x100   AMDXDNA_QOS_HIGH_PRIORITY 0x180
+    AMDXDNA_QOS_NORMAL_PRIORITY   0x200   AMDXDNA_QOS_LOW_PRIORITY  0x280
+
+and `aie2_get_context_priority()` maps it into `req.context_priority` of the **create-context message to
+the NPU firmware** -- for scheduling and preemption, gated on the `AIE2_PREEMPT` feature, and with
+`default: return PRIORITY_HIGH`. So our tools, which pass no QoS at all, run at `PRIORITY_HIGH` already.
+**It goes to the NPU firmware, never to the SMU, and it is not a power priority.**
+
+And `struct create_ctx_req` is the complete list of what the firmware is told:
+
+    aie_type, start_col, num_col, num_unused_col, reserved, num_cq_pairs_requested,
+    reserved1, pasid, pad[2], sec_comm_target_type, context_priority
+
+**There is no power group, no power priority and no power hint in it** -- the kernel's model of the NPU
+does not contain those concepts at all.
+
+**The firmware is readable as data and opaque as code.** The NPU image (`npu_17f0_11.bin`, 429680 bytes)
+has no compression signature and **no 4 KB window above 7.5 bits/byte** (56 of 104 below 3.0) -- a ~10 KB
+header/table region then dense obfuscated payload with only `Release 1.1.2.65` legible. The SMU image
+(333236 bytes) likewise has no window above 7.5, with plain clock tables at 0x7500-0x7620 and mostly zeros
+after. **So the tables can be read and the arbitration cannot.**
+
+**Conclusion.** The grouping and priority of the NPU in the power domain are decided inside SMU firmware
+code with no interface, no readback of the decision, and no kernel-side representation. The policy is
+therefore *not recoverable by reading* -- it can only be inferred by experiment. One telemetry channel
+remains unused and is worth a look because it is the NPU firmware's own view rather than the SMU's:
+`MSG_OP_GET_TELEMETRY`, exposed as `DRM_AMDXDNA_QUERY_TELEMETRY`, takes a type index
+(`header->type < MAX_TELEMETRY_TYPE`) and returns up to 4 MB of firmware-reported data.
