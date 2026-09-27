@@ -6188,6 +6188,32 @@ that this array is shared across agents and writing a queue register can collide
 **The "SPS messages are not implemented" conclusion is weakened with it**: the queue probed as "PMF v1"
 (`0x3B10A18/A58/A78` = `C2PMSG_70/86/94`) may not be the PMF queue at all.
 
+
+### Experiment queued: force the driver-side load path
+
+`amdgpu.fw_load_type=0` was appended to the `linux-perfopt` entry's `cmdline:` in `/boot/limine.conf`.
+Backups: `/boot/limine.conf.pre-fwloadtype` on the ESP and `/home/q/smu/limine.conf.orig`. The kernel and
+initramfs paths in that file carry inline SHA-512 hashes **over the files**, while `cmdline:` is not
+hashed, so appending a parameter cannot invalidate them -- verified by diff: exactly one line changed and
+the deployed file matches the generated one (md5 `91b746ae4334a518f0a16b2a05965b08`).
+
+With `load_type == AMDGPU_FW_LOAD_DIRECT`:
+
+- `smu_v14_0_init_microcode()` no longer registers `AMDGPU_UCODE_ID_SMC`, so nothing is handed to the PSP.
+- `smu_load_microcode()` falls through to `smu_v14_0_load_microcode()`, which writes the payload dwords
+  to `MP1_SRAM` over SMN and then resets/releases the core -- the unverified path.
+
+**A success is self-proving**: with the PSP out of the picture, the SMU can only be running if those
+writes landed. The falsifier is explicit in the code -- `smu_load_microcode()` logs
+`"Load microcode failed"` if `smu_v14_0_load_microcode()` returns non-zero (it returns `-ETIME` when
+`MP1_FIRMWARE_FLAGS` never reports interrupts enabled).
+
+`/home/q/smu/verify-fwloadtype.sh` classifies the resulting boot. A success means a modified
+`smu_14_0_3.bin` is viable and the next step is an inert validation patch -- bump `ucode_version` in the
+container header and confirm dmesg reports the new value, which proves the driver consumed our file before
+any edit that could matter. A failure closes the firmware route and returns us to the mailbox or
+`ppt_*` levers.
+
 A side observation from the raw BAR5 mailbox work: a deferred machine check (`MC28_STATUS`, "Power,
 Interrupts, etc.", `mem/io: IO`) was logged at uptime 2963 s, coinciding with the direct BAR5 writes. It
 was non-fatal and the machine continued normally, but the raw-mmapped register path is not entirely clean
