@@ -7091,3 +7091,19 @@ opt-in split path from 570.87 to a best measured 650.41, about **+14%**, against
 
 Harness `tools/qwen27b/lean_ab.sh` (paired candidate-vs-candidate) and `tools/qwen27b/lean_gu.sh`
 (candidate-vs-splitless-base, which is the weaker design and is what produced the wrong ranking).
+
+
+### n_gu balance settled: 7168 ties 8192, so 8192 stands
+
+Below 8192 the trace's linear `gu wait` trend suggested a smaller slice might still win. Paired 7168 vs
+8192, 15 s gaps, one run each:
+
+| rep | 7168 | 8192 | delta |
+| --- | ---: | ---: | ---: |
+| 1 | 604.36 | 589.81 | +2.5% |
+| 2 | 548.41 | 560.51 | -2.2% |
+| 3 | 523.31 | 538.51 | -2.8% |
+
+Mean -0.8%, 8192 ahead in 2 of 3, and the within-session drift (7168 falls 604 -> 523) is far larger than
+the difference. **A tie: the balance curve has flattened and there is nothing left between 7168 and 8192.**
+The operating point stays **8192**, with 10240 and 12288 measurably worse. That closes the n_gu question.
