@@ -4713,3 +4713,62 @@ Four baseline points taken that way:
 
 Mean 548.3, spread 1.2%, against 20% drift for the same binary run back to back. Every comparison
 in the tuning work that follows uses this protocol.
+
+## The NPU's concurrency tax is DRAM bandwidth, not power
+
+An earlier section concluded "this is a power split, not memory-bandwidth contention" from the fact
+that the concurrent power ceiling did not exceed the GPU-solo ceiling. That inference does not
+hold -- a bandwidth limit produces the same observation -- and direct measurement says it is
+bandwidth.
+
+**The power mode is a real clock control, and it is already at peak.** `xrt-smi configure --pmode`
+takes default, powersaver, balanced, performance and turbo. Solo NPU at N=8192, K=5120:
+
+| pmode | best ms | TFLOPS |
+| --- | ---: | ---: |
+| Powersaver | 12.048 | 14.26 |
+| Balanced | 7.577 | 22.67 |
+| Default | 5.326 | 32.25 |
+| Performance | 5.305 | 32.38 |
+| Turbo | 5.296 | 32.44 |
+
+Powersaver and balanced are genuine throttles, so the knob works. But `default` is already at the
+top level, so there is no headroom to raise, and under the split the three top modes are
+indistinguishable: pp2048 at n_gu=7168 was 594.4 (default), 593.7 (performance), 590.5 (turbo).
+Nothing to recover here.
+
+**The NPU's best case is untouched by the engine; only its mean moves.** Same shape, one tight
+loop, measured three ways:
+
+| load | best | mean |
+| --- | ---: | ---: |
+| none | 5.310 ms | 5.381 ms |
+| 8 CPU hogs | 5.309 ms | 5.801 ms (+7.8%) |
+| the engine prefilling | 5.305 ms | 6.829 ms (+26.9%) |
+
+So the ~20-26% "derate" is not a lower clock: the best run under full engine load is identical to
+solo. About eight points of the mean is the measuring thread being descheduled (the CPU-hog
+control), and the rest is interference in execution. The engine's own CPU use accounts for a
+couple of those points, not eight.
+
+**Which interference?** Two synthetic GPU loads, each held for the whole NPU loop:
+
+| concurrent GPU load | NPU best | NPU mean | best TF |
+| --- | ---: | ---: | ---: |
+| none | 5.326 ms | 5.368 ms | 32.26 |
+| compute (register-resident FMA, no DRAM) | 6.109 ms | 6.667 ms | 28.12 |
+| memory (streaming copy) | 8.499 ms | 9.697 ms | 20.21 |
+
+A saturating DRAM load costs the NPU 60% *on its best run*; an ALU-only load costs about 15%. The
+NPU is dominated by DRAM bandwidth and latency, not by the power budget it shares with the GPU.
+That also explains why powersaver and balanced look like clock throttles: fewer fetches per unit
+time is what a lower clock buys on a memory-bound workload.
+
+For the record, the engines do not take power from each other either: package power was 82.8 W mean
+/ 95.2 W peak for the engine alone and 79.8 W mean / 92.6 W peak when the NPU loop ran alongside
+it, and the engine lost 0.6% (545.34 to 541.87 tok/s).
+
+**What this means for the split.** The width tuning already prices the contended rate, so the +8.4%
+at n_gu=7168 is real. What is left is not a clock but DRAM pressure: the split adds a B repack that
+writes and then re-reads the NPU's whole weight slice, which the engine would not otherwise touch.
+That is the lever -- reduce or hide that traffic -- not the power mode.
