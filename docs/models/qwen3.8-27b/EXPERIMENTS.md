@@ -4668,3 +4668,48 @@ The split is a first working implementation, not a tuned one. In rough order of 
    an iGPU that sustains ~200.
 6. **The A encoder's gather.** One thread per 8-element group, with consecutive threads reading
    rows 10-35 KB apart.
+
+## Correction: the power envelope is 80 W sustained, 95 W peak
+
+Earlier sections call the package "power-capped at ~95 W". That is wrong, and tracing the rail at
+2 s resolution through one `-r 3` run shows why the mistake was easy:
+
+| t within the run | package |
+| --- | ---: |
+| idle | 15.4 W |
+| 4 s | 91.5 W |
+| 8 s | **95.9 W** (peak) |
+| 10 s | 86.4 W |
+| 12 s | 80.9 W |
+| 14-16 s | **80.0 W** (sustained) |
+
+**80 W sustained, with roughly an 8 s boost to 95 W.** Two consequences that explain a lot of
+earlier confusion:
+
+1. Reps inside one run are not equal. The first rep gets the boost and the rest do not, so a
+   `-r 1` and an `-r 3` are measuring different regimes.
+2. A run leaves Tctl near 89 C and the next run starts there, so back-to-back measurements ratchet
+   upward until they plateau. This is the 20% decay seen in every uncooldowned sequence in this
+   document.
+
+Thermal decay after a run, same 2 s resolution: GPU edge recovers within ~5 s (90 to 56 C in two)
+and package power within ~4 s, but Tctl has a fast component to about 52 C over ~25 s and then a
+multi-minute tail (55.7 C at +10 s, 52.6 at +30 s, 51.1 at +60 s, 48.7 at +138 s).
+
+### Measurement protocol from here on
+
+Cooldown before every point, gated on the sensors rather than a fixed time: Tctl <= 51 C and
+package power <= 20 W. Measured cost 30-39 s per point, so a five-point sweep is about eight
+minutes: cheap next to being wrong.
+
+Four baseline points taken that way:
+
+| point | cooldown | start Tctl | pp2048 |
+| --- | ---: | ---: | ---: |
+| 1 | 0 s | 48 C | 546.73 |
+| 2 | 30 s | 51 C | 556.69 |
+| 3 | 36 s | 50 C | 543.89 |
+| 4 | 39 s | 50 C | 545.79 |
+
+Mean 548.3, spread 1.2%, against 20% drift for the same binary run back to back. Every comparison
+in the tuning work that follows uses this protocol.
