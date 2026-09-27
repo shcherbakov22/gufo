@@ -5455,3 +5455,43 @@ The practical consequences that follow are cheaper than a kernel rebuild:
 * **The limit is still the honest lever** (130 W buys the level back immediately rather than after 45 s),
   and the memory traffic is the one the split should attack -- the B repack writes and re-reads the
   NPU's whole weight slice, which is exactly the resource that is actually rationed.
+
+### Correction: the clamp recovery is a 93 W effect, not a time constant
+
+The section above concluded the clamp "lifts on its own over ~45 s". **At 80 W it does not.** Two
+protocols, both under a continuous engine load:
+
+| protocol at 80 W | result |
+| --- | --- |
+| one continuous 14000-command context (~100 s) | deciles flat: `7.391 7.262 7.375 7.411 7.482 7.462 7.520 7.514 7.530 7.290` |
+| six 1200-command contexts, then three more after a 40 s idle pause | means `7.167 7.446 7.498 7.503 7.566 7.601`, then `7.496 7.604 7.591` |
+
+Granted IPUCLK sat at 1236-1387 (level 3) for the whole 114 s of the second protocol, and the 40 s pause
+-- well past the 5 s runtime-autosuspend delay, so contexts really were recreated after a real resume --
+changed nothing. Neither re-creating the context nor waiting recovers it.
+
+So the recovery seen at 93 W (7.600 -> 6.016 across six chunks, IPUCLK 1277 -> 1637) is a function of
+the **power limit**, not of elapsed time and not of context lifetime. At 93 W the SMU can afford to
+promote the NPU progressively as the GFX settles; at 80 W it cannot, and the clamp is permanent for as
+long as the engine is busy.
+
+Both bullets above are therefore wrong for the standing 80 W setting. There is no transient to wait
+out, so the split's +8.5% measured at 80 W is already a steady-state figure rather than a lower bound;
+and 130 W does not "buy the level back after 45 s", it buys it at all, which 80 W never does.
+
+### The request path, from the code
+
+The level is asked for once and then held. `aie_smu_set_dpm` issues `AIE_SMU_SET_HARD_DPMLEVEL`
+followed by `AIE_SMU_SET_SOFT_DPMLEVEL`, and its caller is guarded:
+
+    aie2_xrs_set_dft_dpm_level(): if (ndev->pw_mode != POWER_MODE_DEFAULT || ndev->dpm_level == dpm_level) return 0;
+
+so a solver call at context creation is a **no-op** once `ndev->dpm_level` already holds the target, and
+`aie2_solver.c` picks `max_dpm_level` whenever no QoS parameters are present -- which is our case. The
+only re-sends are `aie2_pm_init`'s resume branch and `aie2_pm_set_mode`. The SMU therefore receives one
+hard-level request at device init (or on resume), grants what it grants, and is never asked again.
+
+That makes **`aie2_pm_set_mode` the one untested lever**: a power-mode transition re-issues the hard
+level, so re-requesting `performance` (mode HIGH, `dpm_level = max_dpm_level`) mid-run would ask the
+SMU a second time, at a moment when the GFX has settled. Whether a second request is granted better
+than the first is unknown, and it is the cheapest remaining question about the clamp.
