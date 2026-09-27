@@ -4856,3 +4856,48 @@ readback to notice it by.
 un-influenceable from the NPU side, and the platform profile is the user's custom one.
 What remains reachable is the *intermittent* half, which is on our side: the bimodal stalls when
 the NPU's fetches collide with the GPU's memory bursts.
+
+### The configuration layer is package-level, and it is not NPU-specific
+
+The phrase "SMU contention" resolves to a concrete layer: `amd_pmf`'s package power limits. Its
+custom-policy interface (`tee-if.c`) can set exactly this list:
+
+    PMF_POLICY_SPL              sustained power limit
+    PMF_POLICY_SPPT / FPPT      slow and fast package power tracking
+    PMF_POLICY_SPPT_APU_ONLY / PMF_POLICY_PMF_PPT_APU_ONLY
+    PMF_POLICY_STT_MIN, STT_SKINTEMP_APU, STT_SKINTEMP_HS2
+    PMF_POLICY_P3T, PMF_POLICY_SYSTEM_STATE, 10 BIOS_OUTPUT_n slots
+
+Every entry is a *whole-package* limit. **There is no NPU-specific policy item anywhere in it**, so
+there is nothing to configure that would give the NPU a larger share while the GPU is busy. That
+matches the driver: the NPU requests its DPM level (already the top one) and the SMU decides from
+the package policy.
+
+On this machine the tuning surfaces are not even present. `amd_pmf_dbgfs_register` only creates
+`current_power_limits` when `pmf_if_version == PMF_IF_V1`, and `/sys/kernel/debug/amd_pmf/` is
+empty; the `pb/update_policy` upload lives behind a build option that this kernel did not take,
+since there is no `pb/` directory either. Consistent with the operator using a custom profile
+applied elsewhere.
+
+### The NPU's live power, and a number that does not fit the earlier story
+
+`xrt-smi examine -r platform` reports the NPU's own power. Reading it while a loop runs gives
+the missing half of the clamp evidence:
+
+| condition | NPU power | NPU mean | best |
+| --- | ---: | ---: | ---: |
+| NPU only | **1.517 W** | 5.355 ms | 5.302 |
+| + GPU compute | **1.119 W (0.74x)** | 5.877 ms | 5.302 |
+| + GPU memory | **1.474 W (0.97x)** | 6.465 ms | 5.303 |
+
+A busy GPU drops the NPU to 0.74x power, which is the level-3 clamp from the clock table measured
+rather than inferred. A memory load leaves the clock alone (0.97x) and stalls it instead. Two
+mechanisms, both now confirmed from hardware telemetry rather than from timing.
+
+But **the NPU draws about 1.5 W at full tilt (32.4 TF)**. That sits badly with the earlier claim in
+this document that the NPU is "31 TFLOPS for ~30 W" and that the two engines split a power budget:
+a 1.5 W block is not squeezing an 80 W envelope. Whatever drops the NPU's clock when the GPU is
+busy, it is not the NPU's own consumption. Two candidates remain open -- a policy reservation that
+does not reflect the measured power, or a shared clock domain whose divider moves with the GPU's
+state (which would explain why the drop lands on a discrete table level rather than varying
+smoothly). Both are outside anything the engine, XRT or the NPU driver can set.
