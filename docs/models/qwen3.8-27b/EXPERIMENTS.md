@@ -5864,3 +5864,149 @@ management" would execute the same register writes on the same mailbox and get t
 wall is the firmware arbiter, not the driver, the kernel, or a missing interface.** Worth noting the one
 by-product: OUT carries a clock readback, a third telemetry source alongside the SMU metrics table and
 `MSG_OP_GET_TELEMETRY`.
+
+
+## SMU modding: the firmware is unsigned and driver-loaded, but the clamp is not in the message surface
+
+The question was whether the SMU itself can be modified -- patched firmware, a custom image, or a runtime
+override. Three things had to be separated: how the firmware reaches the SMU, whether anything verifies
+it, and whether the SMU exposes an interface that can move the IPU grant.
+
+### Userspace already has a full SMU console
+
+`ryzen_smu` (v0.1.7, commit `187.0bb95d9`) builds and loads against this kernel once
+`<asm/cpuid/api.h>` is included in `smu.c` (`cpuid_eax/ebx` moved out of `<asm/io.h>`). It reports
+`codename = Strix Halo (26)`, `version = 10.100.2.0`, `mp1_if_version = 4`.
+
+All of its register access goes through the classic SMN index/data pair in PCI config space
+(`SMU_PCI_ADDR_REG = 0xC4`, `SMU_PCI_DATA_REG = 0xC8`), exposed as the raw `smn` attribute: writing
+one u32 reads that address, writing two writes the second word to the first.
+
+    printf '\x28\x09\xb1\x03' > /sys/kernel/ryzen_smu_drv/smn   # read SMN 0x3B10928
+    cat  /sys/kernel/ryzen_smu_drv/smn                          # 4-byte result
+
+**Gotcha:** the sysfs file position advances after the write, so a plain re-read returns EOF (0 bytes).
+`lseek(fd, 0, 0)` first, or the read silently yields nothing -- this cost a first sweep that reported
+"0 of 1024 registers populated" while the module was demonstrably reading them fine.
+
+With that fixed, a sweep of `0x3B10000`-`0x3B11000` returns 67 populated registers. The mapping is
+`SMN = 0x03B00000 | <mp1 offset>`, confirmed against the driver's own constants:
+
+| SMN | driver constant | value | meaning |
+|---|---|---|---|
+| `0x3B10028` | `smnMP1_FIRMWARE_FLAGS_14_0_0` (`0x3010028`) | `1` | interrupts enabled |
+| `0x3B10054` | -- | `0x0A640200` | SMU firmware version 10.100.2.0 |
+| `0x3B10928` | `addr_mp1_mb_cmd` | `2` | last op (`GetSmuVersion`) |
+| `0x3B10978` | `addr_mp1_mb_rsp` | `1` | `SMU_Return_OK` |
+| `0x3B10998` | `addr_mp1_mb_args` | `0x0A640200` | the returned version |
+| `0x3B10A20` | `addr_rsmu_mb_cmd` | `0x65` | last RSMU op |
+| `0x3B10D10` | `smnMP1_PUB_CTRL` (`0x3010d10`) | `0` | `LX3_RESET` deasserted |
+
+Two mailboxes coexist in the same register block and both belong to the one PMFW: the NPU driver uses
+`MP1_C2PMSG_0/60/61` (`0x3B10900/9F0/9F4`) while `ryzen_smu` uses `MP1_C2PMSG_10/30/38`
+(`0x3B10928/978/998`). Both answer with the same firmware version.
+
+**The MP1 mailbox is a complete, real PMFW command channel from userspace.** `smu_args` (24 bytes = six
+u32) then `mp1_smu_cmd` (one byte = the op); the response is in `mp1_smu_cmd` (the enum, 1 = OK) and the
+returned args in `smu_args`:
+
+| op | message | result |
+|---|---|---|
+| `0x02` | `GetSmuVersion` | `1`, args[0] `= 0x0A640200` (10.100.2.0) |
+| `0x03` | `GetDriverIfVersion` | `1`, args[0] `= 0x19` (25) |
+| `0x01` | `TestMessage` | `1`, args[0] `= 1` |
+
+`TestMessage` is the tell: it is the driver's own liveness probe, and the SMU answers it on this mailbox.
+So `PPSMC_MSG_*` ids can be issued from userspace with no kernel module, no patch, and no reboot.
+
+### ...but the message surface has no IPU
+
+SMU14 defines **86 `PPSMC_MSG_*` ids** (`smu_v14_0_2_ppsmc.h`), from `0x01 TestMessage` to
+`0x58 PreloadSwPstateForUclkOverDrive`. Not one names the IPU, and no `PPCLK_*` id resolves to it. The
+IPU appears in only two places anywhere in the SMU14 interface:
+
+- the metrics table (`IpuclkFrequency`, `IpuBusy[8]`, `IpuPower`, `MpipuclkFrequency`,
+  `IpuReads/Writes`);
+- `PPTable_t`'s `uint16_t TemperatureLimit[TEMP_COUNT]` and `uint32_t TempInputSelectMask`.
+
+Everything that could plausibly move the IPU grant -- `SetSoftMaxByFreq`/`SetHardMinByFreq`
+(`0x1A`/`0x1B`, per-clock), `SetWorkloadMask` (`0x24`), `SetPptLimit` (`0x32`),
+`SetTemperatureInputSelect` (`0x38`), `SetThrottlerMask` (`0x3A`) -- is either GPU-clock-scoped or
+marked "can be removed" and never called by any driver. **The level-3 clamp is firmware-internal policy
+with no handle in the message surface**, which is the same conclusion the register-level probing reached,
+now confirmed from the interface definition.
+
+### The firmware is loaded by the driver, over SMN, unsigned
+
+`smu_v14_0_load_microcode()` (`smu_v14_0.c:119`) is the whole story:
+
+    addr_start = MP1_SRAM;                                  /* 0x03c00004 */
+    for (i = 1; i < smc_fw_size/4 - 1; i++) {
+            WREG32_PCIE(addr_start, src[i]);                /* ucode dwords -> SMU SRAM */
+            addr_start += 4;
+    }
+    WREG32_PCIE(MP1_Public | smnMP1_PUB_CTRL, 1 &  ...LX3_RESET_MASK);   /* hold SMU in reset */
+    WREG32_PCIE(MP1_Public | smnMP1_PUB_CTRL, 1 & ~...LX3_RESET_MASK);   /* release -> it runs */
+
+The driver copies the image into SMU instruction SRAM over SMN, then resets and releases the SMU core.
+**The PSP is not involved in this path, and nothing verifies what was written.** The only check anywhere
+is `amdgpu_ucode_validate()` (`amdgpu_ucode.c:535`):
+
+    if (fw->size == le32_to_cpu(hdr->size_bytes))
+            return 0;
+    return -EINVAL;
+
+Size equality, nothing else. The header even carries a `crc32` field -- declared `0x2771D83B`, while the
+payload actually hashes to `0x261BF6BD` -- and no code reads it. **A byte-modified firmware blob with an
+unchanged size loads without complaint.**
+
+### Where the blob lives, and the cost of touching it
+
+`/usr/lib/firmware/amdgpu/smu_14_0_3.bin.zst` decompresses to exactly the image analysed earlier
+(md5 `ad1992c4ddcb66f8fcde62493d702596`). Its `smc_firmware_header_v1_0`:
+
+    size_bytes                 333236 (0x515B4)  == file size
+    header_size_bytes          44
+    header_version             2.0
+    ip_version                 14.0
+    ucode_version              0x00684F00
+    ucode_size_bytes           0x4FE00
+    ucode_array_offset_bytes   0x100            <- payload starts here
+    ucode_start_addr           0x20000
+
+so payload byte `X` lands at SMN `0x3C00000 + X` (the loop writes `src[1]` to `0x3c00004`).
+
+**That aperture is closed once the SMU is running** -- reading `0x3C00000` returns `0xffffffff`, and the
+only way the driver gets at it is while holding the SMU in `LX3_RESET`. So there is no live SRAM patch: a
+modified image has to be delivered as a file at load time. Because amdgpu is in the initramfs and the
+firmware is too (669 firmware files in `initramfs-7.3.0-rc4-perfopt.img`, including
+`smu_14_0_3.bin.zst`), that means rebuilding the initramfs and refreshing the limine hash -- the same
+dance the kernel module work already established.
+
+**Correction.** An earlier note in this document recorded "the firmware's own applied values are
+1285/1797, at SMU blob `0xc808`". That was a `u16` misparse: the bytes there are `05 05` and `07 05`,
+which read little-endian as `0x0505 = 1285` and `0x0705 = 1797`. Region `0xC800`-`0xC87F` is a byte
+lookup table (values 1-11), not a clock ladder. The real conclusion -- the driver's DPM table and the
+SMU's granted values differ -- stands on the grant readbacks, not on this offset.
+
+### What this leaves
+
+Three levers exist, in increasing cost:
+
+1. **Workload mask** (`0x24`) and **temperature-input select** (`0x38`) through the userspace channel.
+   Both are real, documented, runtime, and reversible. They change policy *within* the 80 W envelope
+   rather than the envelope, so they are the only untried moves that need no reboot. Falsifier: if the
+   granted IPUCLK read back from `gpu_metrics` is unchanged under load, the policy is not reachable this
+   way either.
+2. **A patched `smu_14_0_3.bin`.** Feasible and unsigned, but the clamp's implementation is unidentified
+   firmware policy in an opaque ISA, so a patch is a blind edit until the responsible routine is located.
+   Cost: initramfs rebuild + reboot, with four fallback limine entries.
+3. **PPTable / VBIOS.** `TransferTableDram2Smu` (`0x13`) can push a table from DRAM and `PPTable_t`
+   carries the temperature limits and select mask -- but the address registers it needs
+   (`SetDriverDramAddrHigh/Low`) are the driver's own, shared with the metrics table, so a userspace push
+   would fight the driver.
+
+A side observation from the raw BAR5 mailbox work: a deferred machine check (`MC28_STATUS`, "Power,
+Interrupts, etc.", `mem/io: IO`) was logged at uptime 2963 s, coinciding with the direct BAR5 writes. It
+was non-fatal and the machine continued normally, but the raw-mmapped register path is not entirely clean
+and is best avoided now that the SMN `smn` attribute provides the same access through the module.
