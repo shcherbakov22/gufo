@@ -754,11 +754,17 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
     // else falls through to the GPU-only path unchanged.
     AtbNpuOffload* const atb =
         half_prefill ? AtbNpuOffload::Get(AtbRole::kGateUp) : nullptr;
+    // Gate and up must share only the *shape*, which is global: the xclbin bakes
+    // M/K/N, while each tensor is repacked individually and
+    // LaunchAtbRepackBfp16Slice() takes the quant type per call (row_bytes comes
+    // from QuantizedRowBytes(type, k), and the type is passed to the kernel).
+    // Requiring gate.type == up.type here excluded every layer of a mixed-quant
+    // model that does not happen to pair the two -- on this 27B shard that was 28
+    // of 64 layers, which ran with no NPU help at all.
     const bool atb_split = atb != nullptr &&
                            batch_size == atb->geometry().batch &&
                            hidden_size == atb->geometry().gu_k &&
-                           intermediate_size == atb->geometry().gu_n_full &&
-                           layer.ffn_gate.type == layer.ffn_up.type;
+                           intermediate_size == atb->geometry().gu_n_full;
     bool atb_launched = false;
 
     {

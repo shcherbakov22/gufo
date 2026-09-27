@@ -7021,3 +7021,31 @@ enforced GFX ceiling moving 1953-1979 MHz -> 2145-2220 MHz).
 
 Consequence for tuning: **only adjacent-paired deltas are usable, and any claim below ~10% needs its own
 adjacent baseline.** Harness `tools/qwen27b/lean_gu.sh`.
+
+
+### The split was running on 36 of 64 layers -- one unnecessary guard
+
+The traced run reports how many layers actually take the split (`atb_prep_gu_n`), and it read **x36** on a
+64-layer model. The per-layer gate was
+
+    layer.ffn_gate.type == layer.ffn_up.type
+
+and it is unnecessary. The xclbin bakes only M/K/N, which are global; the quant type is handled by the
+repack, which takes it **per call** --
+`LaunchAtbRepackBfp16Slice()` computes `row_bytes = quant::QuantizedRowBytes(type, k)` and passes
+`(int)type` straight into `AtbRepackSliceKernel`. Gate and up share the A operand (a type-independent bf16
+encode) and the C decode reads two fp16 outputs, so nothing about the pair needs a common type. On this
+IQ3_S-mixed shard **28 of 64 layers pair gate and up with different types**, so they ran with no NPU help
+at all.
+
+| | layers on the split | pp2048 (`-r 1`, 130 W, n_gu=10240) |
+| --- | ---: | ---: |
+| before | 36 / 64 | 570.87 |
+| after | **64 / 64** | **602.78** (+5.6%) |
+
+The layer count is the drift-free evidence: same trace field, 36 -> 64. The +5.6% is end-to-end and
+therefore drift-exposed, but the two runs were minutes apart in one session.
+
+Caveat: the ATB path is bf16, so widening it changes the numerics of the 28 added layers. The change sits
+behind the `GUFO_ATB_*` opt-in, which is off by default, so the default path is untouched -- but the split
+path's quality gate should be re-run before anyone relies on it.
