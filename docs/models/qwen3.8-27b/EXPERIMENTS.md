@@ -6721,3 +6721,115 @@ about 1 A. A dedicated TDC limit (`tdc_vddcr_npu_limit`) on a rail that small co
 level-3 operating point -- which is exactly the shape of the clamp: a *held* clock reduction, i.e. a lower DPL
 level picked to keep the rail's current under its ceiling. The number that settles it remains
 `tdc_vddcr_npu_residency_acc`, still unexposed.
+
+
+### Correction: the NPU-rail TDC block is M80H-only -- this box is M20H
+
+The `iod` block and its `tdc_vddcr_npu_*` throttler live in `struct amd_pmf_metrics_iod`, and `amd_pmf` only ever
+fills it for `PCI_DEVICE_ID_AMD_1AH_M80H_ROOT`. This box's root complex is `0x1507`:
+
+    /sys/bus/pci/devices/0000:00:00.0/device   -> 0x1507
+    drivers/platform/x86/amd/pmc/pmc.h         -> #define PCI_DEVICE_ID_AMD_1AH_M20H_ROOT 0x1507
+
+so it takes the M20H path in `amd_pmf_get_smu_metrics()`: `SET_TRANSFER_TABLE` (0x16) with `METRICS_TABLE_ID = 7`
+into a system-RAM buffer whose physical address the driver hands to the SMU, then
+`memcpy(&dev->m_table_v2, dev->buf, dev->mtable_size)` (272 bytes). `mtable_v3` is therefore **never written**,
+and a dump of it reads all zeros -- which is what first looked like a broken patch.
+
+That kills the `tdc_vddcr_npu_residency_acc` measurement outright: on M20H there is no per-rail TDC block to
+expose. `struct smu_pmf_metrics_v2` carries package power, clocks, NPU metrics, per-core data and seven throttle
+residencies -- **and no rail limits at all.**
+
+
+### The live limit is an 80 W STAPM field, and the v2 comments have the units wrong
+
+`sps_metrics` (patched in; see below) prints `cpu_id 0x1507 mtable_size 272` and the v2 table. Two fields matter:
+
+    stapm_opn_limit 120     stapm_cur_limit 80
+
+`stapm_cur_limit` is **constant at 80 across all 420 samples** of every phase and equals
+`/sys/devices/platform/asus-nb-wmi/ppt_pl1_spl` (80) exactly. The `/* mW */` comments on those fields are wrong --
+a `u16` cannot hold 120000, so the unit is watts.
+
+`pmf_if_version` here is **V2** (the V1-only `current_power_limits` debugfs file is not created), and the V2
+slider path never sends SPL/FPPT/SPPT at all -- `amd_pmf_update_slider_v2()` sends `SET_PMF_PPT`,
+`SET_PMF_PPT_APU_ONLY`, `SET_STT_MIN_LIMIT`, `SET_STT_LIMIT_APU` and `SET_STT_LIMIT_HS2`. So on V2 the
+platform limits *are* PPT plus skin temperature.
+
+
+### Every power-limit readback is unimplemented
+
+`tools/qwen27b/pmf_get_limits.py` replays `amd_pmf_send_cmd()`'s handshake against the PMF queue triple from
+userspace. The queue is alive, but every `GET_*` in the message table returns `0xFE`:
+
+    GetSmuVersion  0x02  status=0x1  arg=0xa640200        <- queue works
+    GET_SPL 0x0b   GET_SPPT 0x0d       GET_FPPT 0x0f
+    GET_SPPT_APU_ONLY 0x1e   GET_STT_MIN_LIMIT 0x1f
+    GET_STT_LIMIT_APU 0x20   GET_STT_LIMIT_HS2 0x21       <- all status=0xfe (no handler)
+
+The limits are **push-only** on M20H, so `ppt_pmf_apu_only` cannot be read back. The readable surface is the
+asus-nb-wmi attributes, and they are all flat -- `ppt_pl1_spl`, `ppt_pl2_sppt`, `ppt_fppt`, `ppt_apu_sppt` and
+`ppt_platform_sppt` are all 80. So the APU-only PPT is 80, not 66.
+
+
+### The sustained run: the clamp reproduced, attributed, and bounded
+
+216 s of GPU prefill (`gufo bench -p 2048 -r 40`) concurrent with 3 s NPU engine reps, with `sps_sample.sh`
+refreshing and dumping the v2 table every 0.5 s:
+
+    t(s)  pkg W   npup mW  npub0  npuclk mpnpu | spl%    sppt%   fppt%  thmg%
+       0   73.4      977     91    1377  1017 |  75.8     0.06   4.31   0.00
+      20   80.0      949     96    1309   995 |  99.5    71.66   2.04   0.00
+      80   80.0     1083     96    1282   978 | 100.0   100.00   0.00   3.30
+     140   80.0     1169     98    1278   981 | 100.0   100.00   0.00  66.46
+     180   42.8     1944     95    1802  1261 |   0.0     0.00   0.00   0.00
+
+and the NPU latency per rep (best / mean, ms):
+
+    rep 1  5.299 / 6.736        rep  8  5.305 / 6.876   <- released
+    rep 2  6.849 / 7.441        rep  9  5.304 / 5.346
+    rep 3  6.835 / 7.465        rep 10  5.304 / 5.353
+    rep 4  6.841 / 7.574        rep 11  5.305 / 5.357
+    rep 5  6.844 / 7.588        rep 12  5.305 / 5.392
+    rep 6  6.868 / 7.622        rep 13  5.303 / 5.361
+    rep 7  6.828 / 7.623        rep 14  5.304 / 5.379
+
+**The package is pinned at exactly 80.0 W for ~150 s and never decays.** The clamp is already absolute at t=20
+(`spl` ~100%) and lifts the moment package power falls below the ceiling -- same workload, same clock caps,
+45 s apart. That is the ~7.4 ms clamp, reproduced on demand.
+
+
+### What is now falsified
+
+- **STAPM 66 W as the sustained governor.** Falsified: 80.0 W held for ~150 s with no decay.
+- **Thermal.** Falsified: `thm_gfx` residency is 0.00% for the first 60 s while `spl`/`sppt` are already ~100%.
+- **An NPU rail current limit.** Falsified twice: no such field exists on M20H, and capping GFX at a fixed 80 W
+  releases the NPU anyway, which a rail-local limit could not do.
+- **NPU-local throttling of any kind.** Falsified: NPU-solo puts the package at 39-44 W with **zero** increment
+  on every residency counter, and `npuclk`/`mpnpuclk` at 1804/1263 MHz -- top DPM.
+
+
+### What the clamp actually is, and why the firmware route is closed
+
+Package power arbitration inside PMFW. The NPU is parked at DPM level 3 while the package sits on the platform
+ceiling (`spl`/`sppt` ~100%) and returns to full DPM the instant the ceiling is not being pressed.
+
+The decisive quantity is how little is being refused: **the NPU draws 1.1 W at level 3 and 1.9 W unclamped**
+(`npup`, same table) -- about 0.8 W, roughly 1% of the package budget. This is not a power-budget necessity; it
+is arbiter policy with no exposed input. No NPU field in the PPTable, no NPU limit in the PMF/SPS layer on this
+platform, no per-IP weighting in the V2 slider path, and no readable or writable limit from userspace.
+
+The levers that do work are the ones already measured:
+
+    80 W + GFX cap 2000 MHz   engine 508.5   NPU 6.506   net ~-1.3%
+    80 W + GFX cap 1200 MHz   engine 325.0   NPU 5.421   level 7, net negative
+    93 W                      clamp relaxes over ~45 s
+    130 W                     clamp released
+
+So: raise the set point, or buy NPU cycles with GPU throughput (net-negative), or **make the NPU need less power
+per operation**. That third one is the token split, the B repack off the critical path and the gate+up fusion --
+worth ~+25% before any of this, and it moves work onto a block that costs 1.9 W instead of ~30 W.
+
+Patch and harness: `tools/qwen27b/amd_pmf_sps_metrics.patch` (the `sps_metrics` debugfs dump plus the one-line
+`SAMPLE` record), `tools/qwen27b/sps_sample.sh`, `tools/qwen27b/pmf_get_limits.py`. The module is runtime-only:
+`make M=drivers/platform/x86/amd/pmf modules`, then `rmmod amdxdna && rmmod amd_pmf && insmod <ko> && modprobe amdxdna`.

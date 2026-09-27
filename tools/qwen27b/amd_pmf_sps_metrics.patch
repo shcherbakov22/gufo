@@ -1,0 +1,166 @@
+diff --git a/drivers/platform/x86/amd/pmf/core.c b/drivers/platform/x86/amd/pmf/core.c
+index b4eae65e6..1b97a36db 100644
+--- a/drivers/platform/x86/amd/pmf/core.c
++++ b/drivers/platform/x86/amd/pmf/core.c
+@@ -125,6 +125,151 @@ static int current_power_limits_show(struct seq_file *seq, void *unused)
+ }
+ DEFINE_SHOW_ATTRIBUTE(current_power_limits);
+ 
++/*
++ * Dump the platform/SPS power telemetry.
++ *
++ * Which table is live depends on the platform.  M20H (PCI 0x1507) fills
++ * m_table_v2 from METRICS_TABLE_ID 7 via SET_TRANSFER_TABLE; M80H fills
++ * mtable_v3 from the DRAM metrics log.  The accumulator/iod block -- the only
++ * place an NPU rail (VDDCR_NPU) and its TDC throttler appear -- is M80H-only,
++ * so it is printed only there.
++ *
++ * The SAMPLE line is a single machine-readable record for sampling scripts.
++ * amd_pmf_get_smu_metrics() only runs when the NPU metrics are requested, so
++ * read the amdxdna power sensor first to force a refresh.
++ */
++
++static int sps_metrics_show(struct seq_file *seq, void *unused)
++{
++	struct amd_pmf_dev *dev = seq->private;
++	struct smu_pmf_metrics_v2 *v2 = &dev->m_table_v2;
++	struct amd_pmf_metrics_iod *m = &dev->mtable_v3.iod;
++	int i;
++
++	seq_printf(seq,
++		   "SAMPLE cnt=%u spl=%u fppt=%u sppt=%u pro=%u thmg=%u thms=%u thmc=%u "
++		   "sock=%u apu=%u gfx=%u npup=%u npuclk=%u mpnpuclk=%u npub0=%u "
++		   "gfxclk=%u gfxa=%u cur=%u opn=%u gfxt=%u soct=%u skint=%u\n",
++		   v2->metrics_counter, v2->throttle_residency_spl,
++		   v2->throttle_residency_fppt, v2->throttle_residency_sppt,
++		   v2->throttle_residency_prochot, v2->throttle_residency_thm_gfx,
++		   v2->throttle_residency_thm_soc, v2->throttle_residency_thm_core,
++		   v2->socket_power, v2->apu_power, v2->gfx_power, v2->npu_power,
++		   v2->npuclk_freq, v2->mpnpuclk_freq, v2->npu_busy[0],
++		   v2->gfxclk_freq, v2->gfx_activity,
++		   v2->stapm_cur_limit, v2->stapm_opn_limit,
++		   v2->gfx_temp, v2->soc_temp, v2->skin_temp);
++
++	seq_printf(seq, "cpu_id 0x%x  mtable_size %zu  metrics_counter %u  alpha %u\n\n",
++		   dev->cpu_id, dev->mtable_size, v2->metrics_counter,
++		   v2->filter_alpha_value);
++
++	seq_puts(seq, "STAPM / package power (mW):\n");
++	seq_printf(seq, "  stapm_opn_limit %u  stapm_cur_limit %u\n",
++		   v2->stapm_opn_limit, v2->stapm_cur_limit);
++	seq_printf(seq, "  apu %u  gfx %u  dgpu %u  socket %u  all_core %u  psys %u\n",
++		   v2->apu_power, v2->gfx_power, v2->dgpu_power,
++		   v2->socket_power, v2->all_core_power, v2->psys);
++
++	seq_puts(seq, "\nNPU:\n");
++	seq_printf(seq, "  npuclk %u MHz  mpnpuclk %u MHz  power %u mW  reads %u  writes %u\n",
++		   v2->npuclk_freq, v2->mpnpuclk_freq, v2->npu_power,
++		   v2->npu_reads, v2->npu_writes);
++	seq_puts(seq, "  busy:");
++	for (i = 0; i < 8; i++)
++		seq_printf(seq, " %u", v2->npu_busy[i]);
++	seq_puts(seq, "\n");
++
++	seq_puts(seq, "\nclocks (MHz) / activity:\n");
++	seq_printf(seq, "  gfxclk %u  fclk %u  socclk %u  vclk %u  vpeclk %u  memclk %u\n",
++		   v2->gfxclk_freq, v2->fclk_freq, v2->socclk_freq,
++		   v2->vclk_freq, v2->vpeclk_freq, v2->memclk_freq);
++	seq_printf(seq, "  gfx_activity %u  vcn_activity %u  infra_cpu_max %u  infra_gfx_max %u\n",
++		   v2->gfx_activity, v2->vcn_activity,
++		   v2->infra_cpu_maxfreq, v2->infra_gfx_maxfreq);
++
++	seq_puts(seq, "\ntemps (centi-C):\n");
++	seq_printf(seq, "  gfx %u  soc %u  skin %u\n",
++		   v2->gfx_temp, v2->soc_temp, v2->skin_temp);
++
++	seq_puts(seq, "\nthrottle residencies:\n");
++	seq_printf(seq, "  prochot %u  spl %u  fppt %u  sppt %u\n",
++		   v2->throttle_residency_prochot, v2->throttle_residency_spl,
++		   v2->throttle_residency_fppt, v2->throttle_residency_sppt);
++	seq_printf(seq, "  thm_core %u  thm_gfx %u  thm_soc %u\n",
++		   v2->throttle_residency_thm_core,
++		   v2->throttle_residency_thm_gfx,
++		   v2->throttle_residency_thm_soc);
++
++	seq_puts(seq, "\ncores (first 8):\n");
++	for (i = 0; i < 8; i++)
++		seq_printf(seq, "  cpu%d %5u MHz %5u mW %5u cC c0 %3u%%\n",
++			   i, v2->core_frequency[i], v2->core_power[i],
++			   v2->core_temp[i], v2->core_c0residency[i]);
++
++	if (dev->cpu_id != 0x115b)
++		return 0;
++
++#define RAIL(n)									\
++	seq_printf(seq, "  %-12s setV %10llu  telV %10llu  telP %10llu\n",	\
++		   #n, (unsigned long long)m->n##_set_voltage,			\
++		   (unsigned long long)m->n##_telemetry_voltage,		\
++		   (unsigned long long)m->n##_telemetry_power)
++#define THR(n)									\
++	seq_printf(seq, "  %-14s fused %8u  irm %8u  pbo %8u  limit %8u  value %10llu  resid %8u\n", \
++		   #n, m->n##_fused_limit, m->n##_max_irm_limit,		\
++		   m->n##_max_pbo_limit, m->n##_limit,				\
++		   (unsigned long long)m->n##_value_acc, m->n##_residency_acc)
++
++	seq_printf(seq, "\nM80H v3 table: counter_acc %u\n", m->counter_acc);
++	seq_puts(seq, "rails:\n");
++	RAIL(vddcr);
++	RAIL(vddcr_soc);
++	RAIL(vddcr_npu);
++	RAIL(vddcr_lp);
++	RAIL(vddcr_gfx);
++	RAIL(vdd_misc);
++	seq_puts(seq, "\npower and current throttlers:\n");
++	THR(fppt);
++	THR(sppt);
++	THR(spl);
++	THR(tdc_vddcr);
++	THR(tdc_vddcr_soc);
++	THR(tdc_vddcr_npu);
++	THR(tdc_vddcr_lp);
++	THR(tdc_vddcr_gfx);
++	seq_puts(seq, "\nPMF (platform) limits:\n");
++	seq_printf(seq, "  fast_apu_ppt limit %8u value %10llu resid %8u\n",
++		   m->pmf_fast_apu_ppt_limit,
++		   (unsigned long long)m->pmf_fast_apu_ppt_value_acc,
++		   m->pmf_fast_apu_ppt_residency_acc);
++	seq_printf(seq, "  slow_apu_ppt limit %8u value %10llu resid %8u\n",
++		   m->pmf_slow_apu_ppt_limit,
++		   (unsigned long long)m->pmf_slow_apu_ppt_value_acc,
++		   m->pmf_slow_apu_ppt_residency_acc);
++	seq_printf(seq, "  fast_spm limit %8u value %10llu resid %8u\n",
++		   m->pmf_fast_spm_limit,
++		   (unsigned long long)m->pmf_fast_spm_value_acc,
++		   m->pmf_fast_spm_residency_acc);
++	seq_printf(seq, "  slow_spm limit %8u value %10llu resid %8u\n",
++		   m->pmf_slow_spm_limit,
++		   (unsigned long long)m->pmf_slow_spm_value_acc,
++		   m->pmf_slow_spm_residency_acc);
++	seq_puts(seq, "\nNPU accumulators:\n");
++	seq_printf(seq, "  npu_power_acc %llu npu_temp_acc %llu aieclk %llu npuhclk %llu\n",
++		   (unsigned long long)m->npu_power_acc,
++		   (unsigned long long)m->npu_temp_acc,
++		   (unsigned long long)m->aieclk_freq_eff_acc,
++		   (unsigned long long)m->npuhclk_freq_eff_acc);
++	seq_printf(seq, "  system_power_acc %llu apu_power_acc %llu thm %u/%u prochot %u\n",
++		   (unsigned long long)m->system_power_acc,
++		   (unsigned long long)m->apu_power_acc,
++		   m->thm_limit, m->thm_residency_acc,
++		   m->prochot_residency_acc);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(sps_metrics);
++
+ static void amd_pmf_dbgfs_unregister(struct amd_pmf_dev *dev)
+ {
+ 	debugfs_remove_recursive(dev->dbgfs_dir);
+@@ -136,6 +281,9 @@ static void amd_pmf_dbgfs_register(struct amd_pmf_dev *dev)
+ 	if (dev->pmf_if_version == PMF_IF_V1)
+ 		debugfs_create_file("current_power_limits", 0644, dev->dbgfs_dir, dev,
+ 				    &current_power_limits_fops);
++
++	debugfs_create_file("sps_metrics", 0444, dev->dbgfs_dir, dev,
++			    &sps_metrics_fops);
+ }
+ 
+ int amd_pmf_get_power_source(void)
