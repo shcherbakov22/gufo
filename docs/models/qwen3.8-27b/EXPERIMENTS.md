@@ -5355,3 +5355,103 @@ already measured NPU mean 5.618 with the engine running), costs the GPU nothing 
 instead adds +9.2% to the engine under concurrent NPU load. Capping GFX pays for the NPU's level with
 GPU throughput; raising the limit pays with heat. There is no third option, because the arbiter
 inside the SMU is the only thing that decides, and it decides on the package budget.
+
+## Research pass: the clamp has a ~45 s time constant, and the missing watts are DRAM
+
+Four questions were open after the GFX-cap experiment. Three are now answered, and two of the
+answers change the conclusion.
+
+### 1. The clamp lifts on its own under sustained load
+
+A single long engine run (`-r 18`) with six sequential NPU chunks, `gpu_metrics` sampled at 2 Hz:
+
+| chunk (sequential) | 1 | 2 | 3 | 4 | 5 | 6 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| NPU best (ms) | 6.904 | 6.895 | 5.498 | 5.478 | 5.399 | **5.370** |
+| NPU mean (ms) | 7.600 | 7.589 | 7.229 | 6.491 | 6.157 | **6.016** |
+
+and the granted clock over the same window, package pinned at 93.0 W throughout:
+
+| t (s) | IPUCLK | MPIPUCLK | gfxclk | socclk | fclk | gfxmax | thm_gfx residency |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 9385 | 1277 | 980 | 1852 | 1104 | 1600 | 1769 | 109288 |
+| 9405 | 1399 | 1050 | 1862 | 1163 | 1644 | 1838 | 117412 |
+| 9415 | 1594 | 1143 | 1728 | 1434 | 1864 | 1749 | 127430 |
+| 9425 | **1637** | **1177** | 1653 | 1466 | 1885 | 1564 | 137447 |
+
+**The SMU walks the NPU from level 3 back toward level 7 over ~40-45 s, at constant package power,
+while it simultaneously throttles GFX** (1887 -> 1653 MHz, `thm_gfx` residency climbing steadily) and
+raises SOCCLK and FCLK (1104 -> 1466, 1600 -> 1885). The best-case command time returns to 5.370 ms,
+within 0.4% of solo. This is a rebalancing, not a warm-up: the NPU is not getting faster by itself, it
+is being given back part of the budget as the GFX thermally yields.
+
+This is why the earlier warm-up test was refuted -- that one sampled 28 s of an NPU *solo* run, and
+this effect needs a mixed load sustained for roughly twice as long. **Every comparison in this
+document that ran for under ~45 s was measuring the clamp's initial state, not its steady state.**
+
+### 2. Two mechanisms, now with the granted clock as direct evidence
+
+`gpu_load` synthetic load, NPU concurrent, 1200 commands each:
+
+| GPU load | NPU best | NPU mean | granted IPUCLK/MPIPUCLK | peak package | DRAM read/write |
+| --- | ---: | ---: | --- | ---: | ---: |
+| compute (register-resident FMA) | 6.446 | 6.877 | **1413 / 1059 (level 3)** | 93.0 W | 42.7 / 3.4 GB/s |
+| memory (streaming copy) | **8.493** | **9.711** | **1798 / 1260 (level 7)** | 88.8 W | 52.8 / 53.2 GB/s |
+
+**The memory load leaves the NPU at level 7 and still costs it 81%** (9.711 against 5.351 solo) --
+that is pure bandwidth starvation, and it is worse than the power clamp. The compute load clamps the
+clock to level 3 and costs 29%. The engine's prefill does both. The earlier "two effects" correction
+is therefore right in kind: there is a power clamp *and* a bandwidth fight, and they are separable
+now because the granted clock distinguishes them.
+
+### 3. The unattributed ~63 W is DRAM and fabric traffic -- and the NPU drives half of it
+
+`gpu_metrics` detail lines at package 93.0 W:
+
+    apu=93.0  sys=4.2  dgpu=0.0 | core_power_sum=6.5
+    dram r/w = 63138 / 12097 MB/s      <-- 75 GB/s total
+    ipu  r/w = 37084 /  2471 MB/s      <-- 39 GB/s of it is the NPU's own fetches
+    gfx power ~25 W, IPU power ~0.9 W
+
+So the breakdown of the 93 W is roughly: GFX 25 W, cores 4-6 W, IPU 0.9 W, and **~60 W in the memory
+subsystem and fabric**, at ~75 GB/s. The LPDDR5X is on-package, so its power is inside `average_apu_power`
+and is not attributed to any engine. Note also `average_sys_power` is 2-8 W while `average_apu_power` is
+93 W, so the "sys power" field is not the system total and should not be read as one.
+
+**This is the most important correction in the pass.** The IPU's *compute* cost really is ~1 W, but its
+*fetch* cost is not: the NPU pulls 39 GB/s, and that traffic is charged to the memory subsystem, which
+is inside the same package budget the SMU enforces. So when the SMU clamps the NPU it is not behaving
+absurdly -- it is responding to a shared resource that the NPU itself loads heavily. The operator's
+"shafted for half a watt" is exactly right about the *attribution* and incomplete about the *physics*:
+the watt the NPU is denied is small, but the memory power it causes is what the arbiter is really
+rationing.
+
+It also explains why the `low` GFX cap released the clamp: at 600 MHz GFX the package fell to 61 W
+because the GPU stopped generating traffic, leaving DRAM headroom.
+
+### 4. Upstream has no NPU control to borrow
+
+The NPU metrics interface is brand new -- `[PATCH V3 1/2] platform/x86/amd/pmf: Introduce new interface
+to export NPU metrics`, reviewed January 2026 (Lizhi Hou, Shyam Sundar S K, Mario Limonciello). It is a
+**metrics export only**, and its v2 path copies `m_table_v2` fields with no accumulation, while the
+M80H/Strix Halo path uses the `_acc` deltas. AMD has never exposed an NPU power or clock *control*:
+the entire control surface in `amdxdna_accel.h` is get/set power mode
+(`DEFAULT/LOW/MEDIUM/HIGH/TURBO`) plus `set_dft_dpm_level`, and `aie2_pm_init` already walks
+`dpm_clk_tbl` to find `max_dpm_level` and requests it at init. Nothing to borrow, nothing that was
+left disabled.
+
+### Where this leaves the patch
+
+It lowers its value further. The SMU already performs the GFX-to-IPU rebalance that a soft GFX cap
+would force -- it just takes ~45 s and it does it by letting the GFX thermally throttle. A patch
+exposing `SMU_MSG_SetSoftMaxGfxClk` would make that happen immediately and controllably, but it would
+not produce a state the hardware cannot already reach, and the steady-state numbers above are mostly
+what a cap would buy.
+
+The practical consequences that follow are cheaper than a kernel rebuild:
+
+* **Measure the steady state, not the first 30 s.** Any NPU-under-engine number taken under ~45 s is
+  the clamped transient. The +8.5% split gain measured earlier is a lower bound.
+* **The limit is still the honest lever** (130 W buys the level back immediately rather than after 45 s),
+  and the memory traffic is the one the split should attack -- the B repack writes and re-reads the
+  NPU's whole weight slice, which is exactly the resource that is actually rationed.
