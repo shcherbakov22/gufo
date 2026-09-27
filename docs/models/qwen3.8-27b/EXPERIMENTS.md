@@ -6833,3 +6833,49 @@ worth ~+25% before any of this, and it moves work onto a block that costs 1.9 W 
 Patch and harness: `tools/qwen27b/amd_pmf_sps_metrics.patch` (the `sps_metrics` debugfs dump plus the one-line
 `SAMPLE` record), `tools/qwen27b/sps_sample.sh`, `tools/qwen27b/pmf_get_limits.py`. The module is runtime-only:
 `make M=drivers/platform/x86/amd/pmf modules`, then `rmmod amdxdna && rmmod amd_pmf && insmod <ko> && modprobe amdxdna`.
+
+
+### Measured: the SMU publishes no rail voltage or current on this APU, so the SoC-rail test cannot be run
+
+The falsifier recorded earlier -- *read the SoC rail current at the moment the clamp engages* -- was attempted.
+It cannot be read on this hardware.
+
+**The user-facing metrics blob has no voltage fields.** `smu_v14_0_2_get_gpu_metrics()` fills
+`struct gpu_metrics_v1_3`, which does carry `voltage_soc` / `voltage_gfx` / `voltage_mem` from
+`AvgVoltage[SVI_PLANE_*]` (`smu_v14_0_2_ppt.c:2217-2219`). But what `/sys/class/drm/card1/device/gpu_metrics`
+actually exposes is `gpu_metrics_v3_0` (264 bytes, `format_revision` 3), which has **no voltage fields at
+all** -- the conversion drops them, and the parser confirms 264 bytes with no VDD member.
+
+**The SMU's own read path returns zero.** `amdgpu_pm_info`'s `VDDGFX` / `VDDNB` lines call
+`amdgpu_dpm_read_sensor()` for `AMDGPU_PP_SENSOR_VDDGFX` / `_VDDNB`, and the former is a direct read of
+`metrics->AvgVoltage[SVI_PLANE_VDD_GFX]` (`smu_v14_0_2_ppt.c:732`). Sampled 70 times over a held clamp --
+package pinned at **79.89-80.09 W**, NPU at **npuclk 1284-1367 / mpnpuclk 985-1032** (the level-3 row) on
+every sample, engine pp2048 500.10 against ~546 solo:
+
+    VDDGFX  0 mV    (every sample)
+    VDDNB   0 mV    (every sample)
+
+hwmon agrees: `in0_label` `vddgfx` and `in1_label` `vddnb` are both 0.
+
+**`AvgCurrent[SVI_PLANE_*]` is never read by any in-tree code** -- a whole-tree grep finds only the
+declarations in `smu13_driver_if_v13_0_0.h`, `smu13_driver_if_v13_0_7.h` and `smu14_driver_if_v14_0.h`,
+and the only `.c` users are `AvgVoltage` reads for the GFX plane. So the sibling current array is dropped
+for the same reason the voltage is: there is nothing there to report.
+
+**What this means.** On this APU the SMU's SVI3 per-plane voltage/current telemetry is unpopulated. It
+reports package power -- `AverageSocketPower` is 80.0 W, exactly on the cap -- but no per-rail V or I. Two
+consequences:
+
+- The SoC-rail current hypothesis is **not testable on this hardware**. The named falsifier is unobtainable,
+  which is different from the hypothesis being refuted.
+- An SMU that holds no per-rail current data cannot be arbitrating on per-rail current. That favours the
+  package-power model, though it is not proof: an unpublished internal estimate cannot be excluded.
+
+**And it settles the two contradictory corrections.** The `304 W is the real ceiling, so the current
+hypothesis is dead` entry reached a defensible conclusion by the wrong route (it argued from the GFX 224 A
+rail and called the 84 A SOC rail a secondary domain). The `dismissed on a wrong rail mapping` entry was
+right to retract that. The honest status now is neither *dead* nor *open* but **unsupported and untestable**
+with the telemetry this part exposes.
+
+Harness: `/home/q/smu/socrail_probe.sh` (70 samples, `amdgpu_pm_info` VDD lines plus the refreshed SPS
+`SAMPLE` record, under a held GPU+NPU clamp).
