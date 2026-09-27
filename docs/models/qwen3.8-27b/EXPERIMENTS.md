@@ -5069,3 +5069,30 @@ lever. The original curve is saved in `build/atb/fan_curve_backup.txt` and has b
 `asus-nb-wmi` PPT files for `tdp`, the `platform-profile` attribute for `profile`, and the same
 `asus_custom_fan_curve` hwmon for `fancurve`. It is not a different power path -- setting 80 through
 it produces the identical `ppt_*` = 80 state, and the trace above is that setting.
+
+### The clamp does not release at 93 W, and it is a cliff, not a ramp
+
+The NPU's unmet need under contention is ~0.5 W by its own metric, so the package limit needed to
+release it should be trivial. It is not. Same shape under the real engine prefill (baseline path, no
+split), 2000 commands, ppt = 93 W:
+
+| state | best | p50 | mean | TFLOPS |
+| --- | ---: | ---: | ---: | ---: |
+| NPU solo | 5.306 | 5.355 | 5.359 | 32.38 |
+| under engine, **80 W** | 5.305 | -- | 6.829 | -- |
+| under engine, **93 W** | 6.199 | 6.925 | **6.960** | 27.72 |
+| under GPU compute load, **130 W** | 5.302 | -- | **5.347** | 32.3 |
+
+The time-ordered deciles at 93 W are flat -- `6.902 6.931 6.958 6.908 6.933 6.926 6.990 7.020 7.049
+6.986` -- so there is no partial release, and none as the engine's boost budget expires and its
+package draw falls from 111 to ~80 W. The command time is pinned at ~6.9 ms for the whole run.
+
+That is the shape of the injustice exactly as the operator put it: **the SMU withholds ~0.5 W from
+the NPU and charges 29-33% of its throughput (level 7 -> level 3, 0.70x), while the GPU spends an
+extra 12-30 W for +1.6% of baseline throughput.** The exchange rate on the NPU side is ~60x better
+than on the GPU side, and the arbiter spends the budget on the wrong one.
+
+The engine's own baseline is indifferent to the limit in this range -- 530.30 (`-r 1`, 80 W),
+538.83 (`-r 1`, 93 W), 531.54 +/- 9.90 (`-r 3`, 93 W) -- so the only thing that changes with the
+limit is whether the NPU is allowed to work. **The knee is between 93 and 130 W, and the optimum
+standing limit for a split workload is therefore above the optimum for a baseline workload.**
