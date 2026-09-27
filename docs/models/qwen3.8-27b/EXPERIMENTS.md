@@ -6386,3 +6386,26 @@ tweak, it is a way to damage the board. The safe direction -- reducing GFX's sha
 same ceiling -- is the GFX-cap trade already measured, which nets roughly -1.3%. Worth recording as a
 hypothesis with a falsifier (read the SoC rail current at the moment the clamp engages) rather than as a thing
 to try.
+
+
+### Correction: 304 W is the real ceiling, so the current hypothesis is dead
+
+`SocketPowerLimitAc[0] = 304` is not an artifact -- it is the actual socket power ceiling, and this APU will
+draw 250-300 W when cooling allows. That is self-consistent with `VrTdcLimit[0] = 224 A`: at ~1.1 V, 224 A
+is ~246 W, right in that range. The PPTable's limits are the real hardware limits.
+
+**Which refutes the TDC hypothesis recorded immediately above.** At the 80 W set point the main rail sits
+near 73 A against a 224 A ceiling -- about a third. Current is not what clamps the IPU, and the "84 A" rail
+is a secondary domain rather than a package ceiling. Worth having recorded it as a hypothesis with a
+falsifier instead of acting on it; the falsifier is what killed it.
+
+What the numbers do establish is sharper than what they replaced: **the PPTable's ceiling is 304 W, yet the
+SMU clamps the IPU at 80 W, so the effective budget is imposed from outside the PPTable** -- by the EC/SPS
+path z13ctl drives. The clamp is the SMU arbitrating a budget it was *told* against a ceiling of 304 W, which
+is exactly why only package headroom (less demand) and a higher set point (bigger budget) release it, and why
+nothing in the PPTable, the message surface, or the driver moves it.
+
+One unexplained detail to keep: `SkuTable_t.SocketPowerLimitSpare[10]` holds `{80, 0, ...}` -- a field the
+header labels spare, inside the firmware's *static* SkuTable, holding exactly the set point in use. It may be
+nothing (80 is a round number) or a repurposed slot in this SMU revision. Not actionable, but worth a look if
+the budget-writing path is ever mapped.
