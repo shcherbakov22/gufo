@@ -7189,3 +7189,35 @@ design. Generator `config3/n32_core.py`, driven as `gen_pair.sh` does; harnesses
 Remaining work for the split itself, all host-side: chunk at 4096, full-width B repacks (the NPU now needs
 all 17408 gate rows, so B goes 56.2 MB -> ~120 MB), a row-offset C decode (the NPU writes 2048 of 4096
 tokens on the full token stride), and wiring both xclbins as one NPU chain.
+
+
+### The token split can be memory-neutral: pad the width instead of doubling the chunk
+
+The first framing was "M=1024, so the chunk must be 4096 to give each engine 2048", and that costs
+**+~0.6 GB** of arena: the three FP32 FFN buffers are `batch * 17408 * 4`, so 142.6 MB each at batch 2048
+and 285.2 MB each at 4096 (+428 MB), plus `d_scratch_bf16` 71.3 -> 142.6 MB, plus the q8 scratch and A.
+That is a real doubling of the activation footprint, and it also silently changes the benchmark:
+`batch_size = arena_.GetMaxBatch()` (prefill.cpp), so a 4096 chunk only exists at `-p 4096`, and the split
+check `batch_size == xclbin.M` would never fire at `-p 2048` at all.
+
+**But the generator constraint is only `(M/512) * (N/1024) divisible by 4`.** At M=1024 that means N must
+be a multiple of 2048 -- and N can be *padded* past the real width, with the surplus columns computed and
+discarded:
+
+    gate/up  N 17408 -> 18432   (18 tiles, num_groups 36)   ~6%  of columns discarded
+    down     N  5120 ->  6144   ( 6 tiles, num_groups 12)   ~20% of columns discarded
+
+Both build in 5-6 s:
+
+    npu_gu_t1024_pad   M=1024 K=5120  N=18432
+    npu_dn_t1024_pad   M=1024 K=17408 N=6144
+
+**So the chunk stays at 2048 and the arena is untouched.** The price is ~6% and ~20% surplus columns on
+the two projections (weighted, roughly 7% of NPU work) instead of 600 MB and a new benchmark protocol.
+Two details the padding must respect: B has to be sized to the padded width with the surplus zeroed, so
+the repack never reads past the weight tensor, and C is sized to the padded width with the surplus simply
+ignored by the decode. Both buffers are already ours (the repack writes them, the decode reads them), so
+this is bookkeeping rather than new mechanism.
+
+Harness `/home/q/smu/gen_padded_t1024.sh`. This supersedes the M=2048/4096-chunk route recorded above,
+which is kept for the shape-constraint table rather than as the plan.
