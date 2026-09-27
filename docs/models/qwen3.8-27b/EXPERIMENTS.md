@@ -7221,3 +7221,55 @@ this is bookkeeping rather than new mechanism.
 
 Harness `/home/q/smu/gen_padded_t1024.sh`. This supersedes the M=2048/4096-chunk route recorded above,
 which is kept for the shape-constraint table rather than as the plan.
+
+
+### Fixed the generator instead: no padding, no wasted columns, no 4096 chunk
+
+The constraint was not fundamental -- it was a bug in the tail of the sequence loop in
+`config3/n32_core.py`.
+
+    slots = [None] * tb_max_n_rows                  # 4 slots, cycled by group_idx % 4
+    for group_idx in range(num_groups):
+        slot_idx = group_idx % tb_max_n_rows
+        ...
+        if slot_idx == 1 and group_idx != 1: finish_slot(2); finish_slot(3)
+        if slot_idx == 3:                   finish_slot(0); finish_slot(1)
+    finish_slot(2)                                  # <-- hardcoded
+    finish_slot(3)
+
+The hardcoded tail is only correct when `num_groups % 4 == 0`. For `num_groups = 34` the last mid-loop
+finish happens at `group_idx = 33`, which closes slots 2 and 3 (groups 30, 31); the tail then closes 2 and 3
+*again* and the two newest groups sitting in slots 0 and 1 are never closed -- which is exactly the reported
+`Failed to close task groups: TaskGroup(33), TaskGroup(34)`.
+
+**The fix** tracks each slot's group index, clears a slot when it is closed, and replaces the hardcoded tail
+with a loop that closes whatever is still open in group order (preserving the FIFO release order the
+mid-loop rotation uses):
+
+    slot_group: list[int] = [-1] * tb_max_n_rows
+    def finish_slot(idx):
+        slots[idx].finish()
+        slots[idx] = None
+    ...
+    for idx in sorted((i for i in range(tb_max_n_rows) if slots[i] is not None),
+                      key=lambda i: slot_group[i]):
+        finish_slot(idx)
+
+**Result -- the exact widths now build, and the shapes that already worked still do:**
+
+| shape | num_groups | before | after |
+| --- | ---: | --- | --- |
+| M=1024 K=5120  N=17408 (gate/up) | 34 | REJECTED | **OK, 6 s** |
+| M=1024 K=17408 N=5120  (down)    | 10 | REJECTED | **OK, 5 s** |
+| M=1536 K=5120  N=17408           | 51 | REJECTED | **OK, 6 s** |
+| M=1024 K=5120  N=10240           | 20 | OK | OK, 5 s |
+| M=2048 K=5120  N=17408           | 68 | OK | OK, 7 s |
+
+**So the token split runs at the existing 2048-token chunk with no arena change, no +600 MB, no 4096-token
+protocol, and no surplus columns.** The artifacts are `npu_gu_t1024_exact` and `npu_dn_t1024_exact`; the
+padded variants and the M=2048 full-width pair are no longer needed and should not be used.
+
+Patch saved as `tools/qwen27b/n32_core_slot_tail.patch` -- it is a change to the vendored mlir-aie example,
+not to this repo, so the file is what carries it across a re-clone. If it is genuinely a bug rather than a
+local shape assumption it is worth sending upstream; the failure mode (silent until
+`resolve_program()`, with no hint that the group count is the issue) is easy to hit again.

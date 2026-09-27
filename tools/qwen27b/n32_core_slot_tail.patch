@@ -1,0 +1,55 @@
+diff --git a/programming_examples/ml/block_datatypes/gemm_asymmetric_tile_buffering/config3/n32_core.py b/programming_examples/ml/block_datatypes/gemm_asymmetric_tile_buffering/config3/n32_core.py
+index 452e0b1..5c6ff72 100644
+--- a/programming_examples/ml/block_datatypes/gemm_asymmetric_tile_buffering/config3/n32_core.py
++++ b/programming_examples/ml/block_datatypes/gemm_asymmetric_tile_buffering/config3/n32_core.py
+@@ -68,6 +68,7 @@ def n32_core_gemm(
+ 
+     kernel_flags = [
+         f"-I{_AIE_KERNELS_INC}",
++        f"-DK_PROBLEMSIZE={K}",
+     ]
+ 
+     # mm_bfp_mixed.cc keeps a TU-local staging buffer that matmul and
+@@ -175,16 +176,26 @@ def n32_core_gemm(
+ 
+     def sequence(a, b, c, A_prods, B_prods, C_conses):
+         slots: list[TaskGroup | None] = [None] * tb_max_n_rows
++        # Which group each slot currently holds.  The tail needs this to close the
++        # remaining slots in *group* order: the original tail hardcoded slots 2 and
++        # 3, which is only correct when num_groups is a multiple of tb_max_n_rows.
++        # For num_groups = 4k+2 the last mid-loop finish happens at slot 1 (closing
++        # slots 2,3) and the two newest groups sit in slots 0 and 1 -- hardcoding the
++        # tail then closes 2,3 twice and leaves 0,1 open, and the AIE runtime reports
++        # "Failed to close task groups" naming those two groups.
++        slot_group: list[int] = [-1] * tb_max_n_rows
+ 
+         def finish_slot(idx: int):
+             slot = slots[idx]
+             assert slot is not None
+             slot.finish()
++            slots[idx] = None
+ 
+         for group_idx in range(num_groups):
+             slot_idx = group_idx % tb_max_n_rows
+             tg = TaskGroup()
+             slots[slot_idx] = tg
++            slot_group[slot_idx] = group_idx
+ 
+             a_base_idx = (group_idx // num_col_tile) * n_aie_rows
+             for row in range(n_aie_rows):
+@@ -218,8 +229,13 @@ def n32_core_gemm(
+                 finish_slot(0)
+                 finish_slot(1)
+ 
+-        finish_slot(2)
+-        finish_slot(3)
++        # Close whatever is still open, oldest group first, so the FIFO lifetimes
++        # are released in the same order the mid-loop rotation releases them.
++        for idx in sorted(
++            (i for i in range(tb_max_n_rows) if slots[i] is not None),
++            key=lambda i: slot_group[i],
++        ):
++            finish_slot(idx)
+ 
+     rt = Runtime(
+         sequence,
