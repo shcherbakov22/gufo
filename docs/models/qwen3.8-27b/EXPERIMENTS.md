@@ -5495,3 +5495,39 @@ That makes **`aie2_pm_set_mode` the one untested lever**: a power-mode transitio
 level, so re-requesting `performance` (mode HIGH, `dpm_level = max_dpm_level`) mid-run would ask the
 SMU a second time, at a moment when the GFX has settled. Whether a second request is granted better
 than the first is unknown, and it is the cheapest remaining question about the clamp.
+
+### Measured: re-requesting the top level changes nothing
+
+That question is now answered. Under a continuous engine load at 80 W, seven NPU chunks with a power
+mode change before each -- every change forcing a fresh `SET_HARD_DPMLEVEL`:
+
+| chunk | pmode before it | IPUCLK peak | best ms | mean ms | TFLOPS |
+| --- | --- | ---: | ---: | ---: | ---: |
+| A baseline | default | 1355 | 6.765 | 7.408 | 25.40 |
+| B | performance | 1347 | 6.839 | **7.419** | 25.12 |
+| C | balanced | 1267 | 7.584 | 7.698 | 22.65 |
+| D | performance | 1334 | 6.850 | **7.444** | 25.08 |
+| E | powersaver | 858 | 12.036 | **12.108** | 14.27 |
+| F | performance | 1320 | 6.859 | 7.546 | 25.05 |
+| G | turbo | 1383 | 6.824 | 7.201 | 25.18 |
+
+**The knob works, and the measurement chain reproduces the document's own earlier numbers.** `balanced`
+and `powersaver` return 7.584 ms / 22.65 TF and 12.036 ms / 14.27 TF against the no-load table recorded
+much earlier in this document (7.577 / 22.67 and 12.048 / 14.26) -- a 0.1% agreement that validates both
+the pmode path and the instrument.
+
+**And re-requesting the top level does nothing.** Three separate `performance` chunks (B, D, F) return
+7.419, 7.444 and 7.546 ms against the 7.408 ms baseline -- identical within noise. The IPUCLK peaks tell
+the same story: every performance chunk granted 1320-1383 MHz, which is level 3's hclk (1267) plus filter
+lag, **not** level 7's 1800. The driver asks for level 7 each time and the SMU answers level 3 each time.
+
+So the clamp is a **continuous arbitration, not a latched decision**, and no request lifts it. The
+complete lever set is now closed:
+
+* The level request is already the maximum (`aie2_solver.c` picks `max_dpm_level` with no QoS).
+* Re-requesting it via the power-mode path changes nothing (measured above).
+* Context lifetime changes nothing, and at 80 W neither does elapsed time (measured).
+* Only two things release it: **package headroom** -- a 600 MHz GFX cap produced 1810/1267, level 7, at
+  61 W -- or **a higher package limit**, 130 W.
+
+There is no software route to the IPU's share. Whatever the SMU decides is what runs.
