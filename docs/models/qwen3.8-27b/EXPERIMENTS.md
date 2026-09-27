@@ -7143,3 +7143,49 @@ of near-equal marginal efficiency -- which is what the n_gu curve already measur
 **What the trace says the real constraint is:** the GPU is saturated. The lever is removing GPU work
 (which is what the split does, and why the n_gu optimum exists at all) or making the GPU faster, not
 overlapping the NPU. Analyzer kept at `tools/qwen27b/an_timeline.py`.
+
+
+### The xclbin generator's shape constraint, and why the token split needs M=2048 not M=1024
+
+The token split was scoped as "an M < 2048 xclbin", and the obvious reading is M=1024 (each engine
+takes half of a 2048-token chunk). **M=1024 at full width cannot be built with this design.**
+
+`config3/n32_core.py` lays the GEMM out over 8 columns x 4 rows and pipelines four slots:
+
+    num_row_tile = M // m // n_aie_rows          # /4
+    num_col_tile = N // n // n_aie_cols          # /8
+    num_groups   = num_row_tile * num_col_tile   # = (M/512) * (N/1024)
+
+and **`num_groups` must be divisible by 4** or `resolve_program()` raises `IronRuntimeError: Failed to
+close task groups`. Bisected over seven shapes -- the divisibility column is a perfect predictor, and the
+failure names `TaskGroup(33)`/`TaskGroup(34)`, i.e. the 34th group, exactly where a count that is 2 mod 4
+desynchronises the 4-slot rotation:
+
+| shape | num_groups | /4 | result |
+| --- | ---: | --- | --- |
+| M=1024 N=8192 | 16 | 4 | built |
+| M=1024 N=10240 | 20 | 5 | built |
+| M=1024 N=12288 | 24 | 6 | built |
+| M=1024 N=16384 | 32 | 8 | built |
+| M=1024 N=17408 | **34** | 8.5 | **rejected in 0 s** |
+| M=1536 N=17408 | **51** | 12.75 | **rejected in 0 s** |
+| M=2048 N=17408 | 68 | 17 | built in 7 s |
+
+**The consequence.** At M=1024 the viable N values are multiples of 2048. Both widths the token split
+needs -- 17408 for gate/up and 5120 for down -- are odd multiples of 1024, so both are rejected. At M=2048
+they give 68 and 20, both divisible by 4.
+
+**So the split works with M=2048 per engine**, by running the prefill chunk at **4096 tokens** and giving
+each engine half. That needs the same *full-width* xclbins at M=2048 rather than M=1024, and both are now
+built (each takes 5-7 s):
+
+    npu_gu_m2048_full   M=2048 K=5120  N=17408
+    npu_dn_m2048_full   M=2048 K=17408 N=5120
+
+No AIE design change is required -- the constraint is satisfied by choosing the shape, not by editing the
+design. Generator `config3/n32_core.py`, driven as `gen_pair.sh` does; harnesses
+`/home/q/smu/bisect_shape.sh` and `/home/q/smu/gen_fullwidth.sh`.
+
+Remaining work for the split itself, all host-side: chunk at 4096, full-width B repacks (the NPU now needs
+all 17408 gate rows, so B goes 56.2 MB -> ~120 MB), a row-offset C decode (the NPU writes 2048 of 4096
+tokens on the full token stride), and wiring both xclbins as one NPU chain.
