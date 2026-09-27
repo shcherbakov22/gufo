@@ -6338,3 +6338,51 @@ not a PSP bypass**, and this machine has already booted patched kernels three ti
 So the next move on the IPU clamp is to read the embedded PPTable, find the field that governs the IPU split,
 and inject a modified table through a patched driver. It is unsigned by construction because it never touches
 the PSP's image.
+
+
+### The embedded PPTable, decoded
+
+The 5812-byte blob is a 1344-byte ATOM-style directory followed by a **complete `PPTable_t`**
+(`sizeof` = 4468, and 1344 + 4468 = 5812 exactly) at file offset `0x4FF00 + 1344 = 0x540`. Compiling the
+kernel's own header against the image gives every field with its offset and value
+(`/home/q/smu/gen_ppt_dump.py` generates the dumper from `smu14_driver_if_v14_0.h`). The load-bearing
+values:
+
+    CustomSkuTable_t
+      SocketPowerLimitAc[4]    {304, 1200, 0, 0}   // EnableLegacyPptLimit=0 -> [0] absolute, rest scalar
+      SocketPowerLimitDc[4]    { 35, 1200, 0, 0}
+      VrTdcLimit[2]            {224, 84}           // Amps, per VR current rail
+      PlatformTdcLimit[2]      {224, 84}
+      TemperatureLimit[12]     {105,105,0,0,105,115,115,115,115,0,0,0}
+      FwCtfLimit[12]           {0,113,0,0,113,125,125,125,125,0,0,0}
+      TempInputSelectMask      498 (0x1F2 -> inputs 1,4,5,6,7,8)
+      FanTargetTemperature[12] {0,85,0,0,90,100,100,100,100,0,0,0}
+
+    SkuTable_t
+      TotalPowerConfig         4
+      HwCtfTempLimit           120
+      SocketPowerLimitSpare[10] {80, 0, ...}
+      FreqTableDclk[8]         {800,1950,0,0,800,2200,0,0}
+      FreqTableDcfclk[8]       {148,1800,0,0,720,720,0,0}
+      VminTempThreshold[2]     {55,55}   VminTempHystersis[2] {5,5}
+
+    BoardTable_t
+      GfxEdcLimit 0   SocEdcLimit 0   RestBoardPower 0
+
+**There is no IPU/NPU field anywhere in `PPTable_t`** -- a case-insensitive search for `Ipu|Npu` across all
+four sub-tables returns nothing. The IPU's DPM allocation is not a PPTable parameter, so injecting a modified
+table cannot be used to release the clamp directly. That closes the lever as originally framed.
+
+**But it does surface a different mechanism worth naming.** The per-rail current limits are 224 A and 84 A, and
+80 W into a ~1.0-1.1 V SoC rail is roughly 73-80 A -- close to the 84 A limit. A clamp driven by a *current*
+(TDC/EDC) ceiling would explain everything already measured: it releases with package headroom (less current),
+releases at a higher power limit, and appears as a flat clock cap rather than stalls. Power is not the only
+candidate the evidence supports; current fits equally well, and unlike an IPU allocation, **current limits do
+live in the PPTable**.
+
+That is where this has to stop, though, and deliberately: the only way to act on it would be to *raise* a
+hardware current limit, and an over-current limit exists to protect the VRMs. Raising it is not a performance
+tweak, it is a way to damage the board. The safe direction -- reducing GFX's share so the IPU fits under the
+same ceiling -- is the GFX-cap trade already measured, which nets roughly -1.3%. Worth recording as a
+hypothesis with a falsifier (read the SoC rail current at the moment the clamp engages) rather than as a thing
+to try.
