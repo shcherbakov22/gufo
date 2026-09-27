@@ -4805,3 +4805,54 @@ engine's memory traffic spikes. Two different remedies, neither of which is a dr
    touched.
 2. The intermittent stalls need the NPU's fetches to stop colliding with the GPU's bursts, either by
    scheduling or by deepening the design's L3/L2 FIFOs so a command can ride out a latency spike.
+
+## How XDNA2 power management actually works (from the running kernel's own source)
+
+The driver source ships with this kernel, so this is read rather than inferred:
+`/lib/modules/` + `$(uname -r)` + `/build/drivers/accel/amdxdna/`. Files that matter:
+`aie2_pm.c` (mode mapping), `npu4_regs.c` (clock table), `aie_smu.c` (mailbox),
+`aie2_solver.c` (per-context level), `aie2_pci.c` (the setter).
+
+**Performance is a discrete DPM level, requested over the SMU mailbox.** `npu4_dpm_clk_table` has
+eight levels of `{npuclk, hclk}` in MHz, from {396, 792} to {1267, 1800}. The modes
+`xrt-smi configure --pmode` offers map onto them directly, and the measured throughput matches
+the table to within a percent, which is what confirms the model:
+
+| level | hclk | predicted vs level 7 | measured pmode |
+| --- | ---: | ---: | --- |
+| 0 | 792 | 0.44 | powersaver 14.26 TF |
+| 3 (max/2) | 1267 | 0.70 | balanced 22.67 TF |
+| 7 | 1800 | 1.00 | default 32.25 / performance 32.38 / turbo 32.44 TF |
+
+`turbo` differs from `performance` only by disabling clock gating, and
+`aie2_pm_set_mode` refuses it outright while a hardware context exists
+(`if (ndev->hwctx_num) return -EINVAL`), so it can never help a running workload.
+
+**The driver never learns what the SMU granted.** The NPU's SMU interface has exactly five messages:
+`POWER_ON`, `POWER_OFF`, `SET_MPNPUCLK_FREQ`, `SET_HCLK_FREQ`,
+`SET_SOFT_DPMLEVEL`, `SET_HARD_DPMLEVEL`. There is no query, no read-back, and sysfs exposes
+only `vbnv`, `device_type` and `fw_version` while debugfs exposes only `carveout` and
+`name`. `ndev->npuclk_freq` and `hclk_freq` are the *requested* values cached in software.
+Whatever the SMU actually grants is invisible from the host, so the ~28% steady tax under GPU load
+can only be inferred from timing -- which is what the distributions above do.
+
+**The SMU is the arbiter, and the NPU has no lever above it.** The driver's highest request is already
+the top level, sent by both `default` and `performance`. When the GPU is busy the SMU clamps
+whatever it grants, and the clamp size we measured (0.70) is exactly the table's level 3. Nothing in
+XRT, the driver, or the engine can override that.
+
+**One real and non-obvious trap.** `aie2_solver.c` picks the level per context load:
+
+    /* If no QoS parameters are passed, set it to the max DPM level */
+    if (!is_valid_qos_dpm_params(rqos)) { level = max_dpm_level; goto set_dpm; }
+    for (level = 0; level < max_dpm_level; level++) { ... qos_meet ... }
+
+A context that advertises QoS parameters (`gops`, `fps`, `latency`) gets the *lowest* level
+that just meets them. Our ATB design advertises none, so it correctly gets the top level -- but an
+xclbin that ever grew QoS metadata would silently lose up to 56% of throughput with no error and no
+readback to notice it by.
+
+**So the steady 28% is closed.** It is a SMU decision inside a shared power budget, invisible and
+un-influenceable from the NPU side, and the platform profile is the user's custom one.
+What remains reachable is the *intermittent* half, which is on our side: the bimodal stalls when
+the NPU's fetches collide with the GPU's memory bursts.
