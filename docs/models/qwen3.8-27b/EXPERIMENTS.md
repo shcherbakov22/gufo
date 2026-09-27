@@ -6219,3 +6219,37 @@ A side observation from the raw BAR5 mailbox work: a deferred machine check (`MC
 Interrupts, etc.", `mem/io: IO`) was logged at uptime 2963 s, coinciding with the direct BAR5 writes. It
 was non-fatal and the machine continued normally, but the raw-mmapped register path is not entirely clean
 and is best avoided now that the SMN `smn` attribute provides the same access through the module.
+
+
+### Result: the direct load path does not work -- the PSP is mandatory
+
+Boot with `amdgpu.fw_load_type=0`, with the parameter verified present on that boot's kernel command line
+via `journalctl -b -1 -k`:
+
+    12:46:00 amdgpu 0000:c4:00.0: [drm] Wait for DMUB auto-load failed: 3
+    12:46:00 amdgpu 0000:c4:00.0: [drm] DMUB hardware initialized: version=0x09004700
+    12:46:04 amdgpu 0000:c4:00.0: Fatal error during GPU init
+
+There is no `SMU is initialized successfully!` line, and the IP block enumeration stops after ten blocks --
+the `psp` and `smu` blocks that normally appear at positions 3 and 4 are **absent altogether**. The machine
+was not dead: audio, wifi and userspace all came up before a clean `systemd-shutdown`. It presented as a
+**blackscreen with a live system underneath**; the display simply never initialised.
+
+So `AMDGPU_FW_LOAD_DIRECT` does not merely fail to bring the SMU up -- amdgpu cannot initialise the GPU at
+all on this platform without the PSP. **The driver-side, unverified `MP1_SRAM` write path is unreachable,
+and the SMU firmware is unavoidably PSP-loaded.** That closes the firmware-patch route: the image goes
+through the PSP, which verifies its firmware, while the path that checks nothing but `size_bytes` is the one
+that cannot run. It also explains why `smu_start_smc_engine()` gates its loader behind `IP < 11.0.0` -- the
+direct path is not expected to work on SMU14.
+
+Two honest qualifications:
+
+- The failure is at GPU-init level, so this does not isolate the `MP1_SRAM` writes themselves. It shows only
+  that there is no way to deliver a patched image by that route.
+- Whether the PSP would *reject* a modified `smu_14_0_3.bin` is still untested, and testing it costs an
+  initramfs rebuild, a limine hash refresh and another reboot. Not worth spending until there is a byte known
+  to need changing -- and identifying one needs the Xtensa RE, which needs a disassembler this environment
+  cannot install (the JDK download is blocked by the mirror's size cap).
+
+The cmdline change was reverted; `/boot/limine.conf` is byte-identical to the pre-experiment backup
+(md5 `e18f3d48c3aef67dc75d253cd0132acd`, 4702 bytes, no `fw_load_type`).
