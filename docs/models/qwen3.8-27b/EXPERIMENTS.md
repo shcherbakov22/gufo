@@ -6465,3 +6465,46 @@ moved the NPU from 7.247 ms to 6.506 ms and the engine from 533.7 to 508.5, a ne
 cap would be strictly better *if it existed*, because it would limit only when the GPU actually exceeds its
 share rather than capping the clock unconditionally -- that is the real argument for the idea, and the reason
 it is worth revisiting only if a cap can be reached.
+
+
+### The PPTable is not opaque -- the kernel reads it, stores it, and for other ASICs writes it
+
+Answering the question of whether in-tree code parses the PPTable: yes, three pieces, and they agree.
+
+1. **The container header is in-tree.** `inc/smu_v14_0_2_pptable.h` defines
+   `struct smu_14_0_2_powerplay_table` with `SMU_14_0_2_TABLE_FORMAT_REVISION 23` -- and the embedded
+   table's `ucTableFormatRevision` is **0x17 = 23**. Its directory fields decode the head of the blob, which
+   could not be read earlier:
+
+       pmfw_pptable_start_offset            1344   pmfw_pptable_size            4468
+       pmfw_sku_table_start_offset          1372   pmfw_sku_table_size          3552
+       pmfw_custom_sku_table_start_offset   4924   pmfw_custom_sku_table_size    360
+       pmfw_board_table_start_offset        5284   pmfw_board_table_size         528
+
+   Every entry tiles the region exactly, and every offset matches the compiler's own `PPTable_t` layout
+   (PFE 0, Sku 28, CustomSku 3580, Board 3940 -- absolute 1344, 1372, 4924, 5284). Three sources agreeing.
+
+2. **The kernel already extracts embedded PPTable containers.** `smu_cmn.c` has
+   `smu_cmn_get_pptable_v2_0()` / `smu_cmn_get_pptable_v2_1()` -- the May 2026 series is merged into this
+   tree -- which read `ppt_offset_bytes`/`ppt_size_bytes` out of an `smc_firmware_header_v2_0`, exactly how
+   the table was located here.
+
+3. **The smu14 driver reads it into a named struct and uses it.** `smu_v14_0_2_setup_pptable()`
+   (`.setup_pptable` at line 2876, called from `amdgpu_smu.c:1763`) runs
+   `smu_v14_0_2_get_pptable_from_pmfw()` -> `smu_cmn_get_combo_pptable()`, then
+   `smu_v14_0_2_store_powerplay_table()` memcpys `powerplay_table->smc_pptable` into
+   `smu_table->driver_pptable`, then `check_powerplay_table()` and `init_ppt_limits()`. Fields are then read
+   by name throughout: `SkuTable.OverDriveLimitsBasicMax/Min`, `SkuTable.FeaturesToRun[0]`,
+   `CustomSkuTable.TemperatureLimit[TEMP_EDGE]`, `CustomSkuTable.FanMaximumRpm`.
+
+**There is a writer too.** `smu_cmn_write_pptable()` uploads `driver_pptable` through `SMU_TABLE_PPTABLE`,
+and it is registered as `.write_pptable` for smu11 and smu13 -- **but not for smu14**, so this ASIC never has a
+table pushed to it. `smu_sys_set_pp_table()` (the sysfs writer) swaps in a `hardcode_pptable` and calls
+`smu_reset()`, but `smu_v14_0_2_setup_pptable()` re-sources the table from the PMFW combo table on every
+init, so a sysfs-written table would be replaced.
+
+That makes the patch surface concrete and small: on smu14, source `driver_pptable` from a file inside
+`smu_v14_0_2_setup_pptable()` and register `.write_pptable`. That is the `amdgpu-custom-ppt` approach
+adapted to this ASIC -- no PSP, no signature, no firmware image, just a table the driver already reads and a
+transfer path it already has. It would let us ship a modified PPTable and see what the SMU does with it, which
+is the only way to test the SoC-EDC hypothesis.
