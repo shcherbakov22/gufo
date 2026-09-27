@@ -5823,3 +5823,44 @@ therefore *not recoverable by reading* -- it can only be inferred by experiment.
 remains unused and is worth a look because it is the NPU firmware's own view rather than the SMU's:
 `MSG_OP_GET_TELEMETRY`, exposed as `DRM_AMDXDNA_QUERY_TELEMETRY`, takes a type index
 (`header->type < MAX_TELEMETRY_TYPE`) and returns up to 4 MB of firmware-reported data.
+
+### Direct SMU access from userspace: the arbiter cannot be overridden
+
+The NPU's SMU mailbox turned out to be reachable from userspace without any kernel patch, so the
+"implement our own power management" idea was tested as directly as the hardware allows -- by talking to
+the SMU ourselves, bypassing the driver entirely.
+
+**The mailbox is in BAR5 of the NPU at fixed offsets** (`npu4_regs.c`, registration in `aie2_pci.c:586`):
+
+    NPU4_SMU_BAR_INDEX = 5            NPU4_SMU_BAR_BASE = MMNPU_APERTURE4_BASE = 0x3B10000
+    SMU_CMD_REG  = MP1_C2PMSG_0   0x3B10900  -> BAR5+0x900
+    SMU_ARG_REG  = MP1_C2PMSG_60  0x3B109F0  -> BAR5+0x9F0   (also SMU_OUT_REG)
+    SMU_RESP_REG = MP1_C2PMSG_61  0x3B109F4  -> BAR5+0x9F4
+    SMU_INTR_REG = APERTURE4      0x3B10000  -> BAR5+0x000
+
+`/sys/bus/pci/devices/0000:c5:00.1/resource5` is root-mmap-able, so `build/atb/npu_smu_msg.c` (~70 lines)
+reproduces `aie_smu_exec()`'s protocol from userspace: clear RESP, write ARG, write CMD, kick INTR 0->1,
+poll RESP for `SMU_RESULT_OK` (1), read OUT from ARG. **The device must be awake** -- suspended, BAR5 reads
+back all `0xffffffff`; with an NPU job running it reads live state, and the first peek showed
+`CMD=0x07 ARG=7 RESP=1`, the driver's own last command.
+
+**The test.** While the engine clamped the NPU to level 3, we sent the two absolute-frequency messages
+that npu1 uses -- the ones npu4 never sends:
+
+    SET_HCLK_FREQ(0x6)=1800        -> ret=0  RESP=1  OUT=1267
+    SET_MPNPUCLK_FREQ(0x5)=1267    -> ret=0  RESP=1  OUT=974
+
+Both were **accepted**, and OUT returned **1267 / 974** -- level 3's own values, i.e. the SMU handed back
+the *granted* clocks. And nothing changed: granted IPUCLK stayed 1240-1383, the time-ordered deciles were
+flat (`7.482 7.254 7.085 7.793 7.373 7.303 7.502 7.464 7.556 7.406`), mean 7.422 ms, engine 509.1.
+
+**So the absolute-frequency path is accepted and ignored under contention.** `npu4` using DPM levels
+rather than frequencies is not an omission to be fixed; the SMU answers both kinds of request with its
+arbiter's decision. Together with the earlier pmode test -- which sends `SET_HARD_DPMLEVEL(7)` mid-run --
+**all six NPU SMU messages have now been exercised under load and none changes the grant.**
+
+That closes the idea with the strongest evidence available: a kernel module doing "our own NPU power
+management" would execute the same register writes on the same mailbox and get the same answer. **The
+wall is the firmware arbiter, not the driver, the kernel, or a missing interface.** Worth noting the one
+by-product: OUT carries a clock readback, a third telemetry source alongside the SMU metrics table and
+`MSG_OP_GET_TELEMETRY`.
