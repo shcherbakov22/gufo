@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -293,6 +294,11 @@ int main(int argc, char** argv) {
     return std::pair<double, int>(t1 - t0, st);
   };
   for (int i = 0; i < 3; ++i) timed_run();
+  // Every run's wall time, so the shape of the distribution is visible. Steady
+  // contention shifts the whole distribution; intermittent stalls under a GPU
+  // memory burst leave the fast mode intact and only add a slow tail.
+  std::vector<double> samples;
+  samples.reserve(static_cast<std::size_t>(reps));
   double best = 1e30, total = 0.0;
   for (int i = 0; i < reps; ++i) {
     if (gap_ms > 0) usleep(static_cast<unsigned>(gap_ms) * 1000);
@@ -300,11 +306,23 @@ int main(int argc, char** argv) {
     if (st != 4) std::printf("  rep %d state=%d\n", i, st);
     if (ms < best) best = ms;
     total += ms;
+    samples.push_back(ms);
   }
+  std::sort(samples.begin(), samples.end());
+  const auto pct = [&](double q) {
+    const std::size_t i = std::min(
+        samples.size() - 1,
+        static_cast<std::size_t>(q * static_cast<double>(samples.size())));
+    return samples[i];
+  };
   const double flops = 2.0 * static_cast<double>(M) * static_cast<double>(N) *
                        static_cast<double>(K);
   std::printf("npu: best %.3f ms  mean %.3f ms  -> %.2f TFLOPS (best) gap=%dms\n",
               best, total / reps, flops / (best / 1000.0) / 1e12, gap_ms);
+  std::printf("dist: min %.3f p10 %.3f p25 %.3f p50 %.3f p75 %.3f p90 %.3f "
+              "max %.3f n=%zu\n",
+              samples.front(), pct(0.10), pct(0.25), pct(0.50), pct(0.75),
+              pct(0.90), samples.back(), samples.size());
   std::printf("NPU_RUN %s\n", failures == 0 ? "PASS" : "FAIL");
 
   if (host_alloc) {

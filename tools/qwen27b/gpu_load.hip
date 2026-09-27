@@ -70,14 +70,24 @@ int main(int argc, char** argv) {
   std::fflush(stdout);
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+  // Bound the queue to two launches. Without this the host enqueues thousands
+  // of them during the deadline and then sits in hipDeviceSynchronize draining
+  // the backlog long after the requested duration: a 14 s "load" that pegged
+  // the GPU for more than fifteen minutes. Two in flight keeps the device
+  // saturated and the process finite.
+  int in_flight = 0;
   while (std::chrono::steady_clock::now() < deadline) {
     if (mem) {
       StreamKernel<<<blocks, threads>>>(in, out, n, kMemPasses);
     } else {
       ComputeKernel<<<blocks, threads>>>(out, 200000);
     }
+    if (++in_flight == 2) {
+      if (hipDeviceSynchronize() != hipSuccess) return 1;
+      in_flight = 0;
+    }
   }
-  (void)hipDeviceSynchronize();
+  if (hipDeviceSynchronize() != hipSuccess) return 1;
   std::printf("gpu_load done\n");
   return 0;
 }

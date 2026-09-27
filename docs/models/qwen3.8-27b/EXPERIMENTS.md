@@ -4772,3 +4772,36 @@ it, and the engine lost 0.6% (545.34 to 541.87 tok/s).
 at n_gu=7168 is real. What is left is not a clock but DRAM pressure: the split adds a B repack that
 writes and then re-reads the NPU's whole weight slice, which the engine would not otherwise touch.
 That is the lever -- reduce or hide that traffic -- not the power mode.
+
+### Correction: it is two effects, and the steady one is power after all
+
+The section above reads as "bandwidth, not power". Measuring the whole *distribution* of per-command
+times separates two mechanisms that the mean alone conflates. 2000 runs each, same shape:
+
+| load | min | p10 | p25 | p50 | p75 | p90 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| none | 5.304 | 5.331 | 5.340 | 5.355 | 5.370 | 5.388 |
+| compute (register-resident FMA) | 5.309 | 6.831 | 6.862 | 6.883 | 6.903 | 6.920 |
+| memory (streaming copy) | 5.304 | 5.332 | 5.352 | 9.726 | 9.954 | 10.032 |
+
+**A compute-only GPU load shifts the entire distribution, uniformly, by about 28%.** That kernel
+never touches DRAM, so this is not bandwidth. It is shared-power arbitration, and the size says
+which level the SMU picks: 22.67 / 32.25 = 0.70, i.e. a busy GPU appears to drop the NPU to close
+to its `balanced` power mode (22.7 TF). That also explains why setting `--pmode performance` or
+`turbo` changes nothing under load -- the driver is not choosing the level.
+
+**A memory load is bimodal.** The bottom quartile of commands run at full solo speed (5.33, 5.35)
+and the rest sit at ~9.7-10.0 ms, 83% slower. That is a collision effect: a command whose operand
+fetches do not coincide with the GPU's bursts runs at full speed, and one that does stalls. The
+best and the min stay pinned at 5.304 in every case, which is the signature of an intermittent
+stall rather than a reduced clock.
+
+So the ~20-27% seen under the engine is the *steady* component -- the engine's GPU work is steady,
+so the NPU spends most commands in the arbitrated level -- with occasional extra stalls when the
+engine's memory traffic spikes. Two different remedies, neither of which is a driver knob:
+
+1. The steady 28% needs the SMU to give the NPU a better level while the GPU is busy. The available
+   dial is the platform profile (`balanced` today), which is the user's setting and has not been
+   touched.
+2. The intermittent stalls need the NPU's fetches to stop colliding with the GPU's bursts, either by
+   scheduling or by deepening the design's L3/L2 FIFOs so a command can ride out a latency spike.
